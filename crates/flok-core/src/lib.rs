@@ -13,5 +13,6 @@ pub mod config;
 pub mod provider;
 pub mod session;
 pub mod snapshot;
+pub mod team;
 pub mod token;
 pub mod tool;

@@ -20,6 +20,7 @@ use flok_core::tool::{
     AgentMemoryTool, BashTool, EditTool, GlobTool, GrepTool, PlanTool, QuestionTool, ReadTool,
     SkillTool, TaskTool, TodoList, TodoWriteTool, ToolRegistry, WebfetchTool, WriteTool,
 };
+use flok_core::worktree::WorktreeManager;
 use tokio::sync::mpsc;
 
 fn main() -> Result<()> {
@@ -120,6 +121,20 @@ async fn run(args: cli::Args) -> Result<()> {
     // Create bus (before task tool, which needs it)
     let bus = Bus::new(512);
 
+    // Create worktree manager for agent isolation
+    let worktree_mgr = Arc::new(WorktreeManager::new(&project_id, project_root.clone()));
+    if worktree_mgr.is_enabled() && config.worktree.enabled {
+        tracing::info!("worktree isolation enabled for background agents");
+        // Clean up stale worktrees from previous sessions
+        match worktree_mgr.cleanup_stale().await {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(count = n, "cleaned stale worktrees"),
+            Err(e) => tracing::warn!(error = %e, "stale worktree cleanup failed"),
+        }
+    } else {
+        tracing::debug!("worktree isolation disabled");
+    }
+
     // Snapshot the base tools for the task tool (before registering task itself)
     let base_tools = Arc::new(tools.clone());
     tools.register(Arc::new(TaskTool::new(
@@ -127,6 +142,8 @@ async fn run(args: cli::Args) -> Result<()> {
         base_tools,
         bus.clone(),
         project_root.clone(),
+        Arc::clone(&worktree_mgr),
+        config.worktree.clone(),
     )));
 
     tracing::info!(

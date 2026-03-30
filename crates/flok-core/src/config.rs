@@ -17,6 +17,26 @@ use serde::{Deserialize, Serialize};
 pub struct FlokConfig {
     /// Provider configurations keyed by provider name.
     pub provider: std::collections::HashMap<String, ProviderConfig>,
+    /// Git worktree isolation settings.
+    pub worktree: WorktreeConfig,
+}
+
+/// Configuration for git worktree isolation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WorktreeConfig {
+    /// Enable worktree isolation for background agents.
+    pub enabled: bool,
+    /// Automatically merge non-conflicting changes on agent completion.
+    pub auto_merge: bool,
+    /// Remove worktree directory after successful merge.
+    pub cleanup_on_complete: bool,
+}
+
+impl Default for WorktreeConfig {
+    fn default() -> Self {
+        Self { enabled: true, auto_merge: true, cleanup_on_complete: true }
+    }
 }
 
 /// Configuration for a single LLM provider.
@@ -96,6 +116,9 @@ fn merge_config(target: &mut FlokConfig, source: &FlokConfig) {
     for (key, value) in &source.provider {
         target.provider.insert(key.clone(), value.clone());
     }
+    // Worktree config: source overrides target entirely if present in source file
+    // (serde default handles missing fields; if explicitly set in source, override)
+    target.worktree = source.worktree.clone();
 }
 
 /// Ensure XDG-compliant directories exist.
@@ -169,6 +192,7 @@ mod tests {
             )]
             .into_iter()
             .collect(),
+            worktree: WorktreeConfig::default(),
         };
         merge_config(&mut base, &overlay);
         assert_eq!(base.provider["anthropic"].api_key.as_deref(), Some("key-123"));

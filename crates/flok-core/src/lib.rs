@@ -15,3 +15,4 @@ pub mod session;
 pub mod snapshot;
 pub mod token;
 pub mod tool;
+pub mod worktree;

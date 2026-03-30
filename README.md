@@ -1,11 +1,26 @@
 # flok
 
+<div align="center">
+
+[![CI Badge]][CI] [![License Badge]][License] [![Rust Badge]][Rust] [![Deps Badge]][Deps]
+
+</div>
+
 An AI coding agent for the terminal, built in Rust.
 
 Flok connects to multiple LLM providers and gives you an interactive TUI for
 AI-assisted coding workflows. Single binary, no runtime dependencies.
 
 > **Status:** Early development (v0.0.1). Core features work. APIs may change.
+
+[CI Badge]: https://img.shields.io/github/actions/workflow/status/pamelia/flok/rust.yml?style=flat-square&logo=github&label=CI
+[CI]: https://github.com/pamelia/flok/actions/workflows/rust.yml
+[License Badge]: https://img.shields.io/badge/license-MIT-blue?style=flat-square
+[License]: ./LICENSE
+[Rust Badge]: https://img.shields.io/badge/rust-1.80%2B-orange?style=flat-square&logo=rust
+[Rust]: https://www.rust-lang.org
+[Deps Badge]: https://deps.rs/repo/github/pamelia/flok/status.svg?style=flat-square
+[Deps]: https://deps.rs/repo/github/pamelia/flok
 
 ## Features
 

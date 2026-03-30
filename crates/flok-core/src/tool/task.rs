@@ -12,7 +12,9 @@ use tokio::sync::mpsc;
 
 use crate::agent;
 use crate::bus::BusEvent;
+use crate::config::WorktreeConfig;
 use crate::provider::{CompletionRequest, Message, MessageContent, StreamEvent};
+use crate::worktree::WorktreeManager;
 
 use super::{Tool, ToolContext, ToolOutput};
 
@@ -29,6 +31,10 @@ pub struct TaskTool {
     bus: crate::bus::Bus,
     /// Project root.
     project_root: std::path::PathBuf,
+    /// Worktree manager for agent isolation (shared).
+    worktree_mgr: Arc<WorktreeManager>,
+    /// Worktree configuration.
+    worktree_config: WorktreeConfig,
 }
 
 impl TaskTool {
@@ -38,8 +44,10 @@ impl TaskTool {
         tools: Arc<crate::tool::ToolRegistry>,
         bus: crate::bus::Bus,
         project_root: std::path::PathBuf,
+        worktree_mgr: Arc<WorktreeManager>,
+        worktree_config: WorktreeConfig,
     ) -> Self {
-        Self { provider, tools, bus, project_root }
+        Self { provider, tools, bus, project_root, worktree_mgr, worktree_config }
     }
 }
 
@@ -104,6 +112,40 @@ impl Tool for TaskTool {
             tool_call_id: description.to_string(),
         });
 
+        // Determine if this agent needs worktree isolation.
+        // Only non-explore agents that modify files need isolation.
+        let use_worktree = self.worktree_config.enabled
+            && self.worktree_mgr.is_enabled()
+            && agent_type != "explore";
+
+        // Create worktree if needed, determining the effective project root
+        let session_suffix = format!("{}:{description}", ctx.session_id);
+        let worktree_info = if use_worktree {
+            match self.worktree_mgr.create(&session_suffix).await {
+                Ok(info) => {
+                    tracing::info!(
+                        agent = agent_type,
+                        path = %info.path.display(),
+                        "sub-agent using isolated worktree"
+                    );
+                    Some(info)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        agent = agent_type,
+                        error = %e,
+                        "worktree creation failed, falling back to shared directory"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let effective_root =
+            worktree_info.as_ref().map_or_else(|| self.project_root.clone(), |wt| wt.path.clone());
+
         // Build the system prompt for the sub-agent
         let system = agent_def.system_prompt.map_or_else(
             || {
@@ -111,14 +153,50 @@ impl Tool for TaskTool {
                     "You are a sub-agent ({agent_type}) helping with a specific task. \
                      Complete the task and provide a clear summary of your findings.\n\n\
                      Working directory: {}",
-                    self.project_root.display()
+                    effective_root.display()
                 )
             },
             String::from,
         );
 
-        // Run the sub-agent prompt loop
-        let result = self.run_subagent(system, prompt, &ctx.session_id, description).await;
+        // Run the sub-agent prompt loop with the effective project root
+        let result =
+            self.run_subagent(system, prompt, &ctx.session_id, description, &effective_root).await;
+
+        // Merge worktree changes back if applicable
+        let mut merge_info = String::new();
+        if let Some(ref wt_info) = worktree_info {
+            if result.is_ok() && self.worktree_config.auto_merge {
+                match self.worktree_mgr.merge(wt_info).await {
+                    Ok(crate::worktree::MergeResult::Clean { files_applied }) => {
+                        tracing::info!(files_applied, "worktree merge: clean");
+                        if files_applied > 0 {
+                            merge_info =
+                                format!("\n\n[{files_applied} file(s) merged into workspace]");
+                        }
+                    }
+                    Ok(crate::worktree::MergeResult::Conflict { files_applied, conflicts }) => {
+                        tracing::warn!(?conflicts, "worktree merge: conflicts");
+                        merge_info = format!(
+                            "\n\n[{files_applied} file(s) merged. CONFLICTS in: {}]",
+                            conflicts.join(", ")
+                        );
+                    }
+                    Ok(crate::worktree::MergeResult::NothingToMerge) => {}
+                    Err(e) => {
+                        tracing::error!(error = %e, "worktree merge failed");
+                        merge_info = format!("\n\n[Worktree merge failed: {e}]");
+                    }
+                }
+            }
+
+            // Clean up worktree
+            if self.worktree_config.cleanup_on_complete {
+                if let Err(e) = self.worktree_mgr.remove(wt_info).await {
+                    tracing::warn!(error = %e, "worktree cleanup failed");
+                }
+            }
+        }
 
         let is_error = result.is_err();
         self.bus.send(BusEvent::ToolCallCompleted {
@@ -129,7 +207,7 @@ impl Tool for TaskTool {
         });
 
         match result {
-            Ok(response) => Ok(ToolOutput::success(response)),
+            Ok(response) => Ok(ToolOutput::success(format!("{response}{merge_info}"))),
             Err(e) => Ok(ToolOutput::error(format!("Sub-agent error: {e}"))),
         }
     }
@@ -143,6 +221,7 @@ impl TaskTool {
         prompt: &str,
         parent_session_id: &str,
         description: &str,
+        effective_root: &std::path::Path,
     ) -> anyhow::Result<String> {
         let mut messages = vec![Message {
             role: "user".into(),
@@ -154,7 +233,7 @@ impl TaskTool {
         let filtered_tools: Vec<_> = tool_defs.into_iter().filter(|t| t.name != "task").collect();
 
         let sub_ctx = ToolContext {
-            project_root: self.project_root.clone(),
+            project_root: effective_root.to_path_buf(),
             session_id: format!("{parent_session_id}:sub:{description}"),
             agent: "subagent".into(),
             cancel: tokio_util::sync::CancellationToken::new(),

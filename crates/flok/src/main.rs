@@ -16,9 +16,11 @@ use flok_core::config;
 use flok_core::provider::AnthropicProvider;
 use flok_core::session::{AppState, SessionEngine};
 use flok_core::snapshot::SnapshotManager;
+use flok_core::team::TeamRegistry;
 use flok_core::tool::{
     AgentMemoryTool, BashTool, EditTool, FastApplyTool, GlobTool, GrepTool, PlanTool, QuestionTool,
-    ReadTool, SkillTool, TaskTool, TodoList, TodoWriteTool, ToolRegistry, WebfetchTool, WriteTool,
+    ReadTool, SendMessageTool, SkillTool, TaskTool, TeamCreateTool, TeamDeleteTool, TeamTaskTool,
+    TodoList, TodoWriteTool, ToolRegistry, WebfetchTool, WriteTool,
 };
 use flok_core::worktree::WorktreeManager;
 use tokio::sync::mpsc;
@@ -119,6 +121,13 @@ async fn run(args: cli::Args) -> Result<()> {
     tools.register(Arc::new(AgentMemoryTool));
     tools.register(Arc::new(PlanTool));
 
+    // Create team registry for multi-agent coordination
+    let team_registry = TeamRegistry::new();
+    tools.register(Arc::new(TeamCreateTool::new(team_registry.clone())));
+    tools.register(Arc::new(TeamDeleteTool::new(team_registry.clone())));
+    tools.register(Arc::new(TeamTaskTool::new(team_registry.clone())));
+    tools.register(Arc::new(SendMessageTool::new(team_registry.clone())));
+
     // Create bus (before task tool, which needs it)
     let bus = Bus::new(512);
 
@@ -145,6 +154,7 @@ async fn run(args: cli::Args) -> Result<()> {
         project_root.clone(),
         Arc::clone(&worktree_mgr),
         config.worktree.clone(),
+        team_registry,
     )));
 
     tracing::info!(

@@ -1089,102 +1089,33 @@ impl SessionEngine {
 
     /// Execute a batch of tool calls.
     ///
-    /// Checks the cancellation token between calls. If cancelled, remaining
-    /// tool calls are skipped and returned as cancelled errors.
+    /// Read-only (`Safe`) tool calls run concurrently for better latency.
+    /// Write/Dangerous tool calls run sequentially to avoid filesystem races.
+    /// Permission checks happen sequentially before execution since they
+    /// involve user interaction.
+    ///
+    /// Checks the cancellation token before each execution phase.
     async fn execute_tool_calls(&self, tool_calls: &[ToolCall]) -> Vec<ToolResult> {
-        let mut results = Vec::with_capacity(tool_calls.len());
-        let ctx = self.state.tool_context(&self.session_id, self.cancel_token.clone());
-
-        for tc in tool_calls {
-            // Check cancellation before each tool call
-            if self.cancel_token.is_cancelled() {
-                tracing::info!(tool = %tc.name, "skipping tool call — cancelled by user");
-                results.push(ToolResult {
+        if self.cancel_token.is_cancelled() {
+            return tool_calls
+                .iter()
+                .map(|tc| ToolResult {
                     tool_call_id: tc.id.clone(),
                     content: "Cancelled by user.".into(),
                     is_error: true,
-                });
-                continue;
-            }
+                })
+                .collect();
+        }
 
-            tracing::debug!(tool = %tc.name, id = %tc.id, "executing tool call");
+        let ctx = self.state.tool_context(&self.session_id, self.cancel_token.clone());
 
-            self.state.bus.send(BusEvent::ToolCallStarted {
-                session_id: self.session_id.clone(),
-                tool_name: tc.name.clone(),
-                tool_call_id: tc.id.clone(),
-            });
+        // Phase 1: Pre-validate all tool calls (sequential — permission prompts).
+        let mut pre_results: Vec<Option<ToolResult>> = vec![None; tool_calls.len()];
+        let mut approved: Vec<(usize, Arc<dyn crate::tool::Tool>, serde_json::Value)> = Vec::new();
 
-            let result = if let Some(tool) = self.state.tools.get(&tc.name) {
-                let args: serde_json::Value =
-                    serde_json::from_str(&tc.arguments).unwrap_or_default();
-
-                // Plan mode safety net: block write/dangerous tools
-                if self.state.plan_mode.is_plan()
-                    && tool.permission_level() != crate::tool::PermissionLevel::Safe
-                {
-                    ToolResult {
-                        tool_call_id: tc.id.clone(),
-                        content: format!(
-                            "Tool '{}' blocked: currently in PLAN mode (read-only). \
-                             Switch to BUILD mode to make changes.",
-                            tc.name
-                        ),
-                        is_error: true,
-                    }
-                } else {
-                    // Validate args against the tool's JSON schema
-                    let schema = tool.parameters_schema();
-                    if let Err(e) = validate_tool_args(&args, &schema) {
-                        ToolResult {
-                            tool_call_id: tc.id.clone(),
-                            content: format!("Invalid arguments: {e}"),
-                            is_error: true,
-                        }
-                    } else {
-                        // Check permissions before execution
-                        let description = tool.describe_invocation(&args);
-                        let allowed = self
-                            .state
-                            .permissions
-                            .check(&tc.name, tool.permission_level(), &description)
-                            .await;
-
-                        if allowed {
-                            // Execute with panic safety
-                            let exec_result =
-                                std::panic::AssertUnwindSafe(tool.execute(args, &ctx));
-                            match futures::FutureExt::catch_unwind(exec_result).await {
-                                Ok(Ok(output)) => ToolResult {
-                                    tool_call_id: tc.id.clone(),
-                                    content: output.content,
-                                    is_error: output.is_error,
-                                },
-                                Ok(Err(e)) => ToolResult {
-                                    tool_call_id: tc.id.clone(),
-                                    content: format!("Tool execution error: {e}"),
-                                    is_error: true,
-                                },
-                                Err(_panic) => ToolResult {
-                                    tool_call_id: tc.id.clone(),
-                                    content: format!(
-                                        "Tool '{}' panicked during execution",
-                                        tc.name
-                                    ),
-                                    is_error: true,
-                                },
-                            }
-                        } else {
-                            ToolResult {
-                                tool_call_id: tc.id.clone(),
-                                content: format!("Permission denied for tool '{}'", tc.name),
-                                is_error: true,
-                            }
-                        }
-                    } // close schema validation else
-                } // close plan mode else
-            } else {
-                ToolResult {
+        for (i, tc) in tool_calls.iter().enumerate() {
+            let Some(tool) = self.state.tools.get(&tc.name) else {
+                pre_results[i] = Some(ToolResult {
                     tool_call_id: tc.id.clone(),
                     content: format!(
                         "Unknown tool: {}. Available tools: {}",
@@ -1192,34 +1123,189 @@ impl SessionEngine {
                         self.state.tools.names().join(", ")
                     ),
                     is_error: true,
-                }
+                });
+                continue;
             };
 
-            // Truncate very large outputs
-            let truncated = if result.content.len() > 50_000 {
-                let mut s = result.content[..25_000].to_string();
-                let _ = write!(
-                    s,
-                    "\n\n... [truncated {} bytes] ...\n\n",
-                    result.content.len() - 50_000
-                );
-                s.push_str(&result.content[result.content.len() - 25_000..]);
-                ToolResult { content: s, ..result }
+            let args: serde_json::Value = serde_json::from_str(&tc.arguments).unwrap_or_default();
+
+            if self.state.plan_mode.is_plan()
+                && tool.permission_level() != crate::tool::PermissionLevel::Safe
+            {
+                pre_results[i] = Some(ToolResult {
+                    tool_call_id: tc.id.clone(),
+                    content: format!(
+                        "Tool '{}' blocked: currently in PLAN mode (read-only). \
+                         Switch to BUILD mode to make changes.",
+                        tc.name
+                    ),
+                    is_error: true,
+                });
+                continue;
+            }
+
+            let schema = tool.parameters_schema();
+            if let Err(e) = validate_tool_args(&args, &schema) {
+                pre_results[i] = Some(ToolResult {
+                    tool_call_id: tc.id.clone(),
+                    content: format!("Invalid arguments: {e}"),
+                    is_error: true,
+                });
+                continue;
+            }
+
+            let description = tool.describe_invocation(&args);
+            let allowed =
+                self.state.permissions.check(&tc.name, tool.permission_level(), &description).await;
+
+            if !allowed {
+                pre_results[i] = Some(ToolResult {
+                    tool_call_id: tc.id.clone(),
+                    content: format!("Permission denied for tool '{}'", tc.name),
+                    is_error: true,
+                });
+                continue;
+            }
+
+            approved.push((i, Arc::clone(tool), args));
+        }
+
+        // Phase 2: Execute approved calls — safe concurrently, non-safe sequentially.
+        let mut safe_batch: Vec<(usize, Arc<dyn crate::tool::Tool>, serde_json::Value)> =
+            Vec::new();
+        let mut non_safe_batch: Vec<(usize, Arc<dyn crate::tool::Tool>, serde_json::Value)> =
+            Vec::new();
+
+        for (i, tool, args) in approved {
+            if tool.permission_level() == crate::tool::PermissionLevel::Safe {
+                safe_batch.push((i, tool, args));
             } else {
-                result
-            };
+                non_safe_batch.push((i, tool, args));
+            }
+        }
+
+        // Phase 2a: Safe tools concurrently
+        if !safe_batch.is_empty() && !self.cancel_token.is_cancelled() {
+            let futs: Vec<_> = safe_batch
+                .into_iter()
+                .map(|(i, tool, args)| {
+                    let tc = &tool_calls[i];
+                    let ctx = ctx.clone();
+                    let session_id = self.session_id.clone();
+                    let bus = self.state.bus.clone();
+                    let tc_name = tc.name.clone();
+                    let tc_id = tc.id.clone();
+
+                    async move {
+                        bus.send(BusEvent::ToolCallStarted {
+                            session_id: session_id.clone(),
+                            tool_name: tc_name.clone(),
+                            tool_call_id: tc_id.clone(),
+                        });
+
+                        let result =
+                            execute_single_tool(&*tool, args, &ctx, &tc_id, &tc_name).await;
+
+                        bus.send(BusEvent::ToolCallCompleted {
+                            session_id,
+                            tool_name: tc_name,
+                            tool_call_id: tc_id,
+                            is_error: result.is_error,
+                        });
+
+                        (i, result)
+                    }
+                })
+                .collect();
+
+            let concurrent_results = futures::future::join_all(futs).await;
+            for (i, result) in concurrent_results {
+                pre_results[i] = Some(truncate_result(result));
+            }
+        }
+
+        // Phase 2b: Non-safe tools sequentially
+        for (i, tool, args) in non_safe_batch {
+            if self.cancel_token.is_cancelled() {
+                pre_results[i] = Some(ToolResult {
+                    tool_call_id: tool_calls[i].id.clone(),
+                    content: "Cancelled by user.".into(),
+                    is_error: true,
+                });
+                continue;
+            }
+
+            let tc = &tool_calls[i];
+            self.state.bus.send(BusEvent::ToolCallStarted {
+                session_id: self.session_id.clone(),
+                tool_name: tc.name.clone(),
+                tool_call_id: tc.id.clone(),
+            });
+
+            let result = execute_single_tool(&*tool, args, &ctx, &tc.id, &tc.name).await;
 
             self.state.bus.send(BusEvent::ToolCallCompleted {
                 session_id: self.session_id.clone(),
                 tool_name: tc.name.clone(),
                 tool_call_id: tc.id.clone(),
-                is_error: truncated.is_error,
+                is_error: result.is_error,
             });
 
-            results.push(truncated);
+            pre_results[i] = Some(truncate_result(result));
         }
 
-        results
+        pre_results
+            .into_iter()
+            .enumerate()
+            .map(|(i, r)| {
+                r.unwrap_or_else(|| ToolResult {
+                    tool_call_id: tool_calls[i].id.clone(),
+                    content: "Internal error: tool result not populated".into(),
+                    is_error: true,
+                })
+            })
+            .collect()
+    }
+}
+
+/// Execute a single tool call with panic safety.
+async fn execute_single_tool(
+    tool: &dyn crate::tool::Tool,
+    args: serde_json::Value,
+    ctx: &crate::tool::ToolContext,
+    tool_call_id: &str,
+    tool_name: &str,
+) -> ToolResult {
+    let exec_result = std::panic::AssertUnwindSafe(tool.execute(args, ctx));
+    match futures::FutureExt::catch_unwind(exec_result).await {
+        Ok(Ok(output)) => ToolResult {
+            tool_call_id: tool_call_id.to_string(),
+            content: output.content,
+            is_error: output.is_error,
+        },
+        Ok(Err(e)) => ToolResult {
+            tool_call_id: tool_call_id.to_string(),
+            content: format!("Tool execution error: {e}"),
+            is_error: true,
+        },
+        Err(_panic) => ToolResult {
+            tool_call_id: tool_call_id.to_string(),
+            content: format!("Tool '{tool_name}' panicked during execution"),
+            is_error: true,
+        },
+    }
+}
+
+/// Truncate very large tool outputs to keep context manageable.
+fn truncate_result(result: ToolResult) -> ToolResult {
+    use std::fmt::Write;
+    if result.content.len() > 50_000 {
+        let mut s = result.content[..25_000].to_string();
+        let _ = write!(s, "\n\n... [truncated {} bytes] ...\n\n", result.content.len() - 50_000);
+        s.push_str(&result.content[result.content.len() - 25_000..]);
+        ToolResult { content: s, ..result }
+    } else {
+        result
     }
 }
 

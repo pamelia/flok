@@ -72,6 +72,9 @@ pub enum BusEvent {
         files_changed: usize,
     },
 
+    /// The current operation was cancelled by the user.
+    Cancelled { session_id: String },
+
     /// An error occurred.
     Error { message: String },
 }

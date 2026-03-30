@@ -15,6 +15,8 @@ pub enum UiCommand {
     Undo,
     /// Redo the last undone message and restore files.
     Redo,
+    /// Cancel the current streaming response or tool execution.
+    Cancel,
     /// User wants to quit.
     Quit,
 }
@@ -26,6 +28,9 @@ pub enum UiEvent {
     TextDelta(String),
     /// The assistant finished responding.
     AssistantDone(String),
+    /// The assistant's response was cancelled by the user.
+    /// Contains any partial text generated before cancellation.
+    Cancelled(String),
     /// A historical message loaded from a resumed session.
     /// (role: "user" | "assistant" | "system", content)
     HistoryMessage { role: String, content: String },

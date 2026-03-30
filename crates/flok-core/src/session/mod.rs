@@ -7,5 +7,5 @@
 mod engine;
 mod state;
 
-pub use engine::{SessionEngine, UndoResult};
+pub use engine::{SendMessageResult, SessionEngine, UndoResult};
 pub use state::{AppState, PlanMode};

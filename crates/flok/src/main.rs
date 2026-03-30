@@ -207,11 +207,21 @@ async fn run(args: cli::Args) -> Result<()> {
 /// Run in non-interactive mode: send a single prompt and print the response.
 async fn run_non_interactive(state: AppState, model_id: String, prompt: &str) -> Result<()> {
     let mut engine = SessionEngine::new(state, model_id)?;
-    let response = engine.send_message(prompt).await?;
+    let result = engine.send_message(prompt).await?;
     // In non-interactive mode, print directly to stdout
     #[allow(clippy::print_stdout)]
     {
-        println!("{response}");
+        match result {
+            flok_core::session::SendMessageResult::Complete(response) => {
+                println!("{response}");
+            }
+            flok_core::session::SendMessageResult::Cancelled { partial_text } => {
+                if !partial_text.is_empty() {
+                    println!("{partial_text}");
+                }
+                println!("(cancelled)");
+            }
+        }
     }
     Ok(())
 }
@@ -258,18 +268,56 @@ async fn run_interactive(
         SessionEngine::new(state, model_id)?
     };
 
-    // Spawn the background session task
+    // Spawn the background session task.
+    //
+    // The key challenge is that `engine.send_message()` blocks the command
+    // loop while streaming + executing tools. We use `tokio::select!` to
+    // allow Cancel (and Quit) commands to be processed during that time.
     let session_handle = tokio::task::spawn_local(async move {
         while let Some(cmd) = cmd_rx.recv().await {
             match cmd {
-                flok_tui::UiCommand::SendMessage(text) => match engine.send_message(&text).await {
-                    Ok(response) => {
-                        let _ = ui_tx.send(flok_tui::UiEvent::AssistantDone(response));
+                flok_tui::UiCommand::SendMessage(text) => {
+                    // Reset + clone the cancel token BEFORE the mutable borrow
+                    // in send_message(). This ensures the cloned token matches
+                    // the one used inside the prompt loop.
+                    engine.reset_cancel();
+                    let cancel = engine.cancel_token();
+
+                    // Pin the future so it can be polled in select!
+                    let mut send_fut = std::pin::pin!(engine.send_message(&text));
+                    let result = loop {
+                        tokio::select! {
+                            biased;
+                            result = &mut send_fut => break result,
+                            Some(inner_cmd) = cmd_rx.recv() => {
+                                match inner_cmd {
+                                    flok_tui::UiCommand::Cancel => {
+                                        cancel.cancel();
+                                        // Don't break — let send_message detect
+                                        // the token and finish gracefully
+                                    }
+                                    flok_tui::UiCommand::Quit => {
+                                        cancel.cancel();
+                                        return;
+                                    }
+                                    // Ignore other commands while streaming
+                                    _ => {}
+                                }
+                            }
+                        }
+                    };
+                    match result {
+                        Ok(flok_core::session::SendMessageResult::Complete(response)) => {
+                            let _ = ui_tx.send(flok_tui::UiEvent::AssistantDone(response));
+                        }
+                        Ok(flok_core::session::SendMessageResult::Cancelled { partial_text }) => {
+                            let _ = ui_tx.send(flok_tui::UiEvent::Cancelled(partial_text));
+                        }
+                        Err(e) => {
+                            let _ = ui_tx.send(flok_tui::UiEvent::Error(e.to_string()));
+                        }
                     }
-                    Err(e) => {
-                        let _ = ui_tx.send(flok_tui::UiEvent::Error(e.to_string()));
-                    }
-                },
+                }
                 flok_tui::UiCommand::ListSessions => {
                     // Query sessions from the DB and send as a system message
                     match engine.list_sessions_text() {
@@ -310,6 +358,9 @@ async fn run_interactive(
                         let _ = ui_tx.send(flok_tui::UiEvent::Error(format!("Redo failed: {e}")));
                     }
                 },
+                flok_tui::UiCommand::Cancel => {
+                    // Cancel received outside of streaming — nothing to cancel
+                }
                 flok_tui::UiCommand::Quit => break,
             }
         }

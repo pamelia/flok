@@ -112,6 +112,21 @@ fn FlokApp(mut hooks: Hooks, props: &mut FlokAppProps) -> impl Into<AnyElement<'
                         .push(DisplayMessage { role: MessageRole::Assistant, content: text });
                     waiting.set(false);
                 }
+                Some(UiEvent::Cancelled(partial)) => {
+                    streaming_text.set(String::new());
+                    streaming_reasoning.set(String::new());
+                    if !partial.is_empty() {
+                        messages.write().push(DisplayMessage {
+                            role: MessageRole::Assistant,
+                            content: partial,
+                        });
+                    }
+                    messages.write().push(DisplayMessage {
+                        role: MessageRole::System,
+                        content: "(cancelled)".into(),
+                    });
+                    waiting.set(false);
+                }
                 Some(UiEvent::HistoryMessage { role, content }) => {
                     let msg_role = match role.as_str() {
                         "user" => MessageRole::User,
@@ -446,6 +461,12 @@ fn FlokApp(mut hooks: Hooks, props: &mut FlokAppProps) -> impl Into<AnyElement<'
 
                 // Normal keyboard handling
                 match code {
+                    // ESC cancels the current streaming/tool execution
+                    KeyCode::Esc if waiting.get() => {
+                        if let Some(ref tx) = cmd_tx {
+                            let _ = tx.send(UiCommand::Cancel);
+                        }
+                    }
                     KeyCode::Char('c' | 'd') if ctrl => {
                         if let Some(ref tx) = cmd_tx {
                             let _ = tx.send(UiCommand::Quit);

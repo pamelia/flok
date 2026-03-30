@@ -17,8 +17,8 @@ use flok_core::provider::AnthropicProvider;
 use flok_core::session::{AppState, SessionEngine};
 use flok_core::snapshot::SnapshotManager;
 use flok_core::tool::{
-    AgentMemoryTool, BashTool, EditTool, GlobTool, GrepTool, PlanTool, QuestionTool, ReadTool,
-    SkillTool, TaskTool, TodoList, TodoWriteTool, ToolRegistry, WebfetchTool, WriteTool,
+    AgentMemoryTool, BashTool, EditTool, FastApplyTool, GlobTool, GrepTool, PlanTool, QuestionTool,
+    ReadTool, SkillTool, TaskTool, TodoList, TodoWriteTool, ToolRegistry, WebfetchTool, WriteTool,
 };
 use tokio::sync::mpsc;
 
@@ -107,6 +107,7 @@ async fn run(args: cli::Args) -> Result<()> {
     tools.register(Arc::new(ReadTool));
     tools.register(Arc::new(WriteTool));
     tools.register(Arc::new(EditTool));
+    tools.register(Arc::new(FastApplyTool));
     tools.register(Arc::new(BashTool));
     tools.register(Arc::new(GrepTool));
     tools.register(Arc::new(GlobTool));

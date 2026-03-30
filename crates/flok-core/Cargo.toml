@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 flok-db = { path = "../flok-db" }
+flok-apply = { path = "../flok-apply" }
 
 tokio = { workspace = true }
 serde = { workspace = true }

@@ -693,6 +693,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "flok-apply"
+version = "0.0.1"
+dependencies = [
+ "insta",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "flok-core"
 version = "0.0.1"
 dependencies = [
@@ -703,6 +712,7 @@ dependencies = [
  "chrono",
  "dashmap",
  "directories",
+ "flok-apply",
  "flok-db",
  "futures",
  "glob",

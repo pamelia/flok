@@ -11,6 +11,7 @@ pub mod bus;
 pub mod compress;
 pub mod config;
 pub mod provider;
+pub mod review;
 pub mod session;
 pub mod snapshot;
 pub mod token;

@@ -9,7 +9,9 @@
 
 mod engine;
 mod prompts;
+pub mod self_review;
 mod types;
 
 pub use engine::ReviewEngine;
-pub use types::{Finding, FindingPriority, ReviewResult, Verdict};
+pub use self_review::{SelfReviewLoop, SelfReviewResult, StopReason};
+pub use types::{Finding, FindingKind, FindingPriority, ReviewResult, Verdict};

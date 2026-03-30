@@ -1,0 +1,92 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+repository = "https://github.com/opencode-dev/flok"
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+unreachable_pub = "warn"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -2 }
+# Selectively allow noisy pedantic lints
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+too_many_lines = "allow"
+module_name_repetitions = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+# Deny dangerous patterns
+dbg_macro = "deny"
+print_stdout = "warn"
+print_stderr = "warn"
+todo = "deny"
+get_unwrap = "warn"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Database
+rusqlite = { version = "0.32", features = ["bundled", "serde_json"] }
+
+# HTTP client (for LLM providers)
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+reqwest-eventsource = "0.6"
+
+# TUI
+iocraft = { path = "../iocraft/packages/iocraft" }
+crossterm = "0.29"
+arboard = "3"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Utilities
+ulid = "1"
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+directories = "6"
+arc-swap = "1"
+dashmap = "6"
+tiktoken-rs = "0.6"
+async-trait = "0.1"
+futures = "0.3"
+tokio-util = "0.7"
+glob = "0.3"
+regex = "1"
+blake3 = "1"
+lru = "0.12"
+jsonschema = "0.28"
+tokio-stream = "0.1"
+
+# Testing
+insta = { version = "1", features = ["json"] }
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+overflow-checks = true
+
+[profile.dev.package."*"]
+opt-level = 1

@@ -1,0 +1,4 @@
+disallowed-methods = [
+    { path = "serde_json::from_reader", reason = "Use from_slice or from_str -- 10x faster" },
+    { path = "std::process::Command::new", reason = "Use tokio::process::Command for async" },
+]

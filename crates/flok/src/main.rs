@@ -18,9 +18,9 @@ use flok_core::session::{AppState, SessionEngine};
 use flok_core::snapshot::SnapshotManager;
 use flok_core::team::TeamRegistry;
 use flok_core::tool::{
-    AgentMemoryTool, BashTool, EditTool, FastApplyTool, GlobTool, GrepTool, PlanTool, QuestionTool,
-    ReadTool, SendMessageTool, SkillTool, TaskTool, TeamCreateTool, TeamDeleteTool, TeamTaskTool,
-    TodoList, TodoWriteTool, ToolRegistry, WebfetchTool, WriteTool,
+    AgentMemoryTool, BashTool, CodeReviewTool, EditTool, FastApplyTool, GlobTool, GrepTool,
+    PlanTool, QuestionTool, ReadTool, SendMessageTool, SkillTool, TaskTool, TeamCreateTool,
+    TeamDeleteTool, TeamTaskTool, TodoList, TodoWriteTool, ToolRegistry, WebfetchTool, WriteTool,
 };
 use flok_core::worktree::WorktreeManager;
 use tokio::sync::mpsc;
@@ -120,6 +120,7 @@ async fn run(args: cli::Args) -> Result<()> {
     tools.register(Arc::new(SkillTool));
     tools.register(Arc::new(AgentMemoryTool));
     tools.register(Arc::new(PlanTool));
+    tools.register(Arc::new(CodeReviewTool::new(Arc::clone(&provider))));
 
     // Create team registry for multi-agent coordination
     let team_registry = TeamRegistry::new();

@@ -98,12 +98,19 @@ impl AppState {
     }
 
     /// Create a `ToolContext` for tool execution.
-    pub fn tool_context(&self, session_id: &str) -> ToolContext {
+    ///
+    /// The `cancel` token is shared with the session engine so that
+    /// cancellation propagates into running tools.
+    pub fn tool_context(
+        &self,
+        session_id: &str,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> ToolContext {
         ToolContext {
             project_root: self.project_root.clone(),
             session_id: session_id.to_string(),
             agent: "primary".to_string(),
-            cancel: tokio_util::sync::CancellationToken::new(),
+            cancel,
         }
     }
 }

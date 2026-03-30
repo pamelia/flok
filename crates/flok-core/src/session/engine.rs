@@ -11,6 +11,7 @@ use std::fmt::Write;
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
 use std::collections::HashMap;
@@ -158,6 +159,19 @@ pub struct UndoResult {
     pub files_changed: usize,
 }
 
+/// The result of `send_message` — either a complete response or a cancelled partial.
+#[derive(Debug)]
+pub enum SendMessageResult {
+    /// The assistant completed its response normally.
+    Complete(String),
+    /// The operation was cancelled by the user. Contains any partial text
+    /// generated before cancellation.
+    Cancelled {
+        /// Partial response text accumulated before cancellation.
+        partial_text: String,
+    },
+}
+
 /// The session engine manages a single conversation.
 pub struct SessionEngine {
     state: AppState,
@@ -167,6 +181,9 @@ pub struct SessionEngine {
     undo_stack: Vec<UndoEntry>,
     /// Stack of redo entries: state captured before each undo, enabling redo.
     redo_stack: Vec<RedoEntry>,
+    /// Cancellation token for the current operation. Triggered by `cancel()`,
+    /// reset at the start of each `send_message()` call.
+    cancel_token: CancellationToken,
 }
 
 impl SessionEngine {
@@ -184,7 +201,14 @@ impl SessionEngine {
 
         state.bus.send(BusEvent::SessionCreated { session_id: session_id.clone() });
 
-        Ok(Self { state, session_id, model_id, undo_stack: Vec::new(), redo_stack: Vec::new() })
+        Ok(Self {
+            state,
+            session_id,
+            model_id,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            cancel_token: CancellationToken::new(),
+        })
     }
 
     /// Resume an existing session.
@@ -200,12 +224,36 @@ impl SessionEngine {
             model_id: session.model_id,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
+            cancel_token: CancellationToken::new(),
         })
     }
 
     /// The session ID.
     pub fn session_id(&self) -> &str {
         &self.session_id
+    }
+
+    /// Cancel the current streaming or tool execution operation.
+    ///
+    /// Safe to call multiple times — cancelling an already-cancelled token is a no-op.
+    pub fn cancel(&self) {
+        self.cancel_token.cancel();
+    }
+
+    /// Reset the cancellation token for a new operation.
+    ///
+    /// Must be called before `send_message()` + `cancel_token()` to ensure
+    /// the cloned token corresponds to the current operation.
+    pub fn reset_cancel(&mut self) {
+        self.cancel_token = CancellationToken::new();
+    }
+
+    /// Get a clone of the current cancellation token.
+    ///
+    /// Useful when the caller needs to trigger cancellation from a separate
+    /// async branch (e.g., `tokio::select!`) without borrowing the engine.
+    pub fn cancel_token(&self) -> CancellationToken {
+        self.cancel_token.clone()
     }
 
     /// Load historical messages for display (used when resuming a session).
@@ -429,13 +477,15 @@ impl SessionEngine {
     /// Send a user message and run the prompt loop until the assistant
     /// responds with text only (no tool calls).
     ///
-    /// Returns the final assistant text response.
+    /// Returns `SendMessageResult::Complete` with the final text, or
+    /// `SendMessageResult::Cancelled` with any partial text if the user
+    /// cancelled via ESC.
     ///
     /// # Errors
     ///
     /// Returns an error if the provider fails or tool execution fails
     /// unrecoverably.
-    pub async fn send_message(&mut self, user_text: &str) -> anyhow::Result<String> {
+    pub async fn send_message(&mut self, user_text: &str) -> anyhow::Result<SendMessageResult> {
         // Capture workspace snapshot BEFORE processing this user message.
         // This is the undo point — if the user does /undo, we restore to here.
         let pre_snapshot = match self.state.snapshot.track().await {
@@ -598,7 +648,44 @@ impl SessionEngine {
                 max_tokens: 16_384,
             };
 
-            let (text, reasoning, tool_calls) = self.stream_completion_with_retry(request).await?;
+            let (text, reasoning, tool_calls) =
+                match self.stream_completion_with_retry(request).await {
+                    Ok(result) => result,
+                    Err(e) => {
+                        // Check if this was a cancellation
+                        if let Some(cancelled) = e.downcast_ref::<CancelledError>() {
+                            let partial = cancelled.partial_text.clone();
+
+                            // Persist partial response so conversation history stays coherent
+                            if !partial.is_empty() {
+                                let partial_msg_id = Ulid::new().to_string();
+                                let mut parts: Vec<MessageContent> = Vec::new();
+                                if !cancelled.partial_reasoning.is_empty() {
+                                    parts.push(MessageContent::Thinking {
+                                        thinking: cancelled.partial_reasoning.clone(),
+                                    });
+                                }
+                                parts.push(MessageContent::Text {
+                                    text: format!("{partial}\n\n_(cancelled by user)_"),
+                                });
+                                let parts_json = serde_json::to_string(&parts)?;
+                                self.state.db.insert_message(
+                                    &partial_msg_id,
+                                    &self.session_id,
+                                    "assistant",
+                                    &parts_json,
+                                )?;
+                            }
+
+                            self.state
+                                .bus
+                                .send(BusEvent::Cancelled { session_id: self.session_id.clone() });
+
+                            return Ok(SendMessageResult::Cancelled { partial_text: partial });
+                        }
+                        return Err(e);
+                    }
+                };
 
             // Store the assistant message
             let assistant_msg_id = Ulid::new().to_string();
@@ -635,7 +722,14 @@ impl SessionEngine {
 
             // If no tool calls, we're done
             if tool_calls.is_empty() {
-                return Ok(text);
+                return Ok(SendMessageResult::Complete(text));
+            }
+
+            // Check cancellation before starting tool execution
+            if self.cancel_token.is_cancelled() {
+                // Persist what we have
+                self.state.bus.send(BusEvent::Cancelled { session_id: self.session_id.clone() });
+                return Ok(SendMessageResult::Cancelled { partial_text: text });
             }
 
             // Snapshot: capture workspace state BEFORE tool execution
@@ -739,6 +833,12 @@ impl SessionEngine {
             let result_msg_id = Ulid::new().to_string();
             let result_json = serde_json::to_string(&result_parts)?;
             self.state.db.insert_message(&result_msg_id, &self.session_id, "user", &result_json)?;
+
+            // Check cancellation after tool execution — don't start another round
+            if self.cancel_token.is_cancelled() {
+                self.state.bus.send(BusEvent::Cancelled { session_id: self.session_id.clone() });
+                return Ok(SendMessageResult::Cancelled { partial_text: text });
+            }
         }
     }
 
@@ -804,7 +904,9 @@ impl SessionEngine {
 
     /// Stream a completion request and collect the response.
     ///
-    /// Returns `(text, reasoning, tool_calls)`.
+    /// Returns `(text, reasoning, tool_calls)`. If the cancellation token
+    /// fires mid-stream, returns whatever was accumulated so far as a
+    /// `CancelledError`.
     async fn stream_completion(
         &self,
         request: CompletionRequest,
@@ -812,8 +914,9 @@ impl SessionEngine {
         let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
 
         // Only move the provider Arc into the spawn (Db is !Send).
+        // Keep the JoinHandle so we can abort on cancellation.
         let provider = Arc::clone(&self.state.provider);
-        tokio::spawn(async move {
+        let provider_handle = tokio::spawn(async move {
             if let Err(e) = provider.stream(request, tx).await {
                 tracing::error!("Provider stream error: {e}");
             }
@@ -825,76 +928,93 @@ impl SessionEngine {
         let stream_timeout = std::time::Duration::from_secs(30);
 
         loop {
-            let event = match tokio::time::timeout(stream_timeout, rx.recv()).await {
-                Ok(Some(event)) => event,
-                Ok(None) => break, // Channel closed
-                Err(_) => {
-                    // 30s with no event — stream is hung
-                    tracing::warn!("stream timeout: no event for 30s, aborting");
-                    return Err(anyhow::anyhow!(
-                        "Stream timeout: no response from provider for 30 seconds. \
-                         The model may be overloaded. Try again."
-                    ));
+            tokio::select! {
+                biased;
+
+                // Cancellation takes priority
+                () = self.cancel_token.cancelled() => {
+                    provider_handle.abort();
+                    tracing::info!("stream cancelled by user");
+                    return Err(CancelledError {
+                        partial_text: text,
+                        partial_reasoning: reasoning,
+                    }.into());
                 }
-            };
-            match event {
-                StreamEvent::TextDelta(delta) => {
-                    if !delta.is_empty() {
-                        text.push_str(&delta);
-                        self.state.bus.send(BusEvent::TextDelta {
-                            session_id: self.session_id.clone(),
-                            message_id: String::new(),
-                            delta,
-                        });
+
+                result = tokio::time::timeout(stream_timeout, rx.recv()) => {
+                    let event = match result {
+                        Ok(Some(event)) => event,
+                        Ok(None) => break, // Channel closed
+                        Err(_) => {
+                            // 30s with no event — stream is hung
+                            tracing::warn!("stream timeout: no event for 30s, aborting");
+                            provider_handle.abort();
+                            return Err(anyhow::anyhow!(
+                                "Stream timeout: no response from provider for 30 seconds. \
+                                 The model may be overloaded. Try again."
+                            ));
+                        }
+                    };
+                    match event {
+                        StreamEvent::TextDelta(delta) => {
+                            if !delta.is_empty() {
+                                text.push_str(&delta);
+                                self.state.bus.send(BusEvent::TextDelta {
+                                    session_id: self.session_id.clone(),
+                                    message_id: String::new(),
+                                    delta,
+                                });
+                            }
+                        }
+                        StreamEvent::ReasoningDelta(delta) => {
+                            if !delta.is_empty() {
+                                reasoning.push_str(&delta);
+                                self.state.bus.send(BusEvent::ReasoningDelta {
+                                    session_id: self.session_id.clone(),
+                                    delta,
+                                });
+                            }
+                        }
+                        StreamEvent::ToolCallStart { index, id, name } => {
+                            while tool_calls.len() <= index {
+                                tool_calls.push(ToolCall::default());
+                            }
+                            tool_calls[index].id = id;
+                            tool_calls[index].name = name;
+                        }
+                        StreamEvent::ToolCallDelta { index, delta } => {
+                            if let Some(tc) = tool_calls.get_mut(index) {
+                                tc.arguments.push_str(&delta);
+                            }
+                        }
+                        StreamEvent::Usage {
+                            input_tokens,
+                            output_tokens,
+                            cache_read_tokens,
+                            cache_creation_tokens,
+                        } => {
+                            tracing::debug!(input_tokens, output_tokens, cache_read_tokens, "token usage");
+                            self.state.cost_tracker.record(
+                                input_tokens,
+                                output_tokens,
+                                cache_read_tokens,
+                                cache_creation_tokens,
+                            );
+                            self.state.bus.send(BusEvent::TokenUsage {
+                                session_id: self.session_id.clone(),
+                                input_tokens,
+                                output_tokens,
+                            });
+                            self.state.bus.send(BusEvent::CostUpdate {
+                                session_id: self.session_id.clone(),
+                                total_cost_usd: self.state.cost_tracker.estimated_cost_usd(),
+                            });
+                        }
+                        StreamEvent::Done => break,
+                        StreamEvent::Error(e) => {
+                            return Err(anyhow::anyhow!("Provider error: {e}"));
+                        }
                     }
-                }
-                StreamEvent::ReasoningDelta(delta) => {
-                    if !delta.is_empty() {
-                        reasoning.push_str(&delta);
-                        self.state.bus.send(BusEvent::ReasoningDelta {
-                            session_id: self.session_id.clone(),
-                            delta,
-                        });
-                    }
-                }
-                StreamEvent::ToolCallStart { index, id, name } => {
-                    while tool_calls.len() <= index {
-                        tool_calls.push(ToolCall::default());
-                    }
-                    tool_calls[index].id = id;
-                    tool_calls[index].name = name;
-                }
-                StreamEvent::ToolCallDelta { index, delta } => {
-                    if let Some(tc) = tool_calls.get_mut(index) {
-                        tc.arguments.push_str(&delta);
-                    }
-                }
-                StreamEvent::Usage {
-                    input_tokens,
-                    output_tokens,
-                    cache_read_tokens,
-                    cache_creation_tokens,
-                } => {
-                    tracing::debug!(input_tokens, output_tokens, cache_read_tokens, "token usage");
-                    self.state.cost_tracker.record(
-                        input_tokens,
-                        output_tokens,
-                        cache_read_tokens,
-                        cache_creation_tokens,
-                    );
-                    self.state.bus.send(BusEvent::TokenUsage {
-                        session_id: self.session_id.clone(),
-                        input_tokens,
-                        output_tokens,
-                    });
-                    self.state.bus.send(BusEvent::CostUpdate {
-                        session_id: self.session_id.clone(),
-                        total_cost_usd: self.state.cost_tracker.estimated_cost_usd(),
-                    });
-                }
-                StreamEvent::Done => break,
-                StreamEvent::Error(e) => {
-                    return Err(anyhow::anyhow!("Provider error: {e}"));
                 }
             }
         }
@@ -909,6 +1029,7 @@ impl SessionEngine {
     /// Stream a completion with retry on transient errors (429, 529, 500, overloaded).
     ///
     /// Uses exponential backoff: 1s, 2s, 4s (max 3 retries).
+    /// Cancellation errors are never retried.
     async fn stream_completion_with_retry(
         &self,
         request: CompletionRequest,
@@ -922,6 +1043,11 @@ impl SessionEngine {
             match &result {
                 Ok(_) => return result,
                 Err(e) => {
+                    // Never retry cancellations
+                    if e.downcast_ref::<CancelledError>().is_some() {
+                        return result;
+                    }
+
                     let err_msg = e.to_string();
                     let is_retryable = err_msg.contains("429")
                         || err_msg.contains("529")
@@ -962,11 +1088,25 @@ impl SessionEngine {
     }
 
     /// Execute a batch of tool calls.
+    ///
+    /// Checks the cancellation token between calls. If cancelled, remaining
+    /// tool calls are skipped and returned as cancelled errors.
     async fn execute_tool_calls(&self, tool_calls: &[ToolCall]) -> Vec<ToolResult> {
         let mut results = Vec::with_capacity(tool_calls.len());
-        let ctx = self.state.tool_context(&self.session_id);
+        let ctx = self.state.tool_context(&self.session_id, self.cancel_token.clone());
 
         for tc in tool_calls {
+            // Check cancellation before each tool call
+            if self.cancel_token.is_cancelled() {
+                tracing::info!(tool = %tc.name, "skipping tool call — cancelled by user");
+                results.push(ToolResult {
+                    tool_call_id: tc.id.clone(),
+                    content: "Cancelled by user.".into(),
+                    is_error: true,
+                });
+                continue;
+            }
+
             tracing::debug!(tool = %tc.name, id = %tc.id, "executing tool call");
 
             self.state.bus.send(BusEvent::ToolCallStarted {
@@ -1097,6 +1237,17 @@ struct ToolResult {
     tool_call_id: String,
     content: String,
     is_error: bool,
+}
+
+/// Error returned when an operation is cancelled by the user.
+///
+/// Contains partial results accumulated before cancellation so the caller
+/// can persist them for conversation history coherence.
+#[derive(Debug, thiserror::Error)]
+#[error("operation cancelled by user")]
+struct CancelledError {
+    partial_text: String,
+    partial_reasoning: String,
 }
 
 /// Estimate total token count for a set of messages + system prompt.

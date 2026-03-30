@@ -1,0 +1,17 @@
+[package]
+name = "flok-apply"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Fast apply engine for flok — line-level fuzzy matching for lazy edit snippets"
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+insta = { workspace = true }

@@ -6,6 +6,7 @@
 
 mod bash;
 mod edit;
+mod fast_apply;
 mod glob_tool;
 mod grep;
 mod memory;
@@ -21,6 +22,7 @@ mod write;
 
 pub use bash::BashTool;
 pub use edit::EditTool;
+pub use fast_apply::FastApplyTool;
 pub use glob_tool::GlobTool;
 pub use grep::GrepTool;
 pub use memory::AgentMemoryTool;

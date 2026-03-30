@@ -14,6 +14,7 @@ use crate::agent;
 use crate::bus::BusEvent;
 use crate::config::WorktreeConfig;
 use crate::provider::{CompletionRequest, Message, MessageContent, StreamEvent};
+use crate::team::{TeamMessage, TeamRegistry};
 use crate::worktree::WorktreeManager;
 
 use super::{Tool, ToolContext, ToolOutput};
@@ -35,10 +36,13 @@ pub struct TaskTool {
     worktree_mgr: Arc<WorktreeManager>,
     /// Worktree configuration.
     worktree_config: WorktreeConfig,
+    /// Team registry for background agent coordination.
+    team_registry: TeamRegistry,
 }
 
 impl TaskTool {
     /// Create a new task tool.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         provider: Arc<dyn crate::provider::Provider>,
         tools: Arc<crate::tool::ToolRegistry>,
@@ -46,8 +50,9 @@ impl TaskTool {
         project_root: std::path::PathBuf,
         worktree_mgr: Arc<WorktreeManager>,
         worktree_config: WorktreeConfig,
+        team_registry: TeamRegistry,
     ) -> Self {
-        Self { provider, tools, bus, project_root, worktree_mgr, worktree_config }
+        Self { provider, tools, bus, project_root, worktree_mgr, worktree_config, team_registry }
     }
 }
 
@@ -80,6 +85,14 @@ impl Tool for TaskTool {
                 "subagent_type": {
                     "type": "string",
                     "description": format!("The type of agent to use:\n{agent_list}")
+                },
+                "background": {
+                    "type": "boolean",
+                    "description": "If true, the agent runs in the background and returns immediately with a task_id. Use with team_id for parallel multi-agent workflows."
+                },
+                "team_id": {
+                    "type": "string",
+                    "description": "The team ID to register this agent as a member. Required when background is true for team-based workflows."
                 }
             }
         })
@@ -104,7 +117,17 @@ impl Tool for TaskTool {
             anyhow::anyhow!("Unknown agent type: {agent_type}. Available: {}", available.join(", "))
         })?;
 
-        tracing::info!(agent = agent_type, description, "spawning sub-agent task");
+        let background = args["background"].as_bool().unwrap_or(false);
+        let team_id = args["team_id"].as_str().map(String::from);
+
+        tracing::info!(agent = agent_type, description, background, "spawning sub-agent task");
+
+        // Background mode: spawn the agent and return immediately
+        if background {
+            return self
+                .execute_background(description, prompt, agent_type, &agent_def, team_id, ctx)
+                .await;
+        }
 
         self.bus.send(BusEvent::ToolCallStarted {
             session_id: ctx.session_id.clone(),
@@ -214,6 +237,113 @@ impl Tool for TaskTool {
 }
 
 impl TaskTool {
+    /// Execute a background sub-agent that runs asynchronously and reports
+    /// results via team messaging.
+    ///
+    /// Returns immediately with the agent's `task_id`.
+    async fn execute_background(
+        &self,
+        description: &str,
+        prompt: &str,
+        agent_type: &str,
+        agent_def: &agent::AgentDef,
+        team_id: Option<String>,
+        ctx: &ToolContext,
+    ) -> anyhow::Result<ToolOutput> {
+        let task_id = ulid::Ulid::new().to_string();
+        let agent_name = format!("{agent_type}-{}", &task_id[..8]);
+
+        // Register as team member if team_id provided
+        if let Some(ref tid) = team_id {
+            if let Some((_, mut team_arc)) = self.team_registry.teams_mut().remove(tid) {
+                if let Some(team_mut) = Arc::get_mut(&mut team_arc) {
+                    team_mut.add_member(&agent_name).await;
+                }
+                self.team_registry.reinsert(tid.clone(), team_arc);
+            }
+        }
+
+        let effective_root = self.project_root.clone();
+        let system = agent_def.system_prompt.as_ref().map_or_else(
+            || {
+                format!(
+                    "You are a sub-agent ({agent_type}) helping with a specific task. \
+                         Complete the task and provide a clear summary of your findings.\n\n\
+                         Working directory: {}",
+                    effective_root.display()
+                )
+            },
+            std::string::ToString::to_string,
+        );
+
+        // Clone everything needed for the spawned task
+        let provider = Arc::clone(&self.provider);
+        let tools = Arc::clone(&self.tools);
+        let bus = self.bus.clone();
+        let session_id = ctx.session_id.clone();
+        let prompt = prompt.to_string();
+        let description = description.to_string();
+        let agent_type = agent_type.to_string();
+        let agent_name_clone = agent_name.clone();
+        let task_id_clone = task_id.clone();
+        let team_registry = self.team_registry.clone();
+        let team_id_clone = team_id.clone();
+
+        tokio::spawn(async move {
+            bus.send(BusEvent::ToolCallStarted {
+                session_id: session_id.clone(),
+                tool_name: format!("task:{agent_type}:{agent_name_clone}"),
+                tool_call_id: task_id_clone.clone(),
+            });
+
+            let result = run_subagent_standalone(
+                provider,
+                tools,
+                &system,
+                &prompt,
+                &session_id,
+                &description,
+                &effective_root,
+            )
+            .await;
+
+            let (response, is_error) = match result {
+                Ok(text) => (text, false),
+                Err(e) => (format!("Sub-agent error: {e}"), true),
+            };
+
+            // Send result to team lead if team_id was provided
+            if let Some(ref tid) = team_id_clone {
+                if let Some(team) = team_registry.get(tid) {
+                    let _ = team.send_message(TeamMessage {
+                        from: agent_name_clone.clone(),
+                        to: "lead".into(),
+                        content: response.clone(),
+                    });
+                }
+            }
+
+            bus.send(BusEvent::ToolCallCompleted {
+                session_id,
+                tool_name: format!("task:{agent_type}:{agent_name_clone}"),
+                tool_call_id: task_id_clone,
+                is_error,
+            });
+        });
+
+        tracing::info!(task_id = %task_id, agent_name = %agent_name, "background agent spawned");
+
+        Ok(ToolOutput::success(
+            serde_json::json!({
+                "task_id": task_id,
+                "agent_name": agent_name,
+                "status": "running",
+                "team_id": team_id,
+            })
+            .to_string(),
+        ))
+    }
+
     /// Run a sub-agent's prompt loop and return the final text response.
     async fn run_subagent(
         &self,
@@ -353,4 +483,131 @@ struct SubToolCall {
     id: String,
     name: String,
     arguments: String,
+}
+
+/// Standalone sub-agent runner for background tasks (no `&self` needed).
+async fn run_subagent_standalone(
+    provider: Arc<dyn crate::provider::Provider>,
+    tools: Arc<crate::tool::ToolRegistry>,
+    system: &str,
+    prompt: &str,
+    parent_session_id: &str,
+    description: &str,
+    effective_root: &std::path::Path,
+) -> anyhow::Result<String> {
+    let mut messages = vec![Message {
+        role: "user".into(),
+        content: vec![MessageContent::Text { text: prompt.to_string() }],
+    }];
+
+    let tool_defs = tools.tool_definitions();
+    let filtered_tools: Vec<_> = tool_defs.into_iter().filter(|t| t.name != "task").collect();
+
+    let sub_ctx = ToolContext {
+        project_root: effective_root.to_path_buf(),
+        session_id: format!("{parent_session_id}:bg:{description}"),
+        agent: "background".into(),
+        cancel: tokio_util::sync::CancellationToken::new(),
+    };
+
+    for step in 0..MAX_SUBAGENT_STEPS {
+        tracing::debug!(step, description, "background sub-agent step");
+
+        let request = CompletionRequest {
+            model: String::new(),
+            system: system.to_string(),
+            messages: messages.clone(),
+            tools: filtered_tools.clone(),
+            max_tokens: 8192,
+        };
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
+        let prov = Arc::clone(&provider);
+        tokio::spawn(async move {
+            if let Err(e) = prov.stream(request, tx).await {
+                tracing::error!("Background sub-agent stream error: {e}");
+            }
+        });
+
+        let mut text = String::new();
+        let mut tool_calls: Vec<SubToolCall> = Vec::new();
+        let timeout = std::time::Duration::from_secs(30);
+
+        loop {
+            let event = match tokio::time::timeout(timeout, rx.recv()).await {
+                Ok(Some(event)) => event,
+                Ok(None) => break,
+                Err(_) => return Err(anyhow::anyhow!("Background sub-agent stream timeout")),
+            };
+            match event {
+                StreamEvent::TextDelta(delta) => text.push_str(&delta),
+                StreamEvent::ToolCallStart { index, id, name } => {
+                    while tool_calls.len() <= index {
+                        tool_calls.push(SubToolCall::default());
+                    }
+                    tool_calls[index].id = id;
+                    tool_calls[index].name = name;
+                }
+                StreamEvent::ToolCallDelta { index, delta } => {
+                    if let Some(tc) = tool_calls.get_mut(index) {
+                        tc.arguments.push_str(&delta);
+                    }
+                }
+                StreamEvent::Done => break,
+                StreamEvent::Error(e) => {
+                    return Err(anyhow::anyhow!("Background sub-agent error: {e}"));
+                }
+                _ => {}
+            }
+        }
+
+        let tool_calls: Vec<_> =
+            tool_calls.into_iter().filter(|tc| !tc.id.is_empty() && !tc.name.is_empty()).collect();
+
+        let mut parts: Vec<MessageContent> = Vec::new();
+        if !text.is_empty() {
+            parts.push(MessageContent::Text { text: text.clone() });
+        }
+        for tc in &tool_calls {
+            parts.push(MessageContent::ToolUse {
+                id: tc.id.clone(),
+                name: tc.name.clone(),
+                input: serde_json::from_str(&tc.arguments).unwrap_or_default(),
+            });
+        }
+        messages.push(Message { role: "assistant".into(), content: parts });
+
+        if tool_calls.is_empty() {
+            return Ok(text);
+        }
+
+        let mut results: Vec<MessageContent> = Vec::new();
+        for tc in &tool_calls {
+            if let Some(tool) = tools.get(&tc.name) {
+                let args: serde_json::Value =
+                    serde_json::from_str(&tc.arguments).unwrap_or_default();
+                match tool.execute(args, &sub_ctx).await {
+                    Ok(output) => results.push(MessageContent::ToolResult {
+                        tool_use_id: tc.id.clone(),
+                        content: output.content,
+                        is_error: output.is_error,
+                    }),
+                    Err(e) => results.push(MessageContent::ToolResult {
+                        tool_use_id: tc.id.clone(),
+                        content: format!("Error: {e}"),
+                        is_error: true,
+                    }),
+                }
+            } else {
+                results.push(MessageContent::ToolResult {
+                    tool_use_id: tc.id.clone(),
+                    content: format!("Unknown tool: {}", tc.name),
+                    is_error: true,
+                });
+            }
+        }
+        messages.push(Message { role: "user".into(), content: results });
+    }
+
+    Err(anyhow::anyhow!("Background sub-agent exceeded {MAX_SUBAGENT_STEPS} steps"))
 }

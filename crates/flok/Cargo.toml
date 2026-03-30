@@ -1,0 +1,27 @@
+[package]
+name = "flok"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "An AI coding agent for the terminal"
+
+[[bin]]
+name = "flok"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+flok-core = { path = "../flok-core" }
+flok-tui = { path = "../flok-tui" }
+flok-db = { path = "../flok-db" }
+
+tokio = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+directories = { workspace = true }
+ulid = { workspace = true }

@@ -37,6 +37,8 @@ blake3 = { workspace = true }
 jsonschema = { workspace = true }
 lru = { workspace = true }
 tokio-stream = { workspace = true }
+tree-sitter = { workspace = true }
+tree-sitter-bash = { workspace = true }
 
 [dev-dependencies]
 insta = { workspace = true }

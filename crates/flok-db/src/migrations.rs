@@ -9,41 +9,61 @@ use rusqlite::Connection;
 use crate::schema::DbError;
 
 /// All migrations in order. Each entry is `(version, description, sql)`.
-const MIGRATIONS: &[(i32, &str, &str)] = &[(
-    1,
-    "Initial schema: projects, sessions, messages",
-    r"
-    CREATE TABLE IF NOT EXISTS projects (
-        id          TEXT PRIMARY KEY,
-        path        TEXT NOT NULL UNIQUE,
-        created_at  TEXT NOT NULL DEFAULT (datetime('now'))
-    );
+const MIGRATIONS: &[(i32, &str, &str)] = &[
+    (
+        1,
+        "Initial schema: projects, sessions, messages",
+        r"
+        CREATE TABLE IF NOT EXISTS projects (
+            id          TEXT PRIMARY KEY,
+            path        TEXT NOT NULL UNIQUE,
+            created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+        );
 
-    CREATE TABLE IF NOT EXISTS sessions (
-        id              TEXT PRIMARY KEY,
-        project_id      TEXT NOT NULL REFERENCES projects(id),
-        parent_id       TEXT REFERENCES sessions(id),
-        title           TEXT NOT NULL DEFAULT '',
-        model_id        TEXT NOT NULL DEFAULT '',
-        created_at      TEXT NOT NULL DEFAULT (datetime('now')),
-        updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
-    );
+        CREATE TABLE IF NOT EXISTS sessions (
+            id              TEXT PRIMARY KEY,
+            project_id      TEXT NOT NULL REFERENCES projects(id),
+            parent_id       TEXT REFERENCES sessions(id),
+            title           TEXT NOT NULL DEFAULT '',
+            model_id        TEXT NOT NULL DEFAULT '',
+            created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+        );
 
-    CREATE INDEX IF NOT EXISTS idx_sessions_project
-        ON sessions(project_id, updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_sessions_project
+            ON sessions(project_id, updated_at DESC);
 
-    CREATE TABLE IF NOT EXISTS messages (
-        id          TEXT PRIMARY KEY,
-        session_id  TEXT NOT NULL REFERENCES sessions(id),
-        role        TEXT NOT NULL CHECK(role IN ('system', 'user', 'assistant')),
-        parts       TEXT NOT NULL DEFAULT '[]',
-        created_at  TEXT NOT NULL DEFAULT (datetime('now'))
-    );
+        CREATE TABLE IF NOT EXISTS messages (
+            id          TEXT PRIMARY KEY,
+            session_id  TEXT NOT NULL REFERENCES sessions(id),
+            role        TEXT NOT NULL CHECK(role IN ('system', 'user', 'assistant')),
+            parts       TEXT NOT NULL DEFAULT '[]',
+            created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+        );
 
-    CREATE INDEX IF NOT EXISTS idx_messages_session
-        ON messages(session_id, created_at ASC);
-    ",
-)];
+        CREATE INDEX IF NOT EXISTS idx_messages_session
+            ON messages(session_id, created_at ASC);
+        ",
+    ),
+    (
+        2,
+        "Permission rules: per-project persistent always-allow decisions",
+        r"
+        CREATE TABLE IF NOT EXISTS permission_rules (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id  TEXT NOT NULL REFERENCES projects(id),
+            permission  TEXT NOT NULL,
+            pattern     TEXT NOT NULL,
+            action      TEXT NOT NULL CHECK(action IN ('allow', 'deny', 'ask')),
+            created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(project_id, permission, pattern)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_perm_rules_project
+            ON permission_rules(project_id);
+        ",
+    ),
+];
 
 /// Run all pending migrations.
 ///
@@ -79,6 +99,6 @@ mod tests {
         run(&conn).unwrap();
 
         let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
-        assert_eq!(version, 1);
+        assert_eq!(version, 2);
     }
 }

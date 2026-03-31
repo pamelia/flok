@@ -75,6 +75,26 @@ pub enum BusEvent {
     /// The current operation was cancelled by the user.
     Cancelled { session_id: String },
 
+    /// A team was created.
+    TeamCreated { session_id: String, team_id: String, team_name: String },
+
+    /// A background agent's result is being injected into the lead's session.
+    /// The engine's wait loop persists this as a synthetic user message.
+    MessageInjected {
+        /// The lead's session ID.
+        session_id: String,
+        /// The agent that produced this message.
+        from_agent: String,
+        /// The message content to inject.
+        content: String,
+    },
+
+    /// A team member completed its work.
+    TeamMemberCompleted { session_id: String, team_id: String, agent_name: String },
+
+    /// A team member failed.
+    TeamMemberFailed { session_id: String, team_id: String, agent_name: String, error: String },
+
     /// An error occurred.
     Error { message: String },
 }

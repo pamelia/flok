@@ -3,6 +3,7 @@
 //! These tools enable multi-agent coordination patterns like code review
 //! and self-review loops where specialist agents work in parallel.
 
+use crate::bus::Bus;
 use crate::team::TeamRegistry;
 
 use super::{Tool, ToolContext, ToolOutput};
@@ -14,11 +15,12 @@ use super::{Tool, ToolContext, ToolOutput};
 /// Create a named agent team for coordinating multiple sub-agents.
 pub struct TeamCreateTool {
     registry: TeamRegistry,
+    bus: Bus,
 }
 
 impl TeamCreateTool {
-    pub fn new(registry: TeamRegistry) -> Self {
-        Self { registry }
+    pub fn new(registry: TeamRegistry, bus: Bus) -> Self {
+        Self { registry, bus }
     }
 }
 
@@ -49,7 +51,7 @@ impl Tool for TeamCreateTool {
     async fn execute(
         &self,
         args: serde_json::Value,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
     ) -> anyhow::Result<ToolOutput> {
         let name = args["name"]
             .as_str()
@@ -57,6 +59,12 @@ impl Tool for TeamCreateTool {
 
         let team = self.registry.create_team(name);
         tracing::info!(team_id = %team.id, name, "created team");
+
+        self.bus.send(crate::bus::BusEvent::TeamCreated {
+            session_id: ctx.session_id.clone(),
+            team_id: team.id.clone(),
+            team_name: name.to_string(),
+        });
 
         Ok(ToolOutput::success(
             serde_json::json!({
@@ -346,7 +354,7 @@ mod tests {
     #[tokio::test]
     async fn team_create_returns_id() {
         let registry = TeamRegistry::new();
-        let tool = TeamCreateTool::new(registry.clone());
+        let tool = TeamCreateTool::new(registry.clone(), Bus::default());
         let ctx = ToolContext::test(std::path::PathBuf::from("/tmp"));
 
         let result = tool.execute(serde_json::json!({"name": "test-team"}), &ctx).await.unwrap();

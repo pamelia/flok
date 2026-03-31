@@ -1,13 +1,13 @@
 //! Markdown rendering component for iocraft.
 //!
 //! Renders markdown as styled iocraft elements with:
-//! - Cyan bold headings
+//! - Purple/violet bold headings
 //! - Fenced code blocks with language labels and dark background
 //! - Green inline code
-//! - Bold in white
+//! - Orange/gold bold text
 //! - Italic
-//! - Bullet and numbered lists with cyan markers
-//! - Tables with box-drawing borders
+//! - Bullet and numbered lists with peach markers
+//! - Tables with purple/violet headers and muted gray borders
 
 use iocraft::prelude::*;
 
@@ -180,8 +180,7 @@ fn render_block(idx: usize, block: Block, theme: Theme) -> AnyElement<'static> {
                         padding_right: 1u32,
                         padding_top: 1u32,
                         padding_bottom: 1u32,
-                        border_style: BorderStyle::Single,
-                        border_color: theme.border,
+                        margin_left: 1u32,
                     ) {
                         Text(content: code, color: theme.text)
                     }
@@ -210,7 +209,7 @@ fn render_block(idx: usize, block: Block, theme: Theme) -> AnyElement<'static> {
             .into_any()
         }
         Block::TableRow(cells, is_header) => {
-            let fg = if is_header { theme.primary } else { theme.text };
+            let fg = if is_header { theme.accent } else { theme.text };
             let weight = if is_header { Weight::Bold } else { Weight::Normal };
             let border_char = "\u{2502}";
             element! {

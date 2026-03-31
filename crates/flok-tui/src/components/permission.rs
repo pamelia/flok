@@ -11,6 +11,8 @@ use crate::theme::Theme;
 pub struct PermissionPromptProps {
     pub tool: String,
     pub description: String,
+    /// The pattern that "Allow always" will approve (e.g., `"git commit *"`).
+    pub always_pattern: String,
     pub selected: u8, // 0=Allow, 1=Always, 2=Deny
     pub theme: Option<Theme>,
 }
@@ -76,7 +78,15 @@ pub fn PermissionPrompt(props: &PermissionPromptProps) -> impl Into<AnyElement<'
                 }
                 Text(content: "  ", color: theme.bg_element)
                 View(background_color: always_bg, padding_left: 1u32, padding_right: 1u32) {
-                    Text(content: "Allow always", color: always_fg, weight: Weight::Bold)
+                    Text(
+                        content: if props.always_pattern.is_empty() {
+                            "Allow always".to_string()
+                        } else {
+                            format!("Allow always: {}", props.always_pattern)
+                        },
+                        color: always_fg,
+                        weight: Weight::Bold,
+                    )
                 }
                 Text(content: "  ", color: theme.bg_element)
                 View(background_color: deny_bg, padding_left: 1u32, padding_right: 1u32) {

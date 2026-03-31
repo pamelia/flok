@@ -5,13 +5,18 @@
 //! text — it only adds background, so the underlying content stays visible.
 //!
 //! After painting, it reads the selected text from the canvas and writes it
-//! to a shared [`State<String>`] so the parent can access it for clipboard copy.
+//! to a shared [`Ref<String>`] so the parent can access it for clipboard copy.
+//!
+//! Supports three selection modes (from [`SelectionMode`]):
+//! - **Char**: normal drag selection
+//! - **Word**: double-click expands to word boundaries (detected from canvas text)
+//! - **Line**: triple-click expands to full line
 //!
 //! Place this as the **last child** in the element tree so it draws on top.
 
 use iocraft::prelude::*;
 
-use crate::components::selection::SelectionState;
+use crate::components::selection::{SelectionMode, SelectionState};
 use crate::theme::Theme;
 
 /// Props for [`SelectionOverlay`].
@@ -61,9 +66,6 @@ impl Component for SelectionOverlay {
         self.theme = props.theme.unwrap_or_default();
         self.extracted_text = props.extracted_text;
 
-        // Always keep the overlay at full terminal size to avoid layout
-        // changes between frames (which cause flicker). The `draw()` method
-        // simply does nothing when there's no selection.
         updater.set_layout_style(taffy::style::Style {
             position: taffy::style::Position::Absolute,
             inset: taffy::geometry::Rect {
@@ -82,7 +84,6 @@ impl Component for SelectionOverlay {
 
     fn draw(&mut self, drawer: &mut ComponentDrawer<'_>) {
         let Some(ref sel) = self.selection else {
-            // No selection — clear extracted text.
             if let Some(mut et) = self.extracted_text {
                 et.set(String::new());
             }
@@ -95,12 +96,17 @@ impl Component for SelectionOverlay {
         let ((sc, sr), (ec, er)) = sel.normalized();
         let bg = self.theme.selection_bg;
         let mut canvas = drawer.canvas();
+        let panel_w = self.width as usize;
 
-        // Paint background highlights AND read text from the canvas.
         let mut extracted = String::new();
+        let mut prev_was_soft_wrapped = false;
 
         for row in sr..=er {
-            let (col_start, col_end) = if sr == er {
+            let row_text = canvas.get_row_text(row as usize);
+            let row_len = row_text.len();
+
+            // Compute the column range for this row.
+            let (mut col_start, mut col_end) = if sr == er {
                 (sc, ec)
             } else if row == sr {
                 (sc, self.width.saturating_sub(1))
@@ -110,6 +116,23 @@ impl Component for SelectionOverlay {
                 (0, self.width.saturating_sub(1))
             };
 
+            // Word mode: expand to word boundaries using canvas text.
+            if sel.mode == SelectionMode::Word && sr == er {
+                let bytes = row_text.as_bytes();
+                let mut ws = col_start as usize;
+                let mut we = col_end as usize;
+                // Expand backward to word boundary.
+                while ws > 0 && bytes.get(ws.wrapping_sub(1)).is_some_and(|&b| b != b' ') {
+                    ws -= 1;
+                }
+                // Expand forward to word boundary.
+                while we + 1 < row_len && bytes.get(we + 1).is_some_and(|&b| b != b' ') {
+                    we += 1;
+                }
+                col_start = ws as u16;
+                col_end = we as u16;
+            }
+
             let x = i32::from(col_start) as isize;
             let y = i32::from(row) as isize;
             let w = (col_end.saturating_sub(col_start) + 1) as usize;
@@ -117,22 +140,24 @@ impl Component for SelectionOverlay {
             // Paint background only — preserves existing text.
             canvas.set_background_color(x, y, w, 1, bg);
 
-            // Read the text content of this row from the canvas.
-            let row_text = canvas.get_row_text(row as usize);
-            let row_len = row_text.len();
-
             // Extract the selected portion of this row.
             let cs = (col_start as usize).min(row_len);
             let ce = ((col_end as usize) + 1).min(row_len);
-            let slice = if cs < ce { &row_text[cs..ce] } else { "" };
+            let slice = if cs < ce { row_text[cs..ce].trim_end() } else { "" };
 
-            if !extracted.is_empty() {
+            // Soft-wrap detection: if the row text fills the full panel width
+            // (no trailing space before the edge), it's likely a soft wrap.
+            // In that case, don't insert a newline — join with the next row.
+            let trimmed_len = row_text.trim_end().len();
+            let is_soft_wrapped = trimmed_len >= panel_w.saturating_sub(2) && trimmed_len > 0;
+
+            if !extracted.is_empty() && !prev_was_soft_wrapped {
                 extracted.push('\n');
             }
-            extracted.push_str(slice.trim_end());
+            extracted.push_str(slice);
+            prev_was_soft_wrapped = is_soft_wrapped;
         }
 
-        // Write extracted text to shared state.
         if let Some(mut et) = self.extracted_text {
             et.set(extracted);
         }

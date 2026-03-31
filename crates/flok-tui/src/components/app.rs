@@ -71,6 +71,10 @@ fn FlokApp(mut hooks: Hooks, props: &mut FlokAppProps) -> impl Into<AnyElement<'
     let mut history_draft: State<String> = hooks.use_state(String::new);
 
     let mut selection: State<Option<SelectionState>> = hooks.use_state(|| None);
+    // Click tracking for double/triple-click detection (300ms threshold).
+    let mut last_click_time: State<Option<u64>> = hooks.use_state(|| None); // millis since epoch
+    let mut last_click_pos: State<(u16, u16)> = hooks.use_state(|| (0, 0));
+    let mut click_count: State<u8> = hooks.use_state(|| 0);
     // Text extracted from the canvas by SelectionOverlay during draw().
     // Uses Ref (not State) to avoid deadlock — writing State inside draw()
     // triggers a re-render which re-enters the render pass.
@@ -332,6 +336,9 @@ fn FlokApp(mut hooks: Hooks, props: &mut FlokAppProps) -> impl Into<AnyElement<'
                         &mut sidebar_scroll,
                         &mut toast,
                         panel_rects,
+                        &mut last_click_time,
+                        &mut last_click_pos,
+                        &mut click_count,
                     );
                 }
 
@@ -581,7 +588,12 @@ fn FlokApp(mut hooks: Hooks, props: &mut FlokAppProps) -> impl Into<AnyElement<'
                     }
                 }
 
-                TerminalEvent::Resize(..) | _ => {}
+                TerminalEvent::Resize(..) => {
+                    // Clear selection on resize — coordinates become stale
+                    // after reflow (same approach as tmux).
+                    selection.set(None);
+                }
+                _ => {}
             }
         }
     });
@@ -956,17 +968,72 @@ fn handle_mouse(
     sidebar_scroll: &mut Ref<ScrollViewHandle>,
     toast: &mut State<Option<String>>,
     rects: PanelRects,
+    last_click_time: &mut State<Option<u64>>,
+    last_click_pos: &mut State<(u16, u16)>,
+    click_count: &mut State<u8>,
 ) {
     match mouse.kind {
         MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let pos = (mouse.column, mouse.row);
+
+            // Detect multi-click (300ms threshold, same position).
+            let is_repeat = last_click_time.get().is_some_and(|t| now.saturating_sub(t) < 300)
+                && last_click_pos.get() == pos;
+
+            let count = if is_repeat { (click_count.get() % 3) + 1 } else { 1 };
+            click_count.set(count);
+            last_click_time.set(Some(now));
+            last_click_pos.set(pos);
+
             if let Some(panel) = rects.identify(mouse.column, mouse.row) {
-                selection.set(Some(SelectionState::start(panel, mouse.column, mouse.row)));
+                let mut sel = SelectionState::start(panel, mouse.column, mouse.row);
+                match count {
+                    2 => {
+                        // Double-click: word selection mode.
+                        // The overlay will expand to word boundaries in draw().
+                        sel.mode = selection::SelectionMode::Word;
+                    }
+                    3 => {
+                        // Triple-click: line selection mode.
+                        let pr = match panel {
+                            selection::Panel::Messages => rects.messages,
+                            selection::Panel::Sidebar => rects.sidebar.unwrap_or(rects.messages),
+                            selection::Panel::Input => rects.input,
+                        };
+                        sel.mode = selection::SelectionMode::Line;
+                        sel.anchor.0 = pr.x;
+                        sel.cursor.0 = pr.x + pr.w.saturating_sub(1);
+                    }
+                    _ => {} // Single click: normal char selection
+                }
+                selection.set(Some(sel));
             }
         }
         MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
             if let Some(ref mut sel) = *selection.write() {
                 let (c, r) = rects.clamp_to(sel.panel, mouse.column, mouse.row);
                 sel.extend(c, r);
+
+                // Auto-scroll when dragging near panel edges.
+                let rect = match sel.panel {
+                    selection::Panel::Messages => rects.messages,
+                    selection::Panel::Sidebar => rects.sidebar.unwrap_or_default(),
+                    selection::Panel::Input => return, // No scroll for input
+                };
+                let scroll = match sel.panel {
+                    selection::Panel::Messages => &mut *msg_scroll,
+                    selection::Panel::Sidebar => &mut *sidebar_scroll,
+                    selection::Panel::Input => return,
+                };
+                if r <= rect.y {
+                    scroll.write().scroll_by(-SCROLL_STEP);
+                } else if r >= rect.y + rect.h.saturating_sub(1) {
+                    scroll.write().scroll_by(SCROLL_STEP);
+                }
             }
         }
         MouseEventKind::Up(crossterm::event::MouseButton::Left) => {

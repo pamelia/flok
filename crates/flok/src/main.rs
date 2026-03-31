@@ -26,14 +26,37 @@ use flok_core::worktree::WorktreeManager;
 use tokio::sync::mpsc;
 
 fn main() -> Result<()> {
-    // Initialize tracing (only to file/stderr, not stdout — TUI owns stdout)
-    fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .with_target(false)
-        .with_writer(std::io::stderr)
-        .init();
-
     let args = cli::Args::parse_args();
+
+    // Initialize tracing.
+    // --debug: write structured logs to /tmp/flok.log at debug level.
+    // Otherwise: quiet mode, stderr only, controlled by RUST_LOG env var.
+    if args.debug {
+        let log_path = std::path::PathBuf::from("/tmp/flok.log");
+        let log_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .with_context(|| format!("failed to open log file: {}", log_path.display()))?;
+
+        fmt()
+            .with_env_filter(
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug")),
+            )
+            .with_target(true)
+            .with_thread_ids(true)
+            .with_writer(log_file)
+            .init();
+
+        tracing::info!("debug logging enabled, writing to {}", log_path.display());
+    } else {
+        fmt()
+            .with_env_filter(EnvFilter::from_default_env())
+            .with_target(false)
+            .with_writer(std::io::stderr)
+            .init();
+    }
+
     tracing::debug!(?args, "starting flok");
 
     // Use current_thread + LocalSet because SessionEngine holds Db which is !Send.
@@ -122,15 +145,15 @@ async fn run(args: cli::Args) -> Result<()> {
     tools.register(Arc::new(PlanTool));
     tools.register(Arc::new(CodeReviewTool::new(Arc::clone(&provider))));
 
+    // Create bus (needs to be before team/task tools which use it)
+    let bus = Bus::new(512);
+
     // Create team registry for multi-agent coordination
     let team_registry = TeamRegistry::new();
-    tools.register(Arc::new(TeamCreateTool::new(team_registry.clone())));
+    tools.register(Arc::new(TeamCreateTool::new(team_registry.clone(), bus.clone())));
     tools.register(Arc::new(TeamDeleteTool::new(team_registry.clone())));
     tools.register(Arc::new(TeamTaskTool::new(team_registry.clone())));
     tools.register(Arc::new(SendMessageTool::new(team_registry.clone())));
-
-    // Create bus (before task tool, which needs it)
-    let bus = Bus::new(512);
 
     // Create worktree manager for agent isolation
     let worktree_mgr = Arc::new(WorktreeManager::new(&project_id, project_root.clone()));
@@ -150,6 +173,7 @@ async fn run(args: cli::Args) -> Result<()> {
     let base_tools = Arc::new(tools.clone());
     tools.register(Arc::new(TaskTool::new(
         Arc::clone(&provider),
+        model_id.clone(),
         base_tools,
         bus.clone(),
         project_root.clone(),
@@ -195,7 +219,45 @@ async fn run(args: cli::Args) -> Result<()> {
 
     // Interactive mode — create permission channel for TUI prompts
     let (perm_tx, perm_rx) = mpsc::unbounded_channel();
-    let permissions = flok_core::tool::PermissionManager::new(perm_tx);
+    let mut permissions = flok_core::tool::PermissionManager::new(perm_tx);
+
+    // Load config-provided permission rules
+    if !config.permission.is_empty() {
+        let config_rules = flok_core::config::permission_config_to_rules(&config.permission);
+        if !config_rules.is_empty() {
+            tracing::info!(count = config_rules.len(), "loaded permission rules from config");
+            permissions.set_config_rules(config_rules);
+        }
+    }
+
+    // Load persisted permission rules from database
+    match db.list_permission_rules(&project_id) {
+        Ok(rows) => {
+            let rules: Vec<flok_core::permission::PermissionRule> = rows
+                .into_iter()
+                .filter_map(|row| {
+                    let action = match row.action.as_str() {
+                        "allow" => flok_core::permission::PermissionAction::Allow,
+                        "deny" => flok_core::permission::PermissionAction::Deny,
+                        "ask" => flok_core::permission::PermissionAction::Ask,
+                        _ => return None,
+                    };
+                    Some(flok_core::permission::PermissionRule::new(
+                        row.permission,
+                        row.pattern,
+                        action,
+                    ))
+                })
+                .collect();
+            if !rules.is_empty() {
+                tracing::info!(count = rules.len(), "loaded persisted permission rules");
+                permissions.load_session_rules(rules);
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to load persisted permission rules");
+        }
+    }
     let cost_tracker = flok_core::token::CostTracker::new(&model_id);
     let state = AppState::new(
         db,
@@ -278,6 +340,8 @@ async fn run_interactive(
     } else {
         SessionEngine::new(state, model_id)?
     };
+
+    let session_id_for_exit = engine.session_id().to_string();
 
     // Spawn the background session task.
     //
@@ -383,6 +447,12 @@ async fn run_interactive(
 
     // Cleanup
     session_handle.abort();
+
+    // Print resume hint so the user knows how to get back.
+    #[allow(clippy::print_stdout)]
+    {
+        println!("\nResume this session:\n  flok --session {session_id_for_exit}");
+    }
 
     Ok(())
 }

@@ -16,4 +16,8 @@ pub mod permission;
 #[allow(unreachable_pub)]
 pub mod question;
 #[allow(unreachable_pub)]
+pub mod selection;
+#[allow(unreachable_pub)]
+pub mod selection_overlay;
+#[allow(unreachable_pub)]
 pub mod sidebar;

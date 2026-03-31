@@ -18,6 +18,8 @@ tokio = { workspace = true }
 anyhow = { workspace = true }
 arboard = { workspace = true }
 tracing = { workspace = true }
+unicode-width = { workspace = true }
+taffy = { workspace = true }
 
 [dev-dependencies]
 insta = { workspace = true }

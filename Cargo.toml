@@ -53,9 +53,11 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 reqwest-eventsource = "0.6"
 
 # TUI
-iocraft = "0.8"
+iocraft = { git = "https://github.com/pamelia/iocraft.git", branch = "main" }
 crossterm = "0.29"
 arboard = "3"
+unicode-width = "0.1"
+taffy = "0.5"
 
 # CLI
 clap = { version = "4", features = ["derive"] }
@@ -78,6 +80,10 @@ blake3 = "1"
 lru = "0.12"
 jsonschema = "0.28"
 tokio-stream = "0.1"
+
+# Tree-sitter (for bash command parsing in permission system)
+tree-sitter = "0.25"
+tree-sitter-bash = "0.25"
 
 # Testing
 insta = { version = "1", features = ["json"] }

@@ -1,7 +1,7 @@
 //! Color theme for the TUI.
 //!
-//! Inspired by the opencode TUI aesthetic: dark background, bright cyan
-//! headings, green highlights, orange feature names, muted gray for secondary.
+//! Colors matched to the `OpenCode` "opencode" default dark theme for a
+//! consistent, polished terminal aesthetic.
 
 use iocraft::prelude::Color;
 
@@ -18,10 +18,10 @@ pub struct Theme {
     pub text_muted: Color,
 
     // Semantic colors
-    pub primary: Color,   // Bright cyan — headings, table headers, section titles
+    pub primary: Color, // Warm peach/orange — headings in sidebar, section titles
     pub secondary: Color, // Blue — user badge, links
-    pub accent: Color,    // Orange/amber — feature names, plan mode badge
-    pub highlight: Color, // Green — field names, new items, success highlights
+    pub accent: Color,  // Purple/violet — markdown headings, keywords
+    pub highlight: Color, // Green — inline code, success highlights
     pub error: Color,
     pub warning: Color,
     pub success: Color,
@@ -29,46 +29,56 @@ pub struct Theme {
 
     // Borders
     pub border: Color,
+    pub border_active: Color,
+
+    // Selection
+    pub selection_bg: Color,
+    pub selection_fg: Color,
 
     // Markdown-specific
-    pub code_fg: Color, // Inline code text
+    pub code_fg: Color, // Inline code text (green)
     pub code_bg: Color, // Code block background
-    pub heading: Color, // Section headings (cyan)
-    pub bold_fg: Color, // Bold text
+    pub heading: Color, // Markdown headings (purple/violet)
+    pub bold_fg: Color, // Bold text (orange/gold)
     pub table_border: Color,
 }
 
 impl Theme {
     pub fn dark() -> Self {
         Self {
-            // Backgrounds
-            bg: Color::Rgb { r: 13, g: 13, b: 13 }, // #0d0d0d
-            bg_panel: Color::Rgb { r: 22, g: 22, b: 22 }, // #161616
+            // Backgrounds — near-black with subtle stepping
+            bg: Color::Rgb { r: 10, g: 10, b: 10 }, // #0a0a0a
+            bg_panel: Color::Rgb { r: 20, g: 20, b: 20 }, // #141414
             bg_element: Color::Rgb { r: 30, g: 30, b: 30 }, // #1e1e1e
 
-            // Text
-            text: Color::Rgb { r: 204, g: 204, b: 204 }, // #cccccc
-            text_muted: Color::Rgb { r: 100, g: 100, b: 100 }, // #646464
+            // Text — bright for readability
+            text: Color::Rgb { r: 238, g: 238, b: 238 }, // #eeeeee
+            text_muted: Color::Rgb { r: 128, g: 128, b: 128 }, // #808080
 
-            // Semantic colors
-            primary: Color::Rgb { r: 0, g: 212, b: 212 }, // #00d4d4 bright cyan
+            // Semantic colors — matched to OpenCode's opencode.json dark mode
+            primary: Color::Rgb { r: 250, g: 178, b: 131 }, // #fab283 warm peach/orange
             secondary: Color::Rgb { r: 92, g: 156, b: 245 }, // #5c9cf5 blue
-            accent: Color::Rgb { r: 255, g: 140, b: 0 },  // #ff8c00 orange
-            highlight: Color::Rgb { r: 0, g: 255, b: 136 }, // #00ff88 green
-            error: Color::Rgb { r: 255, g: 85, b: 85 },   // #ff5555
-            warning: Color::Rgb { r: 255, g: 200, b: 50 }, // #ffc832
-            success: Color::Rgb { r: 0, g: 255, b: 136 }, // #00ff88 (same as highlight)
-            info: Color::Rgb { r: 0, g: 212, b: 212 },    // #00d4d4 (same as primary)
+            accent: Color::Rgb { r: 157, g: 124, b: 216 },  // #9d7cd8 purple/violet
+            highlight: Color::Rgb { r: 127, g: 216, b: 143 }, // #7fd88f green
+            error: Color::Rgb { r: 224, g: 108, b: 117 },   // #e06c75 soft red
+            warning: Color::Rgb { r: 245, g: 167, b: 66 },  // #f5a742 orange/gold
+            success: Color::Rgb { r: 127, g: 216, b: 143 }, // #7fd88f green
+            info: Color::Rgb { r: 86, g: 182, b: 194 },     // #56b6c2 teal/cyan
 
             // Borders
-            border: Color::Rgb { r: 50, g: 50, b: 50 }, // #323232
+            border: Color::Rgb { r: 72, g: 72, b: 72 }, // #484848
+            border_active: Color::Rgb { r: 250, g: 178, b: 131 }, // #fab283 (same as primary)
+
+            // Selection — inverted style for text selection
+            selection_bg: Color::Rgb { r: 92, g: 156, b: 245 }, // #5c9cf5 blue
+            selection_fg: Color::Rgb { r: 10, g: 10, b: 10 },   // #0a0a0a (same as bg)
 
             // Markdown
-            code_fg: Color::Rgb { r: 0, g: 212, b: 212 }, // cyan for inline code
-            code_bg: Color::Rgb { r: 25, g: 25, b: 30 },  // slightly blue-tinted dark
-            heading: Color::Rgb { r: 0, g: 212, b: 212 }, // cyan headings
-            bold_fg: Color::Rgb { r: 255, g: 255, b: 255 }, // pure white for bold
-            table_border: Color::Rgb { r: 60, g: 60, b: 60 }, // dark gray table borders
+            code_fg: Color::Rgb { r: 127, g: 216, b: 143 }, // #7fd88f green (inline code)
+            code_bg: Color::Rgb { r: 10, g: 10, b: 10 },    // #0a0a0a (same as bg)
+            heading: Color::Rgb { r: 157, g: 124, b: 216 }, // #9d7cd8 purple/violet
+            bold_fg: Color::Rgb { r: 245, g: 167, b: 66 },  // #f5a742 orange/gold
+            table_border: Color::Rgb { r: 128, g: 128, b: 128 }, // #808080 (same as text_muted)
         }
     }
 }

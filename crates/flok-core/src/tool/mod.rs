@@ -40,17 +40,24 @@ pub use todowrite::{TodoItem, TodoList, TodoWriteTool};
 pub use webfetch::WebfetchTool;
 pub use write::WriteTool;
 
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
 use tokio::sync::{mpsc, oneshot};
+
+use crate::permission::arity;
+use crate::permission::rule::{PermissionAction, PermissionRule};
+use crate::permission::{defaults, evaluate};
 
 // ---------------------------------------------------------------------------
 // Permission system
 // ---------------------------------------------------------------------------
 
 /// How dangerous a tool operation is.
+///
+/// This enum is kept for backward compatibility with tools that declare their
+/// permission level. The rule-based system takes precedence when rules exist;
+/// this level is used as a fallback hint when no specific rule matches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PermissionLevel {
     /// Safe operations that only read data. Never prompts.
@@ -64,10 +71,14 @@ pub enum PermissionLevel {
 /// A permission request sent to the TUI for user approval.
 #[derive(Debug)]
 pub struct PermissionRequest {
-    /// Tool name.
+    /// Tool name (permission type).
     pub tool: String,
     /// Human-readable summary of what the tool wants to do.
     pub description: String,
+    /// The "always allow" pattern that will be stored if the user chooses "Always".
+    /// For bash commands, this is the arity-based prefix (e.g., `"git commit *"`).
+    /// For file operations, this is the tool name + `" *"`.
+    pub always_pattern: String,
     /// Channel to send the user's decision back.
     pub response_tx: oneshot::Sender<PermissionDecision>,
 }
@@ -77,64 +88,142 @@ pub struct PermissionRequest {
 pub enum PermissionDecision {
     /// Allow this one invocation.
     Allow,
-    /// Allow all future invocations of this tool in this session.
+    /// Allow all future invocations matching the `always_pattern`.
     Always,
     /// Deny this invocation.
     Deny,
 }
 
-/// Manages tool permissions for a session.
+/// Manages tool permissions for a session using rule-based evaluation.
+///
+/// Evaluates permission checks against three layered rulesets:
+/// 1. Default rules (hardcoded — in-project allowed, external ask)
+/// 2. Config rules (from `flok.toml`)
+/// 3. Session rules (from user "Always Allow" decisions)
+///
+/// Uses last-match-wins semantics across all layers.
 pub struct PermissionManager {
-    /// Tools that have been permanently allowed for this session.
-    always_allowed: Mutex<HashSet<String>>,
+    /// Default permission rules (hardcoded sensible defaults).
+    default_rules: Vec<PermissionRule>,
+    /// Config-provided rules (from `flok.toml`).
+    config_rules: Vec<PermissionRule>,
+    /// Session-level rules from user "Always Allow" decisions.
+    session_rules: Mutex<Vec<PermissionRule>>,
     /// Channel to send permission requests to the TUI.
     request_tx: Option<mpsc::UnboundedSender<PermissionRequest>>,
+    /// Channel to notify when a new session rule is added (for persistence).
+    /// The engine drains this and persists to the database.
+    rule_added_tx: std::sync::mpsc::Sender<PermissionRule>,
+    /// Receiver end — held by the engine for draining.
+    rule_added_rx: Mutex<std::sync::mpsc::Receiver<PermissionRule>>,
 }
 
 impl PermissionManager {
     /// Create a permission manager that prompts through the given channel.
+    ///
+    /// Uses default rules and no config rules. Config rules can be set later
+    /// via [`set_config_rules`].
     pub fn new(request_tx: mpsc::UnboundedSender<PermissionRequest>) -> Self {
-        Self { always_allowed: Mutex::new(HashSet::new()), request_tx: Some(request_tx) }
+        let (rule_added_tx, rule_added_rx) = std::sync::mpsc::channel();
+        Self {
+            default_rules: defaults::default_rules(),
+            config_rules: Vec::new(),
+            session_rules: Mutex::new(Vec::new()),
+            request_tx: Some(request_tx),
+            rule_added_tx,
+            rule_added_rx: Mutex::new(rule_added_rx),
+        }
     }
 
     /// Create a permission manager that auto-approves everything (for non-interactive mode).
     pub fn auto_approve() -> Self {
-        Self { always_allowed: Mutex::new(HashSet::new()), request_tx: None }
+        let (rule_added_tx, rule_added_rx) = std::sync::mpsc::channel();
+        Self {
+            default_rules: defaults::default_rules(),
+            config_rules: Vec::new(),
+            session_rules: Mutex::new(Vec::new()),
+            request_tx: None,
+            rule_added_tx,
+            rule_added_rx: Mutex::new(rule_added_rx),
+        }
+    }
+
+    /// Set config-provided permission rules (from `flok.toml`).
+    pub fn set_config_rules(&mut self, rules: Vec<PermissionRule>) {
+        self.config_rules = rules;
+    }
+
+    /// Load previously persisted session rules (e.g., from database).
+    pub fn load_session_rules(&self, rules: Vec<PermissionRule>) {
+        let mut session =
+            self.session_rules.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        *session = rules;
+    }
+
+    /// Drain any newly added rules from the channel.
+    ///
+    /// Called by the engine after permission checks to persist new rules to
+    /// the database. Returns all rules added since the last drain.
+    pub fn drain_new_rules(&self) -> Vec<PermissionRule> {
+        let rx = self.rule_added_rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut rules = Vec::new();
+        while let Ok(rule) = rx.try_recv() {
+            rules.push(rule);
+        }
+        rules
     }
 
     /// Check if a tool invocation is allowed. May block waiting for user input.
     ///
-    /// Returns `true` if allowed, `false` if denied.
-    pub async fn check(
-        &self,
-        tool_name: &str,
-        permission_level: PermissionLevel,
-        description: &str,
-    ) -> bool {
-        // Safe tools always pass
-        if permission_level == PermissionLevel::Safe {
-            return true;
-        }
-
+    /// # Arguments
+    ///
+    /// * `permission` — The permission type (e.g., `"bash"`, `"edit"`, `"read"`)
+    /// * `pattern` — The specific pattern to check (e.g., `"git commit -m fix"`, `"src/main.rs"`)
+    /// * `description` — Human-readable description for the TUI prompt
+    ///
+    /// # Returns
+    ///
+    /// `true` if allowed, `false` if denied or rejected by the user.
+    pub async fn check(&self, permission: &str, pattern: &str, description: &str) -> bool {
         // Auto-approve mode (non-interactive)
         let Some(ref tx) = self.request_tx else {
             return true;
         };
 
-        // Check "Always" allowlist
-        {
-            let allowed =
-                self.always_allowed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            if allowed.contains(tool_name) {
-                return true;
-            }
+        // Evaluate against all rulesets
+        let action = {
+            let session =
+                self.session_rules.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            evaluate(permission, pattern, &[&self.default_rules, &self.config_rules, &session])
+        };
+
+        tracing::debug!(
+            permission,
+            pattern,
+            action = ?action,
+            "permission check result"
+        );
+
+        match action {
+            PermissionAction::Allow => return true,
+            PermissionAction::Deny => return false,
+            PermissionAction::Ask => {} // Fall through to TUI prompt
         }
+
+        // Compute the "always" pattern for this invocation
+        let always_pattern = if permission == "bash" {
+            let tokens = arity::tokenize_command(pattern);
+            arity::always_pattern(&tokens)
+        } else {
+            format!("{permission} *")
+        };
 
         // Send request to TUI and wait for response
         let (response_tx, response_rx) = oneshot::channel();
         let request = PermissionRequest {
-            tool: tool_name.to_string(),
+            tool: permission.to_string(),
             description: description.to_string(),
+            always_pattern: always_pattern.clone(),
             response_tx,
         };
 
@@ -146,20 +235,42 @@ impl PermissionManager {
         match response_rx.await {
             Ok(PermissionDecision::Allow) => true,
             Ok(PermissionDecision::Always) => {
-                let mut allowed =
-                    self.always_allowed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                allowed.insert(tool_name.to_string());
+                let new_rule =
+                    PermissionRule::new(permission, &always_pattern, PermissionAction::Allow);
+                // Notify engine for persistence (non-blocking, fire-and-forget)
+                let _ = self.rule_added_tx.send(new_rule.clone());
+                // Add to session rules
+                let mut session =
+                    self.session_rules.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                session.push(new_rule);
                 true
             }
             Ok(PermissionDecision::Deny) | Err(_) => false,
         }
+    }
+
+    /// Legacy compatibility: check using the old `PermissionLevel` enum.
+    ///
+    /// Maps the tool name and level to the new `(permission, pattern)` system:
+    /// - `Safe` → always allowed (no rule check)
+    /// - `Write`/`Dangerous` → evaluates rules with `(tool_name, "*")`
+    pub async fn check_legacy(
+        &self,
+        tool_name: &str,
+        permission_level: PermissionLevel,
+        description: &str,
+    ) -> bool {
+        if permission_level == PermissionLevel::Safe {
+            return true;
+        }
+        self.check(tool_name, "*", description).await
     }
 }
 
 impl std::fmt::Debug for PermissionManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PermissionManager")
-            .field("always_allowed", &self.always_allowed)
+            .field("session_rules", &self.session_rules)
             .finish_non_exhaustive()
     }
 }

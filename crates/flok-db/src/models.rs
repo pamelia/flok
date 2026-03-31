@@ -100,6 +100,17 @@ pub enum MessagePart {
     ToolResult { tool_call_id: String, content: String, is_error: bool },
 }
 
+/// A persisted permission rule row from the database.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PermissionRuleRow {
+    pub id: i64,
+    pub project_id: String,
+    pub permission: String,
+    pub pattern: String,
+    pub action: String,
+    pub created_at: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

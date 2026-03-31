@@ -29,6 +29,10 @@ pub(crate) struct Args {
     /// Start in plan mode (read-only, no file modifications).
     #[arg(long, global = true)]
     pub plan: bool,
+
+    /// Enable debug logging to /tmp/flok.log.
+    #[arg(long, global = true)]
+    pub debug: bool,
 }
 
 #[derive(Debug, Subcommand)]

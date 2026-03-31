@@ -110,6 +110,28 @@ When referencing specific functions or pieces of code include the pattern `file_
         chrono::Local::now().format("%Y-%m-%d"),
     );
 
+    // List available skills (built-in + project-local)
+    let _ = writeln!(prompt, "\n# Available Skills\n");
+    let _ =
+        writeln!(prompt, "Use the `skill` tool to load detailed instructions for these workflows:");
+    for skill in crate::skills::BUILTIN_SKILLS {
+        let _ = writeln!(prompt, "- **{}**: {}", skill.name, skill.description);
+    }
+    // Check for project-local skills
+    let local_skills_dir = project_root.join(".flok").join("skills");
+    if local_skills_dir.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(&local_skills_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                let name = name.strip_suffix(".md").unwrap_or(&name);
+                // Skip if it shadows a built-in (already listed)
+                if crate::skills::get_builtin_skill(name).is_none() {
+                    let _ = writeln!(prompt, "- **{name}** (project-local)");
+                }
+            }
+        }
+    }
+
     // Load AGENTS.md if it exists
     let agents_md = project_root.join("AGENTS.md");
     if agents_md.exists() {
@@ -537,6 +559,11 @@ impl SessionEngine {
 
         loop {
             rounds += 1;
+            tracing::debug!(
+                round = rounds,
+                session_id = %self.session_id,
+                "prompt loop round start"
+            );
             if rounds > MAX_TOOL_ROUNDS {
                 return Err(anyhow::anyhow!(
                     "Tool call loop exceeded {MAX_TOOL_ROUNDS} rounds — possible doom loop"
@@ -721,6 +748,12 @@ impl SessionEngine {
             });
 
             // If no tool calls, we're done
+            tracing::debug!(
+                round = rounds,
+                tool_call_count = tool_calls.len(),
+                text_len = text.len(),
+                "LLM response received"
+            );
             if tool_calls.is_empty() {
                 return Ok(SendMessageResult::Complete(text));
             }
@@ -765,15 +798,8 @@ impl SessionEngine {
                         "Tool '{}' called with identical arguments {} times (possible doom loop). Continue?",
                         tc.name, count
                     );
-                    let allowed = self
-                        .state
-                        .permissions
-                        .check(
-                            "doom_loop_continue",
-                            crate::tool::PermissionLevel::Dangerous,
-                            &description,
-                        )
-                        .await;
+                    let allowed =
+                        self.state.permissions.check("doom_loop", &tc.name, &description).await;
 
                     if !allowed {
                         return Err(anyhow::anyhow!(
@@ -789,6 +815,28 @@ impl SessionEngine {
 
             // Execute tool calls and store results
             let tool_results = self.execute_tool_calls(&tool_calls).await;
+
+            // Persist any new "Always Allow" permission rules to the database
+            for rule in self.state.permissions.drain_new_rules() {
+                let action_str = match rule.action {
+                    crate::permission::PermissionAction::Allow => "allow",
+                    crate::permission::PermissionAction::Deny => "deny",
+                    crate::permission::PermissionAction::Ask => "ask",
+                };
+                if let Err(e) = self.state.db.upsert_permission_rule(
+                    &self.state.project_id,
+                    &rule.permission,
+                    &rule.pattern,
+                    action_str,
+                ) {
+                    tracing::warn!(
+                        permission = %rule.permission,
+                        pattern = %rule.pattern,
+                        error = %e,
+                        "failed to persist permission rule"
+                    );
+                }
+            }
 
             // Snapshot: capture workspace state AFTER tool execution and compute patch
             if let Some(ref pre_hash) = pre_snapshot {
@@ -834,12 +882,167 @@ impl SessionEngine {
             let result_json = serde_json::to_string(&result_parts)?;
             self.state.db.insert_message(&result_msg_id, &self.session_id, "user", &result_json)?;
 
+            // Wait for background agents: if tool calls spawned background team
+            // agents, pause and collect their results before the next LLM call.
+            // This prevents the LLM from manually polling with team_task/sleep.
+            let background_agent_count = tool_calls
+                .iter()
+                .filter(|tc| {
+                    tc.name == "task" && {
+                        let args: serde_json::Value =
+                            serde_json::from_str(&tc.arguments).unwrap_or_default();
+                        args.get("background").and_then(serde_json::Value::as_bool).unwrap_or(false)
+                            && args.get("team_id").and_then(serde_json::Value::as_str).is_some()
+                    }
+                })
+                .count();
+
+            if background_agent_count > 0 {
+                self.wait_for_team_agents(background_agent_count).await?;
+            }
+
             // Check cancellation after tool execution — don't start another round
             if self.cancel_token.is_cancelled() {
                 self.state.bus.send(BusEvent::Cancelled { session_id: self.session_id.clone() });
                 return Ok(SendMessageResult::Cancelled { partial_text: text });
             }
         }
+    }
+
+    /// Wait for background team agents to complete and inject their results.
+    ///
+    /// Subscribes to bus events and waits for `MessageInjected` events
+    /// targeting this session. Each injected message is persisted as a
+    /// synthetic user message so the LLM sees the agent's findings.
+    ///
+    /// Waits until all `expected_count` agents have reported back,
+    /// or times out after 5 minutes.
+    async fn wait_for_team_agents(&self, expected_count: usize) -> anyhow::Result<()> {
+        use tokio::time::{timeout, Duration};
+
+        const AGENT_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
+
+        tracing::info!(
+            session_id = %self.session_id,
+            expected_count,
+            "waiting for background team agents to report back"
+        );
+
+        let mut bus_rx = self.state.bus.subscribe();
+        let mut received_count = 0u32;
+        let mut completed_count = 0usize;
+
+        // Wait for injected messages until timeout or cancellation
+        loop {
+            if self.cancel_token.is_cancelled() {
+                tracing::info!("wait_for_team_agents: cancelled");
+                break;
+            }
+
+            let event = match timeout(AGENT_TIMEOUT, bus_rx.recv()).await {
+                Ok(Ok(event)) => event,
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(n))) => {
+                    tracing::warn!(lagged = n, "bus receiver lagged during agent wait");
+                    continue;
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                    tracing::warn!("bus closed during agent wait");
+                    break;
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "timed out waiting for background agents ({}s)",
+                        AGENT_TIMEOUT.as_secs()
+                    );
+                    // Inject a timeout notice so the LLM knows
+                    let timeout_msg = format!(
+                        "[System: Background agents timed out after {}s. \
+                         Proceed with whatever results have been received so far ({} messages).]",
+                        AGENT_TIMEOUT.as_secs(),
+                        received_count
+                    );
+                    let msg_id = Ulid::new().to_string();
+                    let parts =
+                        serde_json::to_string(&vec![MessageContent::Text { text: timeout_msg }])?;
+                    self.state.db.insert_message(&msg_id, &self.session_id, "user", &parts)?;
+                    break;
+                }
+            };
+
+            match event {
+                BusEvent::MessageInjected { ref session_id, ref from_agent, ref content }
+                    if session_id == &self.session_id =>
+                {
+                    tracing::info!(
+                        from = %from_agent,
+                        content_len = content.len(),
+                        "received injected message from background agent"
+                    );
+
+                    // Persist the injected message as a synthetic user message
+                    // so the LLM sees the agent's findings in conversation history.
+                    let injected_text = format!("[Message from @{from_agent}]\n\n{content}");
+                    let msg_id = Ulid::new().to_string();
+                    let parts =
+                        serde_json::to_string(&vec![MessageContent::Text { text: injected_text }])?;
+                    self.state.db.insert_message(&msg_id, &self.session_id, "user", &parts)?;
+
+                    received_count += 1;
+                }
+                BusEvent::TeamMemberCompleted { ref session_id, ref agent_name, .. }
+                    if session_id == &self.session_id =>
+                {
+                    completed_count += 1;
+                    tracing::info!(
+                        agent = %agent_name,
+                        completed_count,
+                        expected_count,
+                        "team member completed"
+                    );
+                    if completed_count >= expected_count {
+                        tracing::info!(
+                            received = received_count,
+                            completed = completed_count,
+                            "all background agents have completed"
+                        );
+                        break;
+                    }
+                }
+                BusEvent::TeamMemberFailed { ref session_id, ref agent_name, .. }
+                    if session_id == &self.session_id =>
+                {
+                    completed_count += 1;
+                    tracing::warn!(
+                        agent = %agent_name,
+                        completed_count,
+                        expected_count,
+                        "team member failed"
+                    );
+                    if completed_count >= expected_count {
+                        tracing::info!(
+                            received = received_count,
+                            completed = completed_count,
+                            "all background agents have finished (some failed)"
+                        );
+                        break;
+                    }
+                }
+                BusEvent::Cancelled { ref session_id } if session_id == &self.session_id => {
+                    tracing::info!("wait_for_team_agents: session cancelled");
+                    break;
+                }
+                _ => {} // Ignore unrelated events
+            }
+        }
+
+        if received_count > 0 {
+            tracing::info!(
+                received = received_count,
+                "background agent wait complete, resuming prompt loop"
+            );
+        }
+
+        Ok(())
     }
 
     /// Assemble the message history from the database.
@@ -925,7 +1128,7 @@ impl SessionEngine {
         let mut text = String::new();
         let mut reasoning = String::new();
         let mut tool_calls: Vec<ToolCall> = Vec::new();
-        let stream_timeout = std::time::Duration::from_secs(30);
+        let stream_timeout = std::time::Duration::from_secs(60);
 
         loop {
             tokio::select! {
@@ -946,11 +1149,11 @@ impl SessionEngine {
                         Ok(Some(event)) => event,
                         Ok(None) => break, // Channel closed
                         Err(_) => {
-                            // 30s with no event — stream is hung
-                            tracing::warn!("stream timeout: no event for 30s, aborting");
+                            // 60s with no event — stream is hung
+                            tracing::warn!("stream timeout: no event for 60s, aborting");
                             provider_handle.abort();
                             return Err(anyhow::anyhow!(
-                                "Stream timeout: no response from provider for 30 seconds. \
+                                "Stream timeout: no response from provider for 60 seconds. \
                                  The model may be overloaded. Try again."
                             ));
                         }
@@ -1074,9 +1277,16 @@ impl SessionEngine {
                         "retrying after transient error"
                     );
 
+                    let reason = if err_msg.contains("timeout") || err_msg.contains("Timeout") {
+                        "Stream timeout"
+                    } else if err_msg.contains("429") || err_msg.contains("rate_limit") {
+                        "Rate limited"
+                    } else {
+                        "Provider error"
+                    };
                     self.state.bus.send(BusEvent::Error {
                         message: format!(
-                            "Rate limited — retrying in {}s (attempt {attempt}/{max_retries})",
+                            "{reason} — retrying in {}s (attempt {attempt}/{max_retries})",
                             delay.as_secs()
                         ),
                     });
@@ -1155,8 +1365,47 @@ impl SessionEngine {
             }
 
             let description = tool.describe_invocation(&args);
-            let allowed =
-                self.state.permissions.check(&tc.name, tool.permission_level(), &description).await;
+            tracing::debug!(
+                tool = %tc.name,
+                description = %description,
+                "permission check for tool call"
+            );
+
+            // For bash commands, use the actual command as the pattern for
+            // fine-grained permission matching. For other tools, use "*".
+            let pattern = if tc.name == "bash" {
+                args.get("command").and_then(serde_json::Value::as_str).unwrap_or("*")
+            } else {
+                "*"
+            };
+
+            let allowed = if tool.permission_level() == crate::tool::PermissionLevel::Safe {
+                true
+            } else {
+                // Check the tool-level permission first
+                let tool_allowed =
+                    self.state.permissions.check(&tc.name, pattern, &description).await;
+                if !tool_allowed {
+                    false
+                } else if tc.name == "bash" {
+                    // For bash commands, additionally check for external directory access
+                    let command =
+                        args.get("command").and_then(serde_json::Value::as_str).unwrap_or("");
+                    if crate::permission::path::command_touches_external_paths(
+                        command,
+                        &self.state.project_root,
+                    ) {
+                        // Command references paths outside the project — check external_directory permission
+                        let ext_desc =
+                            format!("Command accesses paths outside the project: {}", &description);
+                        self.state.permissions.check("external_directory", command, &ext_desc).await
+                    } else {
+                        true
+                    }
+                } else {
+                    true
+                }
+            };
 
             if !allowed {
                 pre_results[i] = Some(ToolResult {

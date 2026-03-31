@@ -9,5 +9,5 @@ mod models;
 mod queries;
 mod schema;
 
-pub use models::{Message, MessageRow, Project, Role, Session};
+pub use models::{Message, MessageRow, PermissionRuleRow, Project, Role, Session};
 pub use schema::{Db, DbError};

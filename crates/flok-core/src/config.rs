@@ -19,6 +19,68 @@ pub struct FlokConfig {
     pub provider: std::collections::HashMap<String, ProviderConfig>,
     /// Git worktree isolation settings.
     pub worktree: WorktreeConfig,
+    /// Permission rules keyed by permission type.
+    ///
+    /// Each entry can be:
+    /// - A bare action: `bash = "allow"` (applies to all patterns)
+    /// - A table of pattern → action: `[permission.bash]` with `"git *" = "allow"`
+    ///
+    /// # Example
+    ///
+    /// ```toml
+    /// [permission]
+    /// read = "allow"
+    /// glob = "allow"
+    ///
+    /// [permission.bash]
+    /// "*" = "allow"
+    /// "rm -rf *" = "deny"
+    ///
+    /// [permission.external_directory]
+    /// "*" = "ask"
+    /// ```
+    pub permission: std::collections::HashMap<String, PermissionToolConfig>,
+}
+
+/// Permission configuration for a single tool/permission type.
+///
+/// Supports two forms in TOML:
+/// - Bare action: `read = "allow"` → applies to all patterns (`"*"`)
+/// - Pattern table: `[permission.bash]` with specific patterns
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PermissionToolConfig {
+    /// A bare action string: applies to all patterns (`"*"`).
+    Action(crate::permission::PermissionAction),
+    /// A map of pattern → action.
+    Patterns(std::collections::HashMap<String, crate::permission::PermissionAction>),
+}
+
+impl PermissionToolConfig {
+    /// Convert this config entry into permission rules for the given permission type.
+    pub fn into_rules(self, permission: &str) -> Vec<crate::permission::PermissionRule> {
+        match self {
+            Self::Action(action) => {
+                vec![crate::permission::PermissionRule::new(permission, "*", action)]
+            }
+            Self::Patterns(patterns) => patterns
+                .into_iter()
+                .map(|(pattern, action)| {
+                    crate::permission::PermissionRule::new(permission, pattern, action)
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Convert all permission config entries into a flat list of rules.
+pub fn permission_config_to_rules<S: std::hash::BuildHasher>(
+    config: &std::collections::HashMap<String, PermissionToolConfig, S>,
+) -> Vec<crate::permission::PermissionRule> {
+    config
+        .iter()
+        .flat_map(|(permission, tool_config)| tool_config.clone().into_rules(permission))
+        .collect()
 }
 
 /// Configuration for git worktree isolation.
@@ -119,6 +181,10 @@ fn merge_config(target: &mut FlokConfig, source: &FlokConfig) {
     // Worktree config: source overrides target entirely if present in source file
     // (serde default handles missing fields; if explicitly set in source, override)
     target.worktree = source.worktree.clone();
+    // Permission config: merge at the permission-type level
+    for (key, value) in &source.permission {
+        target.permission.insert(key.clone(), value.clone());
+    }
 }
 
 /// Ensure XDG-compliant directories exist.
@@ -193,6 +259,7 @@ mod tests {
             .into_iter()
             .collect(),
             worktree: WorktreeConfig::default(),
+            permission: std::collections::HashMap::new(),
         };
         merge_config(&mut base, &overlay);
         assert_eq!(base.provider["anthropic"].api_key.as_deref(), Some("key-123"));
@@ -207,5 +274,80 @@ mod tests {
         let config: FlokConfig = toml::from_str(toml_str).unwrap();
         assert!(config.provider.contains_key("anthropic"));
         assert_eq!(config.provider["anthropic"].api_key.as_deref(), Some("sk-test-123"));
+    }
+
+    #[test]
+    fn parse_permission_bare_action() {
+        let toml_str = r#"
+            [permission]
+            read = "allow"
+            glob = "allow"
+        "#;
+        let config: FlokConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.permission.len(), 2);
+
+        let rules = permission_config_to_rules(&config.permission);
+        assert_eq!(rules.len(), 2);
+        // Both should have pattern "*"
+        for rule in &rules {
+            assert_eq!(rule.pattern, "*");
+            assert_eq!(rule.action, crate::permission::PermissionAction::Allow);
+        }
+    }
+
+    #[test]
+    fn parse_permission_pattern_table() {
+        let toml_str = r#"
+            [permission.bash]
+            "*" = "allow"
+            "rm -rf *" = "deny"
+            "docker *" = "ask"
+        "#;
+        let config: FlokConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.permission.len(), 1);
+
+        let rules = permission_config_to_rules(&config.permission);
+        assert_eq!(rules.len(), 3);
+        // All should be "bash" permission
+        for rule in &rules {
+            assert_eq!(rule.permission, "bash");
+        }
+    }
+
+    #[test]
+    fn parse_permission_mixed() {
+        let toml_str = r#"
+            [permission]
+            read = "allow"
+            glob = "allow"
+
+            [permission.bash]
+            "*" = "allow"
+            "rm -rf *" = "deny"
+
+            [permission.external_directory]
+            "*" = "ask"
+        "#;
+        let config: FlokConfig = toml::from_str(toml_str).unwrap();
+        // "read", "glob", "bash", "external_directory"
+        assert_eq!(config.permission.len(), 4);
+
+        let rules = permission_config_to_rules(&config.permission);
+        // read (1) + glob (1) + bash (2) + external_directory (1) = 5
+        assert_eq!(rules.len(), 5);
+    }
+
+    #[test]
+    fn permission_merge_overrides() {
+        let mut base = FlokConfig::default();
+        let overlay: FlokConfig = toml::from_str(
+            r#"
+            [permission.bash]
+            "*" = "allow"
+            "#,
+        )
+        .unwrap();
+        merge_config(&mut base, &overlay);
+        assert!(base.permission.contains_key("bash"));
     }
 }

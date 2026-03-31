@@ -303,6 +303,91 @@ impl Db {
         )?;
         Ok(count as usize)
     }
+
+    // ---------------------------------------------------------------------------
+    // Permission rules
+    // ---------------------------------------------------------------------------
+
+    /// Insert or replace a permission rule for a project.
+    ///
+    /// Uses `INSERT OR REPLACE` so that re-approving the same pattern
+    /// updates the existing rule rather than creating a duplicate.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DbError` on database failures.
+    pub fn upsert_permission_rule(
+        &self,
+        project_id: &str,
+        permission: &str,
+        pattern: &str,
+        action: &str,
+    ) -> Result<(), DbError> {
+        self.conn().execute(
+            "INSERT OR REPLACE INTO permission_rules (project_id, permission, pattern, action)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![project_id, permission, pattern, action],
+        )?;
+        Ok(())
+    }
+
+    /// List all permission rules for a project.
+    ///
+    /// Rules are returned in insertion order (by `id`), which preserves
+    /// the chronological order of user approvals.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DbError` on database failures.
+    pub fn list_permission_rules(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<crate::models::PermissionRuleRow>, DbError> {
+        let mut stmt = self.conn().prepare(
+            "SELECT id, project_id, permission, pattern, action, created_at
+             FROM permission_rules
+             WHERE project_id = ?1
+             ORDER BY id ASC",
+        )?;
+
+        let rows = stmt.query_map(params![project_id], |row| {
+            Ok(crate::models::PermissionRuleRow {
+                id: row.get(0)?,
+                project_id: row.get(1)?,
+                permission: row.get(2)?,
+                pattern: row.get(3)?,
+                action: row.get(4)?,
+                created_at: row.get(5)?,
+            })
+        })?;
+
+        let mut rules = Vec::new();
+        for row in rows {
+            rules.push(row?);
+        }
+        Ok(rules)
+    }
+
+    /// Delete a specific permission rule by ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DbError` on database failures.
+    pub fn delete_permission_rule(&self, id: i64) -> Result<(), DbError> {
+        self.conn().execute("DELETE FROM permission_rules WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// Delete all permission rules for a project.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DbError` on database failures.
+    pub fn clear_permission_rules(&self, project_id: &str) -> Result<(), DbError> {
+        self.conn()
+            .execute("DELETE FROM permission_rules WHERE project_id = ?1", params![project_id])?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -449,5 +534,86 @@ mod tests {
         assert_eq!(db.count_messages("s1").unwrap(), 1);
         db.insert_message("m2", "s1", "assistant", "[]").unwrap();
         assert_eq!(db.count_messages("s1").unwrap(), 2);
+    }
+
+    // -- Permission Rules --
+
+    #[test]
+    fn permission_rule_upsert_and_list() {
+        let db = test_db();
+        db.get_or_create_project("p1", "/tmp/test").unwrap();
+
+        db.upsert_permission_rule("p1", "bash", "git commit *", "allow").unwrap();
+        db.upsert_permission_rule("p1", "bash", "npm install *", "allow").unwrap();
+
+        let rules = db.list_permission_rules("p1").unwrap();
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].permission, "bash");
+        assert_eq!(rules[0].pattern, "git commit *");
+        assert_eq!(rules[0].action, "allow");
+        assert_eq!(rules[1].pattern, "npm install *");
+    }
+
+    #[test]
+    fn permission_rule_upsert_replaces_existing() {
+        let db = test_db();
+        db.get_or_create_project("p1", "/tmp/test").unwrap();
+
+        db.upsert_permission_rule("p1", "bash", "git commit *", "ask").unwrap();
+        db.upsert_permission_rule("p1", "bash", "git commit *", "allow").unwrap();
+
+        let rules = db.list_permission_rules("p1").unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].action, "allow");
+    }
+
+    #[test]
+    fn permission_rule_delete_specific() {
+        let db = test_db();
+        db.get_or_create_project("p1", "/tmp/test").unwrap();
+
+        db.upsert_permission_rule("p1", "bash", "git commit *", "allow").unwrap();
+        db.upsert_permission_rule("p1", "bash", "npm install *", "allow").unwrap();
+
+        let rules = db.list_permission_rules("p1").unwrap();
+        assert_eq!(rules.len(), 2);
+
+        db.delete_permission_rule(rules[0].id).unwrap();
+
+        let remaining = db.list_permission_rules("p1").unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].pattern, "npm install *");
+    }
+
+    #[test]
+    fn permission_rule_clear_all() {
+        let db = test_db();
+        db.get_or_create_project("p1", "/tmp/test").unwrap();
+
+        db.upsert_permission_rule("p1", "bash", "git *", "allow").unwrap();
+        db.upsert_permission_rule("p1", "edit", "*", "allow").unwrap();
+
+        db.clear_permission_rules("p1").unwrap();
+
+        let rules = db.list_permission_rules("p1").unwrap();
+        assert!(rules.is_empty());
+    }
+
+    #[test]
+    fn permission_rules_scoped_to_project() {
+        let db = test_db();
+        db.get_or_create_project("p1", "/tmp/project1").unwrap();
+        db.get_or_create_project("p2", "/tmp/project2").unwrap();
+
+        db.upsert_permission_rule("p1", "bash", "git *", "allow").unwrap();
+        db.upsert_permission_rule("p2", "bash", "npm *", "allow").unwrap();
+
+        let p1_rules = db.list_permission_rules("p1").unwrap();
+        assert_eq!(p1_rules.len(), 1);
+        assert_eq!(p1_rules[0].pattern, "git *");
+
+        let p2_rules = db.list_permission_rules("p2").unwrap();
+        assert_eq!(p2_rules.len(), 1);
+        assert_eq!(p2_rules[0].pattern, "npm *");
     }
 }

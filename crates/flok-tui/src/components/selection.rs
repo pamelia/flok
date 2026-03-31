@@ -17,6 +17,18 @@ pub enum Panel {
     Input,
 }
 
+/// Selection granularity (single-click, double-click, triple-click).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SelectionMode {
+    /// Normal character-level drag selection.
+    #[default]
+    Char,
+    /// Double-click: expand to word boundaries.
+    Word,
+    /// Triple-click: expand to full line.
+    Line,
+}
+
 /// Rectangular region on screen (in absolute terminal coordinates).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PanelRect {
@@ -85,12 +97,14 @@ pub struct SelectionState {
     pub anchor: (u16, u16),
     /// Current drag point (absolute terminal coords).
     pub cursor: (u16, u16),
+    /// Selection granularity.
+    pub mode: SelectionMode,
 }
 
 impl SelectionState {
     /// Start a new selection at the given screen position.
     pub fn start(panel: Panel, col: u16, row: u16) -> Self {
-        Self { panel, anchor: (col, row), cursor: (col, row) }
+        Self { panel, anchor: (col, row), cursor: (col, row), mode: SelectionMode::Char }
     }
 
     /// Extend the selection to a new position.
@@ -98,9 +112,10 @@ impl SelectionState {
         self.cursor = (col, row);
     }
 
-    /// Whether the selection has nonzero extent (anchor != cursor).
+    /// Whether the selection has nonzero extent.
+    /// Word and Line modes always have extent (expanded by the overlay).
     pub fn has_extent(&self) -> bool {
-        self.anchor != self.cursor
+        self.mode != SelectionMode::Char || self.anchor != self.cursor
     }
 
     /// Return `(start, end)` in normalized order (top-left to bottom-right).
@@ -554,17 +569,32 @@ mod tests {
     #[test]
     fn selection_normalized_order() {
         // anchor before cursor (normal drag down)
-        let sel = SelectionState { panel: Panel::Messages, anchor: (5, 2), cursor: (10, 5) };
+        let sel = SelectionState {
+            panel: Panel::Messages,
+            anchor: (5, 2),
+            cursor: (10, 5),
+            mode: SelectionMode::Char,
+        };
         assert_eq!(sel.normalized(), ((5, 2), (10, 5)));
 
         // anchor after cursor (drag up)
-        let sel = SelectionState { panel: Panel::Messages, anchor: (10, 5), cursor: (5, 2) };
+        let sel = SelectionState {
+            panel: Panel::Messages,
+            anchor: (10, 5),
+            cursor: (5, 2),
+            mode: SelectionMode::Char,
+        };
         assert_eq!(sel.normalized(), ((5, 2), (10, 5)));
     }
 
     #[test]
     fn selection_contains_single_line() {
-        let sel = SelectionState { panel: Panel::Messages, anchor: (5, 3), cursor: (10, 3) };
+        let sel = SelectionState {
+            panel: Panel::Messages,
+            anchor: (5, 3),
+            cursor: (10, 3),
+            mode: SelectionMode::Char,
+        };
         assert!(sel.contains(5, 3));
         assert!(sel.contains(7, 3));
         assert!(sel.contains(10, 3));
@@ -575,7 +605,12 @@ mod tests {
 
     #[test]
     fn selection_contains_multi_line() {
-        let sel = SelectionState { panel: Panel::Messages, anchor: (5, 2), cursor: (10, 4) };
+        let sel = SelectionState {
+            panel: Panel::Messages,
+            anchor: (5, 2),
+            cursor: (10, 4),
+            mode: SelectionMode::Char,
+        };
         // First row: col >= 5
         assert!(sel.contains(5, 2));
         assert!(sel.contains(100, 2));
@@ -593,7 +628,12 @@ mod tests {
     fn extract_text_single_line() {
         let lines = vec!["Hello, world!".to_string()];
         let rect = PanelRect { x: 0, y: 0, w: 80, h: 10 };
-        let sel = SelectionState { panel: Panel::Messages, anchor: (0, 0), cursor: (4, 0) };
+        let sel = SelectionState {
+            panel: Panel::Messages,
+            anchor: (0, 0),
+            cursor: (4, 0),
+            mode: SelectionMode::Char,
+        };
         assert_eq!(sel.extract_text(&lines, rect, 0), "Hello");
     }
 
@@ -601,7 +641,12 @@ mod tests {
     fn extract_text_multi_line() {
         let lines = vec!["Line one".to_string(), "Line two".to_string(), "Line three".to_string()];
         let rect = PanelRect { x: 0, y: 0, w: 80, h: 10 };
-        let sel = SelectionState { panel: Panel::Messages, anchor: (5, 0), cursor: (3, 2) };
+        let sel = SelectionState {
+            panel: Panel::Messages,
+            anchor: (5, 0),
+            cursor: (3, 2),
+            mode: SelectionMode::Char,
+        };
         let text = sel.extract_text(&lines, rect, 0);
         assert_eq!(text, "one\nLine two\nLine");
     }
@@ -616,7 +661,12 @@ mod tests {
         ];
         let rect = PanelRect { x: 0, y: 0, w: 80, h: 2 };
         // Screen row 0 with scroll_offset=2 maps to lines[2]
-        let sel = SelectionState { panel: Panel::Messages, anchor: (0, 0), cursor: (4, 0) };
+        let sel = SelectionState {
+            panel: Panel::Messages,
+            anchor: (0, 0),
+            cursor: (4, 0),
+            mode: SelectionMode::Char,
+        };
         assert_eq!(sel.extract_text(&lines, rect, 2), "Row 2");
     }
 
@@ -626,7 +676,12 @@ mod tests {
         // Panel starts at column 10
         let rect = PanelRect { x: 10, y: 5, w: 80, h: 10 };
         // Screen col 12 = panel col 2, screen col 16 = panel col 6
-        let sel = SelectionState { panel: Panel::Messages, anchor: (12, 5), cursor: (16, 5) };
+        let sel = SelectionState {
+            panel: Panel::Messages,
+            anchor: (12, 5),
+            cursor: (16, 5),
+            mode: SelectionMode::Char,
+        };
         assert_eq!(sel.extract_text(&lines, rect, 0), "llo w");
     }
 

@@ -13,12 +13,13 @@
 2. **Given** the agent needs to understand a function's callers, **When** it uses `lsp_references`, **Then** it receives a list of all call sites with file paths and line numbers.
 3. **Given** the agent needs to navigate to a definition, **When** it uses `lsp_goto_definition`, **Then** it receives the file path and position of the definition.
 
-### User Story 2 - Agent Gets Compiler Diagnostics After Edits (Priority: P0)
-**Why this priority**: LSP diagnostics give the agent a "compiler in the loop" -- it can self-correct without burning tokens re-reading files.
+### User Story 2 - Agent Gets Compiler Diagnostics at Checkpoints (Priority: P0)
+**Why this priority**: LSP diagnostics give the agent a "compiler in the loop" -- it can self-correct without burning tokens re-reading files. But diagnostics must be delivered at the right time, not after every intermediate edit.
 **Acceptance Scenarios**:
-1. **Given** the agent has edited a file, **When** the LSP processes the change, **Then** the agent receives diagnostics (errors, warnings) for the edited file within 2s.
+1. **Given** the agent has completed a logical unit of edits (e.g., finished modifying a function, added an import, renamed across files), **When** the agent explicitly calls `lsp_diagnostics`, **Then** it receives current diagnostics (errors, warnings) for the specified files.
 2. **Given** the agent receives a type error diagnostic, **When** it reads the error, **Then** it can fix the error and re-check without a full rebuild cycle.
-3. **Given** multiple files are affected by a change, **When** the LSP publishes diagnostics, **Then** diagnostics for all affected files are collected and presented.
+3. **Given** the agent is midway through a multi-edit sequence (e.g., edit 3 of 8), **When** it edits a file, **Then** diagnostics are NOT automatically appended to the edit tool output -- the agent checks when ready.
+4. **Given** the agent completes all edits for a task, **When** it calls `lsp_diagnostics`, **Then** diagnostics for all affected files are collected and presented together.
 
 ### User Story 3 - LSP Server Auto-Detection and Management (Priority: P1)
 **Why this priority**: Users shouldn't have to configure LSP servers manually for common languages.
@@ -56,7 +57,7 @@
   | `lsp_references` | `textDocument/references` | Find all references | allow |
   | `lsp_implementations` | `textDocument/implementation` | Find implementations | allow |
   | `lsp_workspace_symbols` | `workspace/symbol` | Search symbols by name | allow |
-  | `lsp_diagnostics` | (publish diagnostics) | Get errors/warnings for a file | allow |
+  | `lsp_diagnostics` | (reads cached `publishDiagnostics`) | Get current errors/warnings for file(s) -- agent calls this explicitly at checkpoints | allow |
   | `lsp_rename_preview` | `textDocument/prepareRename` + `textDocument/rename` | Preview a rename refactor | allow |
   | `lsp_code_actions` | `textDocument/codeAction` | Get available code actions | allow |
 
@@ -89,7 +90,11 @@
   - Send `textDocument/didClose` when appropriate (session end)
   - Handle `workspace/didChangeWatchedFiles` for external changes
 
-- **FR-005**: LSP diagnostics MUST be collected after each file edit and available to the agent without an explicit tool call. The agent's system prompt should include a note about available diagnostics.
+- **FR-005**: LSP diagnostics MUST be collected in the background (via `textDocument/publishDiagnostics` notifications) but MUST NOT be automatically injected into edit/write tool output. Diagnostics are available on-demand via the `lsp_diagnostics` tool. The agent's system prompt should instruct it to check diagnostics after completing a logical unit of work, not after every individual edit.
+
+- **FR-005a**: The `edit` and `write` tools MUST still send `textDocument/didChange` notifications to keep the LSP server's view of the file in sync. This is file synchronization, not diagnostic delivery -- these are separate concerns.
+
+- **FR-005b**: Flok MUST NOT wait for or block on LSP diagnostics during edit/write tool execution. The edit tool returns immediately after applying the file change and notifying the LSP.
 
 - **FR-006**: LSP tool calls MUST timeout after 5s (configurable) and return a timeout error.
 
@@ -158,7 +163,11 @@ pub enum DiagnosticSeverity { Error, Warning, Info, Hint }
 
 ### Overview
 
-The LSP integration makes flok a semantically-aware coding agent. Instead of treating code as text (grep + regex), the agent can query type information, navigate symbol relationships, and get compiler feedback in real-time. The LSP client communicates with language servers via stdio using the standard Language Server Protocol (JSON-RPC over stdin/stdout).
+The LSP integration makes flok a semantically-aware coding agent. Instead of treating code as text (grep + regex), the agent can query type information, navigate symbol relationships, and get compiler diagnostics on demand. The LSP client communicates with language servers via stdio using the standard Language Server Protocol (JSON-RPC over stdin/stdout).
+
+**Key design principle**: LSP serves two distinct roles that must not be conflated:
+1. **Code intelligence** (hover, go-to-definition, references, symbols) -- available any time via explicit tool calls.
+2. **Diagnostic feedback** (errors, warnings) -- collected in the background but delivered only when the agent explicitly requests it at a logical checkpoint. Diagnostics are never automatically appended to edit/write tool output, because intermediate states during multi-edit sequences are expected to be broken and would produce misleading feedback.
 
 ### Detailed Design
 
@@ -256,12 +265,12 @@ impl LspClient {
 }
 ```
 
-#### Diagnostics Collection
+#### Diagnostics Collection (Background, Not Per-Edit)
 
-Diagnostics are pushed by the LSP server via `textDocument/publishDiagnostics` notifications. The client collects them in a `DashMap` and makes them available to agents:
+Diagnostics are pushed by the LSP server via `textDocument/publishDiagnostics` notifications. The client collects them silently in a `DashMap`. **Diagnostics are never automatically injected into edit/write tool output.**
 
 ```rust
-// In the reader loop:
+// In the reader loop -- silently cache diagnostics as they arrive:
 fn handle_notification(&self, method: &str, params: Value) {
     match method {
         "textDocument/publishDiagnostics" => {
@@ -275,31 +284,54 @@ fn handle_notification(&self, method: &str, params: Value) {
 }
 ```
 
-After an agent edits a file, the `edit` and `write` tools automatically wait briefly (up to 2s) for fresh diagnostics, then append them to the tool result:
+The agent retrieves diagnostics explicitly via the `lsp_diagnostics` tool when it is ready to check:
 
 ```rust
-// In edit tool, after applying the edit:
-if let Some(lsp) = state.lsp.server_for_file(&file_path) {
-    lsp.did_change(&file_path, &new_content, version).await?;
+pub struct LspDiagnosticsTool;
 
-    // Wait for diagnostics (with timeout)
-    let diagnostics = tokio::time::timeout(
-        Duration::from_secs(2),
-        lsp.wait_for_diagnostics(&file_path),
-    ).await;
+impl Tool for LspDiagnosticsTool {
+    async fn execute(&self, args: Value, ctx: ToolContext) -> Result<ToolOutput> {
+        let paths: Vec<PathBuf> = match args.get("paths") {
+            Some(p) => serde_json::from_value(p.clone())?,
+            None => vec![], // Empty = return diagnostics for all tracked files
+        };
 
-    if let Ok(Some(diags)) = diagnostics {
-        let error_count = diags.iter().filter(|d| d.severity == Error).count();
-        if error_count > 0 {
-            output.push_str(&format!(
-                "\n\n⚠ LSP reports {} error(s) after edit:\n{}",
-                error_count,
-                format_diagnostics(&diags)
-            ));
+        let lsp = &ctx.state.lsp;
+        let mut all_diagnostics = Vec::new();
+
+        // If specific paths requested, optionally wait briefly for fresh diagnostics
+        // (the LSP may still be processing recent didChange notifications)
+        if !paths.is_empty() {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+
+        let files = if paths.is_empty() {
+            lsp.all_diagnostics()
+        } else {
+            lsp.diagnostics_for(&paths)
+        };
+
+        for (path, diags) in files {
+            all_diagnostics.extend(diags.iter().map(|d| format_diagnostic(&path, d)));
+        }
+
+        if all_diagnostics.is_empty() {
+            Ok(ToolOutput::text("No diagnostics. Code looks clean."))
+        } else {
+            Ok(ToolOutput::text(all_diagnostics.join("\n")))
         }
     }
 }
 ```
+
+**Design rationale -- why not per-edit diagnostics:**
+
+During a multi-edit sequence (e.g., renaming a type and updating 8 call sites), intermediate states are *expected* to be broken. Feeding the agent diagnostics after edit 1 of 8 is actively harmful:
+- The diagnostics are noise -- the agent already knows the code is incomplete.
+- The agent may waste tokens "fixing" errors that would resolve after the remaining edits.
+- Each diagnostic wait adds latency (up to 2s per edit = 16s wasted on an 8-edit sequence).
+
+Instead, the agent checks diagnostics at **logical checkpoints** -- after completing a coherent unit of work. The `edit`/`write` tools still notify the LSP via `didChange` (to keep its view in sync), but do not wait for or return diagnostics.
 
 #### Tool Implementations
 
@@ -330,16 +362,34 @@ impl Tool for LspHoverTool {
 
 #### Integration with Edit Tools
 
-The `edit` and `write` tools are enhanced to automatically synchronize with LSP and report diagnostics. This creates a "compiler in the loop" that reduces wasted tokens:
+The `edit` and `write` tools synchronize file state with the LSP server but **do not block on or return diagnostics**. This separates file synchronization (keep LSP in sync) from diagnostic feedback (agent checks when ready):
 
 ```
 Agent edits file → edit tool applies change
-                 → LSP notified (didChange)
-                 → Wait up to 2s for diagnostics
-                 → If errors: append to tool output
-                 → Agent reads errors, self-corrects
-                 → Repeat (without re-reading the full file)
+                 → LSP notified (didChange) -- fire-and-forget
+                 → Tool returns immediately with edit result only
+
+Agent completes logical unit of work (e.g., finishes a function refactor)
+                 → Agent calls lsp_diagnostics
+                 → Reads errors, self-corrects if needed
 ```
+
+```rust
+// In edit tool, after applying the edit:
+if let Some(lsp) = state.lsp.server_for_file(&file_path) {
+    // Fire-and-forget: keep LSP in sync, but don't wait for diagnostics.
+    // The LSP will process this in the background and update its
+    // cached diagnostics, which the agent can query later.
+    lsp.did_change(&file_path, &new_content, version).await?;
+}
+// Tool output contains ONLY the edit result -- no diagnostics appended.
+```
+
+This design means the agent operates in two distinct modes:
+1. **Editing mode**: rapid sequential edits with no diagnostic overhead.
+2. **Verification mode**: explicit `lsp_diagnostics` call to check the result.
+
+The system prompt instructs the agent to call `lsp_diagnostics` after completing a coherent set of changes, not after every individual edit.
 
 #### Per-Worktree LSP Instances
 
@@ -361,11 +411,12 @@ impl LspManager {
 3. **Query LSP on every file read**: Rejected. Too expensive. LSP tools are available on-demand, and diagnostics are pushed after edits.
 4. **Bundle LSP servers with flok**: Rejected. LSP servers are language-specific and large. Users install them via their package manager. Flok auto-detects what's available.
 5. **Use tree-sitter for type inference instead of LSP**: Rejected for type info (tree-sitter doesn't do type inference), but tree-sitter is used separately for fast apply (spec-014). LSP and tree-sitter serve complementary roles.
+6. **Inject diagnostics automatically after every edit** ("compiler in the loop"): Rejected. During multi-edit sequences (e.g., renaming a type across 8 files), intermediate states are expected to be broken. Per-edit diagnostics are noise that wastes tokens, adds latency (up to 2s per edit), and can derail the agent into "fixing" transient errors. The checkpoint-based approach (agent calls `lsp_diagnostics` when ready) gives the same self-correction benefit without the pathological intermediate-state problem.
 
 ## Success Criteria
 
 - **SC-001**: LSP hover response returns in < 500ms (excluding server startup)
-- **SC-002**: Diagnostics published within 2s of file edit notification
+- **SC-002**: `lsp_diagnostics` tool returns current diagnostics within 1s (reads from cache; LSP background processing is async)
 - **SC-003**: LSP initialization does not block TUI launch
 - **SC-004**: LSP restart on crash completes within 5s
 - **SC-005**: Agent self-correction rate improves by 30%+ when LSP diagnostics are available (measured by reduction in retry turns for type errors)
@@ -382,7 +433,7 @@ impl LspManager {
 ## Open Questions
 
 - Should we expose `textDocument/completion` for agent-assisted code completion?
-- Should LSP diagnostics be automatically injected into the agent's context, or only when explicitly requested?
+- ~~Should LSP diagnostics be automatically injected into the agent's context, or only when explicitly requested?~~ **Resolved: explicitly requested.** Automatic per-edit injection produces noise during multi-edit sequences and can derail the agent. See FR-005 and the "Design rationale" in the Diagnostics Collection section.
 - Should we support LSP code actions as agent-callable tools (auto-fix suggestions)?
 - How should we handle LSP servers that require project-specific configuration (e.g., `rust-analyzer` settings in `rust-analyzer.json`)?
 - Should we add a `lsp_status` TUI panel showing connected language servers and their health?

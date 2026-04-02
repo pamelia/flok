@@ -17,6 +17,9 @@ pub mod session;
 pub mod skills;
 pub mod snapshot;
 pub mod team;
+// Test utilities — only compiled during `cargo test`
+#[cfg(any(test, feature = "testutil"))]
+pub mod testutil;
 pub mod token;
 pub mod tool;
 pub mod worktree;

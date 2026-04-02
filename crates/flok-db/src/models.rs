@@ -20,6 +20,21 @@ pub struct Session {
     pub model_id: String,
     pub created_at: String,
     pub updated_at: String,
+    /// The message ID in the parent session where this branch was taken.
+    /// `None` for root sessions (not branched).
+    pub branch_from_message_id: Option<String>,
+    /// The workspace snapshot hash at the branch point.
+    /// `None` if snapshots are disabled or this is a root session.
+    pub branch_snapshot_hash: Option<String>,
+}
+
+/// A session label (bookmark) for tree navigation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionLabel {
+    pub id: i64,
+    pub session_id: String,
+    pub label: String,
+    pub created_at: String,
 }
 
 /// Message role in a conversation.

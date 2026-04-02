@@ -63,6 +63,25 @@ const MIGRATIONS: &[(i32, &str, &str)] = &[
             ON permission_rules(project_id);
         ",
     ),
+    (
+        3,
+        "Tree sessions: branch metadata and session labels",
+        r"
+        ALTER TABLE sessions ADD COLUMN branch_from_message_id TEXT;
+        ALTER TABLE sessions ADD COLUMN branch_snapshot_hash TEXT;
+
+        CREATE TABLE IF NOT EXISTS session_labels (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id  TEXT NOT NULL REFERENCES sessions(id),
+            label       TEXT NOT NULL,
+            created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(session_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_session_labels_session
+            ON session_labels(session_id);
+        ",
+    ),
 ];
 
 /// Run all pending migrations.
@@ -99,6 +118,6 @@ mod tests {
         run(&conn).unwrap();
 
         let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
     }
 }

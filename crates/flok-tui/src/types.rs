@@ -19,6 +19,16 @@ pub enum UiCommand {
     Cancel,
     /// User wants to quit.
     Quit,
+    /// Show the session tree.
+    ShowTree,
+    /// Branch at a specific message ID.
+    BranchAt(String),
+    /// Switch to a different session by ID.
+    SwitchSession(String),
+    /// Set a label on the current session.
+    SetLabel(String),
+    /// List available branch points (user messages) in the current session.
+    ListBranchPoints,
 }
 
 /// Messages from the background session task to the TUI.
@@ -36,6 +46,12 @@ pub enum UiEvent {
     HistoryMessage { role: String, content: String },
     /// An error occurred.
     Error(String),
+    /// Session switched — TUI should reload conversation display.
+    /// Contains display messages for the new session.
+    SessionSwitched { messages: Vec<(String, String)> },
+    /// Branch points (user messages) for the /branch picker.
+    /// Each entry: (`message_id`, `message_number`, `text_preview`)
+    BranchPoints(Vec<(String, usize, String)>),
 }
 
 /// A permission prompt from the engine, needing user approval.

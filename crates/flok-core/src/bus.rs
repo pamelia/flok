@@ -95,6 +95,12 @@ pub enum BusEvent {
     /// A team member failed.
     TeamMemberFailed { session_id: String, team_id: String, agent_name: String, error: String },
 
+    /// A session was branched (new session created from a branch point).
+    SessionBranched { parent_session_id: String, new_session_id: String, from_message_id: String },
+
+    /// The active session was switched (via tree navigation).
+    SessionSwitched { from_session_id: String, to_session_id: String },
+
     /// An error occurred.
     Error { message: String },
 }

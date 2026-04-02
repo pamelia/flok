@@ -24,19 +24,38 @@ AI-assisted coding workflows. Single binary, no runtime dependencies.
 
 ## Features
 
-- **Multi-provider support** -- Anthropic Claude (4.6/4), OpenAI GPT, DeepSeek
-- **Rich terminal UI** -- iocraft-based declarative TUI with sidebar stats, markdown rendering, dark theme
-- **14 built-in tools** -- read, write, edit, bash, grep, glob, webfetch, question, todowrite, skill, agent_memory, plan, task
-- **Sub-agent system** -- explore agent for codebase search, general agent for parallel tasks
-- **Session persistence** -- SQLite-backed conversation storage with resume (`--resume`)
-- **Plan/Build modes** -- read-only plan mode restricts tools; build mode allows full access
-- **Streaming responses** -- real-time text and reasoning delta streaming
+**Providers & Models**
+- **Multi-provider support** -- Anthropic Claude (4.6/4), OpenAI GPT-4.1, DeepSeek
+- **Model shorthand aliases** -- `sonnet`, `opus`, `haiku`, `gpt-4.1`, `mini`, `deepseek`, `r1`
 - **Prompt caching** -- Anthropic cache_control breakpoints for cost savings
+- **Streaming responses** -- real-time text and reasoning delta streaming
+
+**Terminal UI**
+- **Rich terminal UI** -- iocraft-based declarative TUI with sidebar stats, markdown rendering, dark theme
+- **Command palette** (`Ctrl+K`) and model picker (`Ctrl+M`)
+- **Text selection & copy** -- click-drag, double-click word, triple-click line, auto-copy to clipboard
+- **Scrolling** -- mouse wheel per-panel, keyboard scroll (Page Up/Down, vim-style bindings)
+- **Plan/Build modes** -- read-only plan mode restricts tools; build mode allows full access
+
+**Tools & Agents**
+- **19 built-in tools** -- file ops, search, bash, web fetch, code review, team coordination, and more
+- **10 sub-agents** -- explore and general agents, plus 8 specialist reviewers for code/spec review
+- **4 built-in skills** -- code-review, self-review-loop, spec-review, handle-pr-feedback
+- **Code review engine** -- multi-agent parallel review with specialist reviewers, deduplication, and verdicts
+
+**Session Management**
+- **Session persistence** -- SQLite-backed conversation storage with resume (`--resume`)
+- **Session branching** -- branch conversations at any message to explore alternatives; LLM-generated summaries of abandoned paths are injected so the agent learns from prior attempts
+- **Session tree** -- navigate branch history with `/tree`, switch between branches, label checkpoints
+- **Undo/Redo** -- revert the last message and restore workspace files to the pre-message state
+
+**Infrastructure**
+- **Workspace snapshots** -- shadow git repository tracks file state; undo restores files automatically
+- **Worktree isolation** -- sub-agents get isolated git worktrees for concurrent work without conflicts
 - **Token counting & cost tracking** -- real-time cost estimation with tiktoken-rs
 - **Context window management** -- multi-tier compression (tool output pruning, shell output compression, emergency truncation)
-- **Interactive permissions** -- three-tier system: Safe (auto), Write (prompt once), Dangerous (always prompt)
+- **Interactive permissions** -- three-tier system: Safe (auto), Write (prompt once), Dangerous (always prompt); decisions persist per-project
 - **AGENTS.md injection** -- project-specific instructions injected into the system prompt
-- **Model shorthand aliases** -- `sonnet`, `opus`, `haiku`, `gpt-4.1`, `mini`, `deepseek`, `r1`, etc.
 - **Non-interactive mode** -- `--prompt` flag for scripting and CI
 
 ## Quick Start
@@ -69,7 +88,7 @@ cargo run --release
 |----------|----------|
 | `ANTHROPIC_API_KEY` | Anthropic (Claude) |
 | `OPENAI_API_KEY` | OpenAI (GPT) |
-| `DEEPSEEK_API_KEY` | DeepSeek |
+| `DEEPSEEK_API_KEY` | DeepSeek (uses OpenAI-compatible API) |
 
 ## Usage
 
@@ -116,6 +135,7 @@ flok version             # Show version info
 |-----|--------|
 | `Enter` | Send message |
 | `Shift+Enter` | New line in input |
+| `Esc` | Cancel current streaming response |
 | `Tab` | Toggle Plan/Build mode |
 | `Ctrl+K` | Command palette |
 | `Ctrl+M` | Model picker |
@@ -123,16 +143,39 @@ flok version             # Show version info
 | `Ctrl+W` | Delete last word |
 | `Ctrl+A` / `Ctrl+E` | Start / end of input |
 | `Ctrl+U` | Clear input |
+| `Up` / `Down` | Input history (when single-line) |
 | `Ctrl+C` / `Ctrl+D` | Quit |
+
+**Scrolling:**
+
+| Key | Action |
+|-----|--------|
+| `PageUp` / `PageDown` | Scroll messages half-page |
+| `Ctrl+Home` / `Ctrl+End` | Scroll to top / bottom |
+| Mouse wheel | Per-panel scrolling |
+
+**Text Selection:**
+
+| Action | Effect |
+|--------|--------|
+| Click + drag | Character selection |
+| Double-click | Word selection |
+| Triple-click | Line selection |
+| `Ctrl+C` (with selection) | Copy to clipboard |
 
 ### Slash Commands
 
 | Command | Description |
 |---------|-------------|
 | `/new`, `/clear` | Start a new session |
+| `/undo` | Undo last message and restore files |
+| `/redo` | Redo last undone message |
+| `/tree` | Show session branching tree |
+| `/branch` | List messages to branch from |
+| `/branch <n>` | Branch at message number `n` |
+| `/label <text>` | Label the current session for tree navigation |
 | `/plan` | Switch to plan mode (read-only) |
 | `/build` | Switch to build mode |
-| `/model` | Show current model |
 | `/sessions` | List past sessions |
 | `/sidebar` | Toggle sidebar |
 | `/help` | Show available commands |
@@ -143,7 +186,7 @@ flok version             # Show version info
 When the LLM requests a write or dangerous operation, you'll see a permission dialog:
 
 - `y` / `Enter` -- Allow once
-- `a` -- Always allow this tool for the session
+- `a` -- Always allow this tool for the session (persisted to DB)
 - `n` / `Esc` -- Deny
 
 ## Models
@@ -155,16 +198,16 @@ When the LLM requests a write or dangerous operation, you'll see a permission di
 | `haiku` | Claude Haiku 4.5 | Anthropic | 200K |
 | `gpt-4.1` | GPT-4.1 | OpenAI | ~1M |
 | `mini` | GPT-4.1 Mini | OpenAI | ~1M |
-| `flash` | Gemini 2.5 Flash | Google | ~1M |
-| `pro` | Gemini 2.5 Pro | Google | ~1M |
 | `deepseek` | DeepSeek V3 | DeepSeek | 128K |
 | `r1` | DeepSeek R1 | DeepSeek | 128K |
 
 Legacy: `sonnet-4`, `opus-4` for Claude Sonnet 4 / Opus 4 (previous generation).
 
+DeepSeek uses the OpenAI-compatible API format with a different base URL.
+
 ## Tools
 
-Flok provides 14 built-in tools:
+Flok provides 19 built-in tools:
 
 | Tool | Permission | Description |
 |------|-----------|-------------|
@@ -174,15 +217,53 @@ Flok provides 14 built-in tools:
 | `webfetch` | Safe | Fetch URL content (SSRF protected) |
 | `question` | Safe | Ask the user a question with options |
 | `todowrite` | Safe | Manage a task list |
-| `skill` | Safe | Load skill instructions from .flok/skills/ |
+| `skill` | Safe | Load skill instructions from `.flok/skills/` |
 | `agent_memory` | Safe | Read/write persistent per-agent memory |
-| `plan` | Safe | Write structured plans to .flok/plan.md |
-| `task` | Safe | Spawn sub-agent (explore, general) |
+| `plan` | Safe | Write structured plans to `.flok/plan.md` |
+| `task` | Safe | Spawn sub-agent (explore, general, reviewers) |
+| `code_review` | Safe | Run structured multi-agent code review on a diff |
+| `team_create` | Safe | Create a named agent team for coordination |
+| `team_delete` | Safe | Disband an agent team |
+| `team_task` | Safe | Manage tasks on a team's shared task board |
+| `send_message` | Safe | Send messages between agents in a team |
 | `write` | Write | Create or overwrite files |
 | `edit` | Write | Search-and-replace in files |
+| `fast_apply` | Write | Apply code edits using lazy snippet markers (`// ... existing code ...`) |
 | `bash` | Dangerous | Execute shell commands |
 
 In **plan mode**, only Safe tools are available. Switch to **build mode** (`Tab` or `/build`) to enable Write and Dangerous tools.
+
+## Sub-Agents
+
+The `task` tool spawns sub-agents that run independently and report back:
+
+| Agent | Description |
+|-------|-------------|
+| `explore` | Fast codebase search -- glob, grep, read files |
+| `general` | General-purpose multi-step task execution |
+| `feasibility-reviewer` | Technical feasibility & architecture fit |
+| `complexity-reviewer` | Complexity & simplicity analysis |
+| `completeness-reviewer` | Completeness & edge case coverage |
+| `operations-reviewer` | Operations & reliability assessment |
+| `api-reviewer` | API design & contract review |
+| `clarity-reviewer` | Clarity & precision evaluation |
+| `scope-reviewer` | Scope & delivery risk analysis |
+| `product-reviewer` | Product & value alignment review |
+
+The 8 specialist reviewers are used by the code review and spec review skills to provide multi-perspective analysis.
+
+## Built-in Skills
+
+Skills are loaded via the `skill` tool and provide structured workflows:
+
+| Skill | Description |
+|-------|-------------|
+| `code-review` | Reviews a GitHub PR using parallel specialist agents. Produces prioritized findings and a verdict. |
+| `self-review-loop` | Iterative review-fix-review loop. Runs until only minor feedback remains (max 5 turns). |
+| `spec-review` | Three-phase parallel spec review: specialist review, cross-review, synthesized output. |
+| `handle-pr-feedback` | Reads unresolved PR comments, applies fixes, replies to each comment, resolves threads. |
+
+Project-local skills can be added in `.flok/skills/<name>.md`.
 
 ## Configuration
 
@@ -206,6 +287,11 @@ Example `flok.toml`:
 [provider.deepseek]
 # api_key = "sk-..."       # Or set DEEPSEEK_API_KEY env var
 # base_url = "https://api.deepseek.com/v1"
+
+[worktree]
+# enabled = true           # Isolate sub-agents in git worktrees
+# cleanup_on_complete = true
+# auto_merge = true        # Auto-merge worktree changes back
 ```
 
 ### AGENTS.md
@@ -225,7 +311,7 @@ into the system prompt. Flok reads this automatically (up to 20KB).
 flok/
 ├── crates/
 │   ├── flok/          # Binary: CLI entry point, runtime wiring
-│   ├── flok-core/     # Library: session engine, providers, tools, config
+│   ├── flok-core/     # Library: session engine, providers, tools, agents, review
 │   ├── flok-db/       # Library: SQLite persistence, migrations
 │   └── flok-tui/      # Library: iocraft TUI components and rendering
 ├── specs/             # Feature specifications

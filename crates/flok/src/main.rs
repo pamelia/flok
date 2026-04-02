@@ -433,6 +433,111 @@ async fn run_interactive(
                         let _ = ui_tx.send(flok_tui::UiEvent::Error(format!("Redo failed: {e}")));
                     }
                 },
+                flok_tui::UiCommand::ShowTree => match engine.session_tree_text() {
+                    Ok(text) => {
+                        let _ = ui_tx.send(flok_tui::UiEvent::Error(text));
+                    }
+                    Err(e) => {
+                        let _ = ui_tx.send(flok_tui::UiEvent::Error(format!(
+                            "Failed to build session tree: {e}"
+                        )));
+                    }
+                },
+                flok_tui::UiCommand::ListBranchPoints => match engine.list_branch_points() {
+                    Ok(points) => {
+                        let _ = ui_tx.send(flok_tui::UiEvent::BranchPoints(points));
+                    }
+                    Err(e) => {
+                        let _ = ui_tx.send(flok_tui::UiEvent::Error(format!(
+                            "Failed to list branch points: {e}"
+                        )));
+                    }
+                },
+                flok_tui::UiCommand::BranchAt(arg) => {
+                    // Resolve the argument: could be a number (from the list) or a message ID
+                    let message_id = if let Ok(num) = arg.parse::<usize>() {
+                        // User typed a number — resolve to a message ID
+                        match engine.list_branch_points() {
+                            Ok(points) => points
+                                .iter()
+                                .find(|(_, idx, _)| *idx == num)
+                                .map(|(id, _, _)| id.clone()),
+                            Err(e) => {
+                                let _ = ui_tx.send(flok_tui::UiEvent::Error(format!(
+                                    "Failed to resolve branch point: {e}"
+                                )));
+                                None
+                            }
+                        }
+                    } else {
+                        // Treat as a direct message ID
+                        Some(arg)
+                    };
+
+                    if let Some(msg_id) = message_id {
+                        match engine.branch_at_message(&msg_id).await {
+                            Ok(result) => {
+                                let msg = format!(
+                                    "Branch created: {} messages copied{}. \
+                                     Switching to branch session [{:.8}].",
+                                    result.messages_copied,
+                                    if result.summary_generated {
+                                        " + summary generated"
+                                    } else {
+                                        ""
+                                    },
+                                    result.session_id,
+                                );
+                                // Auto-switch to the new branch
+                                match engine.switch_session(&result.session_id).await {
+                                    Ok(history) => {
+                                        let _ = ui_tx.send(flok_tui::UiEvent::Error(msg));
+                                        let _ = ui_tx.send(flok_tui::UiEvent::SessionSwitched {
+                                            messages: history,
+                                        });
+                                    }
+                                    Err(e) => {
+                                        let _ = ui_tx.send(flok_tui::UiEvent::Error(format!(
+                                            "{msg}\nBut switch failed: {e}"
+                                        )));
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let _ = ui_tx
+                                    .send(flok_tui::UiEvent::Error(format!("Branch failed: {e}")));
+                            }
+                        }
+                    } else {
+                        let _ = ui_tx.send(flok_tui::UiEvent::Error(
+                            "Invalid branch point. Use /branch to list available points."
+                                .to_string(),
+                        ));
+                    }
+                }
+                flok_tui::UiCommand::SwitchSession(session_id) => {
+                    match engine.switch_session(&session_id).await {
+                        Ok(history) => {
+                            let _ = ui_tx
+                                .send(flok_tui::UiEvent::SessionSwitched { messages: history });
+                        }
+                        Err(e) => {
+                            let _ = ui_tx.send(flok_tui::UiEvent::Error(format!(
+                                "Session switch failed: {e}"
+                            )));
+                        }
+                    }
+                }
+                flok_tui::UiCommand::SetLabel(label) => match engine.set_label(&label) {
+                    Ok(()) => {
+                        let _ =
+                            ui_tx.send(flok_tui::UiEvent::Error(format!("Label set: \"{label}\"")));
+                    }
+                    Err(e) => {
+                        let _ = ui_tx
+                            .send(flok_tui::UiEvent::Error(format!("Failed to set label: {e}")));
+                    }
+                },
                 flok_tui::UiCommand::Cancel => {
                     // Cancel received outside of streaming — nothing to cancel
                 }

@@ -189,6 +189,44 @@ fn FlokApp(mut hooks: Hooks, props: &mut FlokAppProps) -> impl Into<AnyElement<'
                     });
                     waiting.set(false);
                 }
+                Some(UiEvent::SessionSwitched { messages: history }) => {
+                    // Clear and reload conversation for the new session
+                    messages.write().clear();
+                    for (role, content) in history {
+                        let msg_role = match role.as_str() {
+                            "user" => MessageRole::User,
+                            "assistant" => MessageRole::Assistant,
+                            _ => MessageRole::System,
+                        };
+                        messages.write().push(DisplayMessage { role: msg_role, content });
+                    }
+                    messages.write().push(DisplayMessage {
+                        role: MessageRole::System,
+                        content: "Switched session.".into(),
+                    });
+                    waiting.set(false);
+                }
+                Some(UiEvent::BranchPoints(points)) => {
+                    if points.is_empty() {
+                        messages.write().push(DisplayMessage {
+                            role: MessageRole::System,
+                            content: "No user messages to branch from.".into(),
+                        });
+                    } else {
+                        let mut text = String::from("Select a message to branch from:\n\n");
+                        for (id, num, preview) in &points {
+                            use std::fmt::Write;
+                            let _ = writeln!(text, "  {num}. {preview}  [{id:.8}]");
+                        }
+                        let _ = std::fmt::Write::write_str(
+                            &mut text,
+                            "\nUse: /branch <number> to branch at that message.",
+                        );
+                        messages
+                            .write()
+                            .push(DisplayMessage { role: MessageRole::System, content: text });
+                    }
+                }
                 None => break,
             }
         }
@@ -1282,10 +1320,20 @@ fn handle_palette(
                             let _ = tx.send(UiCommand::ListSessions);
                         }
                     }
+                    "tree" => {
+                        if let Some(tx) = cmd_tx {
+                            let _ = tx.send(UiCommand::ShowTree);
+                        }
+                    }
+                    "branch" => {
+                        if let Some(tx) = cmd_tx {
+                            let _ = tx.send(UiCommand::ListBranchPoints);
+                        }
+                    }
                     "help" => {
                         messages.write().push(DisplayMessage {
                             role: MessageRole::System,
-                            content: "Commands: /quit /new /plan /build /sidebar /sessions /help\n\
+                            content: "Commands: /quit /new /plan /build /sidebar /sessions /tree /branch /label <text> /help\n\
                                      Keys: Ctrl+C quit  Ctrl+K commands  Tab plan/build  Ctrl+B sidebar  Ctrl+U clear".into(),
                         });
                     }
@@ -1406,7 +1454,7 @@ fn handle_slash_command(
         "/help" => {
             messages.write().push(DisplayMessage {
                 role: MessageRole::System,
-                content: "Commands: /quit /new /undo /redo /model /plan /build /sidebar /sessions /help\n\
+                content: "Commands: /quit /new /undo /redo /model /plan /build /sidebar /sessions /tree /branch /label <text> /help\n\
                          Keys: Ctrl+C quit  Tab plan/build  Ctrl+B sidebar  Ctrl+U clear input"
                     .into(),
             });
@@ -1440,6 +1488,40 @@ fn handle_slash_command(
             messages.write().push(DisplayMessage {
                 role: MessageRole::System,
                 content: "Model switching not yet implemented.".into(),
+            });
+        }
+        "/tree" => {
+            if let Some(tx) = cmd_tx {
+                let _ = tx.send(UiCommand::ShowTree);
+            }
+        }
+        cmd if cmd.starts_with("/branch ") => {
+            let arg = cmd.strip_prefix("/branch ").unwrap_or("").trim();
+            if let Some(tx) = cmd_tx {
+                // Argument can be a message ID directly or a number from the branch points list
+                let _ = tx.send(UiCommand::BranchAt(arg.to_string()));
+            }
+        }
+        "/branch" => {
+            if let Some(tx) = cmd_tx {
+                let _ = tx.send(UiCommand::ListBranchPoints);
+            }
+        }
+        cmd if cmd.starts_with("/label ") => {
+            let label = cmd.strip_prefix("/label ").unwrap_or("").trim();
+            if label.is_empty() {
+                messages.write().push(DisplayMessage {
+                    role: MessageRole::System,
+                    content: "Usage: /label <text>".into(),
+                });
+            } else if let Some(tx) = cmd_tx {
+                let _ = tx.send(UiCommand::SetLabel(label.to_string()));
+            }
+        }
+        "/label" => {
+            messages.write().push(DisplayMessage {
+                role: MessageRole::System,
+                content: "Usage: /label <text>".into(),
             });
         }
         _ => {
@@ -1476,6 +1558,8 @@ fn get_palette_commands() -> Vec<(&'static str, &'static str)> {
         ("Switch to Build mode", "build"),
         ("Toggle sidebar", "sidebar"),
         ("List sessions", "sessions"),
+        ("Session tree", "tree"),
+        ("Branch at message", "branch"),
         ("Help", "help"),
         ("Exit", "quit"),
     ]

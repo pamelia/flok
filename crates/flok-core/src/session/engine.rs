@@ -349,6 +349,174 @@ impl SessionEngine {
         Ok(text)
     }
 
+    /// Create a branch from the current session at the given message ID.
+    ///
+    /// Captures the current workspace snapshot, creates a new session with
+    /// messages copied up to the branch point, and generates a summary of
+    /// the abandoned tail.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the message doesn't exist or branch creation fails.
+    pub async fn branch_at_message(
+        &self,
+        from_message_id: &str,
+    ) -> anyhow::Result<super::branch::BranchResult> {
+        // Capture current snapshot for the branch point
+        let snapshot_hash = match self.state.snapshot.track().await {
+            Ok(hash) => hash,
+            Err(e) => {
+                tracing::warn!("branch snapshot failed: {e}");
+                None
+            }
+        };
+
+        super::branch::create_branch(&self.state, &self.session_id, from_message_id, snapshot_hash)
+            .await
+    }
+
+    /// List messages in the current session suitable for selecting a branch point.
+    ///
+    /// Returns a list of `(message_id, index, role, text_preview)` for each
+    /// user message in the session (only user messages are valid branch points).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn list_branch_points(&self) -> anyhow::Result<Vec<(String, usize, String)>> {
+        let rows = self.state.db.list_messages(&self.session_id)?;
+        let mut points = Vec::new();
+
+        for (i, row) in rows.iter().enumerate() {
+            // Only user messages are valid branch points
+            if row.role != "user" {
+                continue;
+            }
+            let parts: Vec<crate::provider::MessageContent> =
+                serde_json::from_str(&row.parts).unwrap_or_default();
+            let preview = parts
+                .iter()
+                .find_map(|p| match p {
+                    crate::provider::MessageContent::Text { text } => Some(text.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let preview =
+                if preview.len() > 80 { format!("{}...", &preview[..77]) } else { preview };
+            points.push((row.id.clone(), i + 1, preview));
+        }
+
+        Ok(points)
+    }
+
+    /// Build the session tree for display.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn session_tree(&self) -> anyhow::Result<Vec<super::tree::SessionTreeNode>> {
+        super::tree::build_session_tree(&self.state.db, &self.state.project_id, &self.session_id)
+    }
+
+    /// Build a formatted text representation of the session tree.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn session_tree_text(&self) -> anyhow::Result<String> {
+        use std::fmt::Write;
+        let tree = self.session_tree()?;
+        let flat = super::tree::flatten_tree(&tree);
+
+        if flat.is_empty() {
+            return Ok("No sessions found.".to_string());
+        }
+
+        let mut text = String::from("Session Tree\n\n");
+        for (depth, node) in &flat {
+            let indent = "  ".repeat(*depth);
+            let prefix = if *depth == 0 {
+                ""
+            } else {
+                "\u{251C}\u{2500} " // ├─
+            };
+            let marker = if node.is_current { "\u{25CF} " } else { "  " }; // ●
+            let title =
+                if node.session.title.is_empty() { "(untitled)" } else { &node.session.title };
+            let count = node.message_count;
+            let _ = write!(text, "{indent}{prefix}{marker}{title}  ({count} msgs)");
+            if let Some(label) = &node.label {
+                let _ = write!(text, "  [{label}]");
+            }
+            let _ = writeln!(text, "  [{:.8}]", node.session.id);
+        }
+
+        Ok(text)
+    }
+
+    /// Set or update a label on the current session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    pub fn set_label(&self, label: &str) -> anyhow::Result<()> {
+        self.state.db.upsert_session_label(&self.session_id, label)?;
+        Ok(())
+    }
+
+    /// Switch to a different session by ID.
+    ///
+    /// Restores the workspace to the target session's snapshot state and
+    /// returns the display messages for the target session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the session doesn't exist, snapshot restore fails,
+    /// or the session belongs to a different project.
+    pub async fn switch_session(
+        &mut self,
+        target_session_id: &str,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        let target = self.state.db.get_session(target_session_id)?;
+
+        // Safety: don't switch to a session from a different project
+        if target.project_id != self.state.project_id {
+            anyhow::bail!("Cannot switch to a session from a different project");
+        }
+
+        let old_session_id = self.session_id.clone();
+
+        // Restore snapshot if the target has one
+        if let Some(ref hash) = target.branch_snapshot_hash {
+            if let Err(e) = self.state.snapshot.restore(hash).await {
+                tracing::warn!(
+                    error = %e,
+                    snapshot = %hash,
+                    "snapshot restore failed during session switch"
+                );
+            } else {
+                self.state.bus.send(BusEvent::SnapshotRestored {
+                    session_id: target_session_id.to_string(),
+                    snapshot_hash: hash.clone(),
+                });
+            }
+        }
+
+        // Switch the engine to the new session
+        self.session_id = target_session_id.to_string();
+        self.model_id = target.model_id;
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+
+        self.state.bus.send(BusEvent::SessionSwitched {
+            from_session_id: old_session_id,
+            to_session_id: target_session_id.to_string(),
+        });
+
+        // Load display messages for the new session
+        self.load_display_messages()
+    }
+
     /// Undo the last user message: restore workspace files and remove
     /// the message (and its responses) from conversation history.
     ///

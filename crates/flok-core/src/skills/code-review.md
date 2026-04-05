@@ -2,6 +2,40 @@
 
 Reviews a GitHub PR using a parallel agent team. Spawns specialist reviewers that examine the diff, self-critique findings, and report back. Produces a structured review with findings organized by priority tier and a binary verdict.
 
+## The Five-Axis Review
+
+Every review evaluates code across these dimensions:
+
+1. **Correctness**: Does the code do what it claims? Edge cases, error paths, race conditions, off-by-one errors.
+2. **Readability**: Can another engineer understand this without the author explaining it? Names, control flow, organization.
+3. **Architecture**: Does the change fit the system's design? Patterns, module boundaries, dependency direction, abstraction level.
+4. **Security**: Does the change introduce vulnerabilities? Input validation, secrets, auth, injection, untrusted data.
+5. **Performance**: Does the change introduce bottlenecks? N+1 patterns, unbounded operations, missing pagination, unnecessary allocations.
+
+**The approval standard:** Approve a change when it definitely improves overall code health, even if it isn't perfect. Perfect code doesn't exist -- the goal is continuous improvement. Don't block a change because it isn't exactly how you would have written it.
+
+## Change Sizing
+
+Target these sizes for reviewable changes:
+
+```
+~100 lines changed   -> Good. Reviewable in one sitting.
+~300 lines changed   -> Acceptable if it's a single logical change.
+~1000 lines changed  -> Too large. Note this in the review.
+```
+
+## Finding Severity Labels
+
+Label every finding so the author knows what's required vs optional:
+
+| Prefix | Meaning | Author Action |
+|--------|---------|---------------|
+| **Critical** | Blocks merge | Security vulnerability, data loss, broken functionality. Must fix. |
+| **High** | Should fix | Missing test, wrong abstraction, poor error handling. Should fix before merge. |
+| **Medium** | Suggestion | Worth considering but not required. |
+| **Low / Nit** | Minor, optional | Formatting, style preferences. Author may ignore. |
+| **FYI** | Informational | No action needed -- context for future reference. |
+
 ## Workflow
 
 ### Phase 1: Fetch PR Data
@@ -55,7 +89,8 @@ After spawning all reviewers, the background agents will complete their reviews 
 1. Collect all findings from the reviewer messages
 2. Deduplicate similar findings (same file + same concern = duplicate)
 3. Sort by priority: Critical > High > Medium > Low
-4. Determine verdict:
+4. Check for dead code: identify any code made unreachable or unused by the change
+5. Determine verdict:
    - **REQUEST_CHANGES** if any critical or high-priority actionable findings exist
    - **APPROVE** otherwise
 
@@ -80,6 +115,9 @@ Output a structured report:
 ### Low Priority / Suggestions
 - ...
 
+### Dead Code
+- [List any code made unreachable or unused by this change]
+
 ### Summary
 <1-2 paragraph synthesis>
 ```
@@ -94,3 +132,36 @@ Output a structured report:
 - If a reviewer fails or times out, note it in the report but proceed with available results
 - The review should be actionable: every finding should suggest a specific fix
 - After the review is complete, disband the team with `team_delete`
+
+## Common Rationalizations
+
+| Rationalization | Reality |
+|---|---|
+| "It works, that's good enough" | Working code that's unreadable, insecure, or architecturally wrong creates debt that compounds. |
+| "The tests pass, so it's good" | Tests are necessary but not sufficient. They don't catch architecture problems, security issues, or readability concerns. |
+| "AI-generated code is probably fine" | AI code needs more scrutiny, not less. It's confident and plausible, even when wrong. |
+| "This is too big to review properly" | That's the problem. Ask the author to split it. Don't rubber-stamp a large change. |
+| "I'll note it and they can fix it later" | Deferred cleanup rarely happens. If it's important, require it before merge. |
+
+## Red Flags
+
+- PRs merged without any review
+- Review that only checks if tests pass (ignoring other axes)
+- "LGTM" without evidence of actual review
+- Security-sensitive changes without security-focused review
+- Large PRs that are "too big to review properly"
+- No regression tests with bug fix PRs
+- Review comments without severity labels
+- Accepting "I'll fix it later"
+- Formatting changes mixed with behavior changes in the same PR
+
+## Verification
+
+After review is complete:
+
+- [ ] All Critical issues are identified with specific file locations and suggested fixes
+- [ ] All findings have severity labels
+- [ ] Tests pass verification is included
+- [ ] Build success verification is included
+- [ ] Dead code from the change is identified
+- [ ] The verdict is binary (APPROVE or REQUEST_CHANGES) with clear justification

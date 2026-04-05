@@ -1,29 +1,33 @@
 # Spec Review Skill
 
-Orchestrates a parallel spec review using an agent team. Specialists each review the spec from their domain, self-critique findings, and report back. Produces a structured review with a binary approval verdict.
+Orchestrates a parallel spec review using an agent team. Specialists each review the spec from their domain, self-critique findings, and report back. Includes a cross-review phase where specialists challenge each other's findings. Produces a structured review with a binary approval verdict.
 
 ## Workflow
 
 ### Phase 1: Read the Spec
 
 1. Read the spec file (the user will provide the path or it will be in `docs/specs/`)
-2. Assess the spec's scope and complexity
-3. Select appropriate reviewer specialists
+2. Assess the spec's scope and complexity:
+   - How many systems/components does it touch?
+   - Does it define APIs or interfaces?
+   - Does it have user-facing impact?
+   - Does it have deployment/infra concerns?
+3. Identify the spec's core claims -- what it promises to deliver and how
 
 ### Phase 2: Select Reviewers
 
 Based on the spec content, select 3-5 specialists from:
 
-| Specialist | When to Include |
-|-----------|----------------|
-| feasibility-reviewer | Always -- checks technical feasibility |
-| complexity-reviewer | Always -- checks for over-engineering |
-| completeness-reviewer | Always -- checks for missing pieces |
-| api-reviewer | When the spec defines APIs or interfaces |
-| clarity-reviewer | When the spec has complex requirements |
-| scope-reviewer | When the spec is large or has delivery risk |
-| product-reviewer | When the spec has user-facing impact |
-| operations-reviewer | When the spec has deployment/infra concerns |
+| Specialist | When to Include | What They Check |
+|-----------|----------------|-----------------|
+| feasibility-reviewer | Always | Technical soundness, can this actually be built as described? |
+| complexity-reviewer | Always | Over-engineering, could this be simpler? |
+| completeness-reviewer | Always | Missing error handling, edge cases, migration paths |
+| api-reviewer | When the spec defines APIs or interfaces | API surface, breaking changes, naming consistency |
+| clarity-reviewer | When the spec has complex requirements | Ambiguity, contradictions, testable acceptance criteria |
+| scope-reviewer | When the spec is large or has delivery risk | Feature deferral, hidden complexity, timeline risk |
+| product-reviewer | When the spec has user-facing impact | User value, UX issues, root cause alignment |
+| operations-reviewer | When the spec has deployment/infra concerns | Deployment safety, observability, security |
 
 ### Phase 3: Parallel Review
 
@@ -31,26 +35,82 @@ Based on the spec content, select 3-5 specialists from:
 2. Spawn all selected reviewers in parallel with `task(background: true, team_id: ...)`
 3. Each reviewer's prompt should include the full spec content and instructions to:
    - Review from their specialist perspective
-   - Self-critique: remove speculative findings
+   - For each finding, state: the specific concern, where in the spec it appears, the impact, and a suggested resolution
+   - Self-critique: remove speculative findings that lack evidence from the spec
    - Send findings back to lead via `send_message`
 
-### Phase 4: Synthesize
+IMPORTANT: Spawn ALL reviewers in a single message. Do NOT spawn them one at a time.
 
-After all reviewers report back:
+### Phase 4: Cross-Review
+
+After all reviewers report back, check for conflicting findings:
+
+- If two specialists disagree (e.g., feasibility says "too simple" while complexity says "too complex"), note the tension and present both perspectives
+- If multiple specialists flag the same concern from different angles, elevate its priority
+- Remove duplicate findings (same section + same concern = duplicate)
+
+### Phase 5: Synthesize & Output
+
 1. Deduplicate overlapping findings
-2. Sort by priority
-3. Determine verdict: APPROVE or REQUEST_CHANGES
+2. Sort by priority: Critical > High > Medium > Low
+3. Determine verdict:
+   - **REQUEST_CHANGES** if any critical or high-priority findings exist that would cause implementation failure or user harm
+   - **APPROVE** otherwise (minor gaps can be addressed during implementation)
 
-### Phase 5: Output
+Output format:
 
 ```
 ## Spec Review: <spec name>
 
 **Verdict: APPROVE / REQUEST_CHANGES**
 
-### Findings by Priority
-...
+### Critical Findings
+- [Section] Description and suggested resolution
+
+### High Priority
+- [Section] Description and suggested resolution
+
+### Medium Priority
+- [Section] Description
+
+### Low Priority / Suggestions
+- [Section] Description
+
+### Cross-Review Tensions
+- [Specialist A vs B] Description of the disagreement and both perspectives
 
 ### Summary
-...
+<1-2 paragraph synthesis of the spec's readiness>
 ```
+
+After the review, disband the team with `team_delete`.
+
+## Common Rationalizations
+
+| Rationalization | Reality |
+|---|---|
+| "The spec is good enough to start coding" | A spec with critical gaps leads to rework. 30 minutes of review prevents days of wrong implementation. |
+| "We'll figure out the details during implementation" | That's what the spec is for. Missing details in the spec become bugs in the code. |
+| "This is just a spec, not code -- it doesn't need rigorous review" | The spec is the foundation. A flawed foundation produces flawed code. |
+| "The reviewers are being too theoretical" | Check if findings have concrete impact. If a finding can't describe a specific failure mode, it's too theoretical. |
+
+## Red Flags
+
+- Spec approved without any reviewers examining it
+- Only one specialist perspective used (missing dimensions of review)
+- Findings without suggested resolutions (identifying problems without solutions is incomplete)
+- Critical findings hand-waved as "we'll handle it later"
+- Spec has no success criteria or acceptance tests
+- Spec describes a solution without stating the problem it solves
+- Cross-review tensions ignored rather than surfaced
+
+## Verification
+
+Before approving a spec:
+
+- [ ] At least 3 specialist perspectives examined the spec
+- [ ] All critical findings have specific suggested resolutions
+- [ ] Success criteria are concrete and testable
+- [ ] Cross-review tensions are surfaced and documented
+- [ ] The spec describes both what will be built AND what won't (scope boundaries)
+- [ ] The verdict is justified with reference to specific findings

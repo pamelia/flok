@@ -713,6 +713,7 @@ dependencies = [
  "dashmap",
  "directories",
  "flok-apply",
+ "flok-core",
  "flok-db",
  "futures",
  "glob",

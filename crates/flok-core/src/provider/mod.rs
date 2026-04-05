@@ -5,6 +5,7 @@
 //! `StreamEvent`s.
 
 mod anthropic;
+pub mod mock;
 mod models;
 mod openai;
 mod types;

@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 use super::models::ModelRegistry;
 use super::types::{CompletionRequest, MessageContent, Provider, StreamEvent};
 
-const DEFAULT_BASE_URL: &str = "https://api.minimax.io";
+const DEFAULT_BASE_URL: &str = "https://api.minimax.io/anthropic";
 
 /// `MiniMax` provider using the Anthropic-compatible API.
 pub struct MiniMaxProvider {
@@ -216,6 +216,7 @@ fn parse_sse_event(event_type: &str, data: &str) -> StreamEvent {
                     Delta::InputJsonDelta { partial_json } => {
                         StreamEvent::ToolCallDelta { index: ev.index, delta: partial_json }
                     }
+                    Delta::SignatureDelta { .. } => StreamEvent::TextDelta(String::new()),
                 }
             } else {
                 StreamEvent::Error(format!("failed to parse content_block_delta: {data}"))
@@ -370,6 +371,9 @@ enum Delta {
     ThinkingDelta { thinking: String },
     #[serde(rename = "input_json_delta")]
     InputJsonDelta { partial_json: String },
+    #[serde(rename = "signature_delta")]
+    #[allow(dead_code)]
+    SignatureDelta { signature: String },
 }
 
 #[derive(Deserialize)]

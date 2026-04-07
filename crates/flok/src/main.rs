@@ -13,15 +13,8 @@ use tracing_subscriber::{fmt, EnvFilter};
 
 use flok_core::bus::Bus;
 use flok_core::config;
-<<<<<<< New base: feat(auth): add flok auth login [--provider] CLI command
-use flok_core::lsp::LspManager;
-use flok_core::provider::AnthropicProvider;
-||||||| Common ancestor
-use flok_core::provider::AnthropicProvider;
-=======
 use flok_core::lsp::LspManager;
 use flok_core::provider::{AnthropicProvider, MiniMaxProvider};
->>>>>>> Current commit: feat(auth): add flok auth login [--provider] CLI command
 use flok_core::session::{AppState, SessionEngine};
 use flok_core::snapshot::SnapshotManager;
 use flok_core::team::TeamRegistry;
@@ -137,7 +130,6 @@ async fn run(args: cli::Args) -> Result<()> {
     // Shared state for interactive tools
     let todo_list = TodoList::new();
     let (question_tx, question_rx) = mpsc::unbounded_channel();
-    let lsp = Arc::new(LspManager::new(project_root.clone(), config.lsp.clone()));
 
     // LSP manager for rust-analyzer integration
     let lsp = Arc::new(LspManager::new(project_root.clone(), config.lsp.clone()));
@@ -293,12 +285,7 @@ async fn run(args: cli::Args) -> Result<()> {
         project_root,
         project_id,
         snapshot,
-<<<<<<< New base: feat(auth): add flok auth login [--provider] CLI command
         Arc::clone(&lsp),
-||||||| Common ancestor
-=======
-        lsp,
->>>>>>> Current commit: feat(auth): add flok auth login [--provider] CLI command
     );
 
     run_interactive(
@@ -310,7 +297,7 @@ async fn run(args: cli::Args) -> Result<()> {
         question_rx,
         todo_list,
         plan_mode,
-        lsp,
+        Arc::clone(&lsp),
     )
     .await
 }

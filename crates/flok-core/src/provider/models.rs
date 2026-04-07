@@ -166,6 +166,18 @@ impl ModelRegistry {
                 supports_tools: true,
                 supports_streaming: true,
             },
+            // MiniMax (Token Plan — subscription-based, per-request not per-token)
+            ModelInfo {
+                id: "minimax/MiniMax-M2.7",
+                provider: "minimax",
+                display_name: "MiniMax M2.7",
+                context_window: 200_000,
+                max_output_tokens: 128_000,
+                input_cost_per_m: 0.0,
+                output_cost_per_m: 0.0,
+                supports_tools: true,
+                supports_streaming: true,
+            },
         ];
 
         let map = models.into_iter().map(|m| (m.id, m)).collect();
@@ -231,6 +243,7 @@ impl ModelRegistry {
             "pro" | "gemini-pro" | "gemini-2.5-pro" => "google/gemini-2.5-pro",
             "deepseek" | "deepseek-v3" | "deepseek-chat" => "deepseek/deepseek-chat",
             "r1" | "deepseek-r1" | "deepseek-reasoner" => "deepseek/deepseek-reasoner",
+            "minimax" | "minimax-m2.7" | "m2.7" => "minimax/MiniMax-M2.7",
             _ => input,
         };
 

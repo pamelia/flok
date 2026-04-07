@@ -5,12 +5,14 @@
 //! `StreamEvent`s.
 
 mod anthropic;
+mod minimax;
 pub mod mock;
 mod models;
 mod openai;
 mod types;
 
 pub use anthropic::AnthropicProvider;
+pub use minimax::MiniMaxProvider;
 pub use models::{ModelInfo, ModelRegistry};
 pub use openai::OpenAiProvider;
 pub use types::{

@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 pub struct FlokConfig {
     /// Provider configurations keyed by provider name.
     pub provider: std::collections::HashMap<String, ProviderConfig>,
+    pub lsp: LspConfig,
     /// Git worktree isolation settings.
     pub worktree: WorktreeConfig,
     /// Permission rules keyed by permission type.
@@ -40,6 +41,33 @@ pub struct FlokConfig {
     /// "*" = "ask"
     /// ```
     pub permission: std::collections::HashMap<String, PermissionToolConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LspConfig {
+    pub enabled: bool,
+    pub request_timeout_ms: u64,
+    pub rust: RustLspConfig,
+}
+
+impl Default for LspConfig {
+    fn default() -> Self {
+        Self { enabled: true, request_timeout_ms: 5_000, rust: RustLspConfig::default() }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RustLspConfig {
+    pub command: String,
+    pub args: Vec<String>,
+}
+
+impl Default for RustLspConfig {
+    fn default() -> Self {
+        Self { command: "rust-analyzer".to_string(), args: Vec::new() }
+    }
 }
 
 /// Permission configuration for a single tool/permission type.
@@ -178,6 +206,7 @@ fn merge_config(target: &mut FlokConfig, source: &FlokConfig) {
     for (key, value) in &source.provider {
         target.provider.insert(key.clone(), value.clone());
     }
+    target.lsp = source.lsp.clone();
     // Worktree config: source overrides target entirely if present in source file
     // (serde default handles missing fields; if explicitly set in source, override)
     target.worktree = source.worktree.clone();
@@ -216,6 +245,27 @@ mod tests {
     fn default_config_is_valid() {
         let config = FlokConfig::default();
         assert!(config.provider.is_empty());
+        assert!(config.lsp.enabled);
+        assert_eq!(config.lsp.rust.command, "rust-analyzer");
+    }
+
+    #[test]
+    fn parse_lsp_config() {
+        let toml_str = r#"
+            [lsp]
+            enabled = true
+            request_timeout_ms = 1200
+
+            [lsp.rust]
+            command = "custom-ra"
+            args = ["--stdio"]
+        "#;
+
+        let config: FlokConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.lsp.enabled);
+        assert_eq!(config.lsp.request_timeout_ms, 1200);
+        assert_eq!(config.lsp.rust.command, "custom-ra");
+        assert_eq!(config.lsp.rust.args, vec!["--stdio"]);
     }
 
     #[test]
@@ -258,6 +308,7 @@ mod tests {
             )]
             .into_iter()
             .collect(),
+            lsp: LspConfig::default(),
             worktree: WorktreeConfig::default(),
             permission: std::collections::HashMap::new(),
         };

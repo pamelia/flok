@@ -12,6 +12,7 @@ use tempfile::TempDir;
 
 use crate::bus::Bus;
 use crate::config::FlokConfig;
+use crate::lsp::LspManager;
 use crate::provider::mock::{MockProvider, MockTurn};
 use crate::session::{AppState, PlanMode, SessionEngine};
 use crate::snapshot::SnapshotManager;
@@ -88,6 +89,7 @@ impl TestHarness {
         let cost_tracker = CostTracker::new("test-model");
         let plan_mode = PlanMode::new();
         let snapshot = Arc::new(SnapshotManager::new("test-session", canonical_root.clone()));
+        let lsp = Arc::new(LspManager::disabled(canonical_root.clone()));
 
         let state = AppState::new(
             db,
@@ -101,6 +103,7 @@ impl TestHarness {
             canonical_root,
             project_id.to_string(),
             snapshot,
+            lsp,
         );
         let engine = SessionEngine::new(state, "mock/test-model".to_string())
             .expect("failed to create engine");

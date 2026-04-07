@@ -13,6 +13,7 @@ use tracing_subscriber::{fmt, EnvFilter};
 
 use flok_core::bus::Bus;
 use flok_core::config;
+use flok_core::lsp::LspManager;
 use flok_core::provider::AnthropicProvider;
 use flok_core::session::{AppState, SessionEngine};
 use flok_core::snapshot::SnapshotManager;
@@ -128,6 +129,9 @@ async fn run(args: cli::Args) -> Result<()> {
     let todo_list = TodoList::new();
     let (question_tx, question_rx) = mpsc::unbounded_channel();
 
+    // LSP manager for rust-analyzer integration
+    let lsp = Arc::new(LspManager::new(project_root.clone(), config.lsp.clone()));
+
     // Register tools
     let mut tools = ToolRegistry::new();
     tools.register(Arc::new(ReadTool));
@@ -213,6 +217,7 @@ async fn run(args: cli::Args) -> Result<()> {
             project_root,
             project_id,
             snapshot,
+            Arc::clone(&lsp),
         );
         return run_non_interactive(state, model_id, &prompt).await;
     }
@@ -271,10 +276,21 @@ async fn run(args: cli::Args) -> Result<()> {
         project_root,
         project_id,
         snapshot,
+        Arc::clone(&lsp),
     );
 
-    run_interactive(state, model_id, bus, args.session, perm_rx, question_rx, todo_list, plan_mode)
-        .await
+    run_interactive(
+        state,
+        model_id,
+        bus,
+        args.session,
+        perm_rx,
+        question_rx,
+        todo_list,
+        plan_mode,
+        lsp,
+    )
+    .await
 }
 
 /// Run in non-interactive mode: send a single prompt and print the response.
@@ -310,6 +326,7 @@ async fn run_interactive(
     question_rx: mpsc::UnboundedReceiver<flok_core::tool::QuestionRequest>,
     todo_list: flok_core::tool::TodoList,
     plan_mode: flok_core::session::PlanMode,
+    _lsp: Arc<LspManager>,
 ) -> Result<()> {
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<flok_tui::UiCommand>();
     let (ui_tx, ui_rx) = mpsc::unbounded_channel::<flok_tui::UiEvent>();

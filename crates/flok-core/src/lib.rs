@@ -10,6 +10,7 @@ pub mod agent;
 pub mod bus;
 pub mod compress;
 pub mod config;
+pub mod lsp;
 pub mod permission;
 pub mod provider;
 pub mod review;

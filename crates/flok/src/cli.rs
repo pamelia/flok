@@ -53,6 +53,22 @@ pub(crate) enum Command {
 
     /// Show version and build info.
     Version,
+
+    /// Manage authentication for LLM providers.
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum AuthCommand {
+    /// Login to a provider — save an API key to your config file.
+    Login {
+        /// Provider to authenticate with. If omitted, you'll be prompted to choose.
+        #[arg(long)]
+        provider: Option<String>,
+    },
 }
 
 impl Args {

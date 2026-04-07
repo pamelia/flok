@@ -12,6 +12,7 @@ use tempfile::TempDir;
 
 use crate::bus::Bus;
 use crate::config::FlokConfig;
+use crate::lsp::LspManager;
 use crate::provider::mock::{MockProvider, MockTurn};
 use crate::session::{AppState, PlanMode, SessionEngine};
 use crate::snapshot::SnapshotManager;

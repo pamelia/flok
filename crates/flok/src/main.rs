@@ -13,15 +13,23 @@ use tracing_subscriber::{fmt, EnvFilter};
 
 use flok_core::bus::Bus;
 use flok_core::config;
+<<<<<<< New base: feat(auth): add flok auth login [--provider] CLI command
 use flok_core::lsp::LspManager;
 use flok_core::provider::AnthropicProvider;
+||||||| Common ancestor
+use flok_core::provider::AnthropicProvider;
+=======
+use flok_core::lsp::LspManager;
+use flok_core::provider::{AnthropicProvider, MiniMaxProvider};
+>>>>>>> Current commit: feat(auth): add flok auth login [--provider] CLI command
 use flok_core::session::{AppState, SessionEngine};
 use flok_core::snapshot::SnapshotManager;
 use flok_core::team::TeamRegistry;
 use flok_core::tool::{
     AgentMemoryTool, BashTool, CodeReviewTool, EditTool, FastApplyTool, GlobTool, GrepTool,
-    PlanTool, QuestionTool, ReadTool, SendMessageTool, SkillTool, TaskTool, TeamCreateTool,
-    TeamDeleteTool, TeamTaskTool, TodoList, TodoWriteTool, ToolRegistry, WebfetchTool, WriteTool,
+    LspDiagnosticsTool, LspFindReferencesTool, LspGotoDefinitionTool, LspSymbolsTool, PlanTool,
+    QuestionTool, ReadTool, SendMessageTool, SkillTool, TaskTool, TeamCreateTool, TeamDeleteTool,
+    TeamTaskTool, TodoList, TodoWriteTool, ToolRegistry, WebfetchTool, WriteTool,
 };
 use flok_core::worktree::WorktreeManager;
 use tokio::sync::mpsc;
@@ -73,6 +81,7 @@ async fn run(args: cli::Args) -> Result<()> {
             cli::Command::Models => return run_models(),
             cli::Command::Version => return run_version(),
             cli::Command::Sessions { .. } => {} // Needs DB — fall through
+            cli::Command::Auth { .. } => return run_auth(cmd),
         }
     }
 
@@ -128,6 +137,7 @@ async fn run(args: cli::Args) -> Result<()> {
     // Shared state for interactive tools
     let todo_list = TodoList::new();
     let (question_tx, question_rx) = mpsc::unbounded_channel();
+    let lsp = Arc::new(LspManager::new(project_root.clone(), config.lsp.clone()));
 
     // LSP manager for rust-analyzer integration
     let lsp = Arc::new(LspManager::new(project_root.clone(), config.lsp.clone()));
@@ -185,6 +195,13 @@ async fn run(args: cli::Args) -> Result<()> {
         config.worktree.clone(),
         team_registry,
     )));
+
+    if lsp.tools_enabled() {
+        tools.register(Arc::new(LspDiagnosticsTool::new(Arc::clone(&lsp))));
+        tools.register(Arc::new(LspGotoDefinitionTool::new(Arc::clone(&lsp))));
+        tools.register(Arc::new(LspFindReferencesTool::new(Arc::clone(&lsp))));
+        tools.register(Arc::new(LspSymbolsTool::new(Arc::clone(&lsp))));
+    }
 
     tracing::info!(
         tools = ?tools.names(),
@@ -276,7 +293,12 @@ async fn run(args: cli::Args) -> Result<()> {
         project_root,
         project_id,
         snapshot,
+<<<<<<< New base: feat(auth): add flok auth login [--provider] CLI command
         Arc::clone(&lsp),
+||||||| Common ancestor
+=======
+        lsp,
+>>>>>>> Current commit: feat(auth): add flok auth login [--provider] CLI command
     );
 
     run_interactive(
@@ -605,12 +627,16 @@ fn create_provider(
                 .or_else(|| Some("https://api.deepseek.com/v1".to_string()));
             Ok(Arc::new(flok_core::provider::OpenAiProvider::new(api_key, base_url)))
         }
+        "minimax" => {
+            let api_key = resolve_api_key("MINIMAX_API_KEY", "minimax", config)?;
+            Ok(Arc::new(MiniMaxProvider::new(api_key, None)))
+        }
         "google" => Err(anyhow::anyhow!(
             "Google Gemini provider not yet implemented. Use Anthropic or OpenAI."
         )),
         _ => Err(anyhow::anyhow!(
             "Unknown provider '{provider_name}' for model '{model_id}'. \
-             Supported providers: anthropic, openai, deepseek"
+             Supported providers: anthropic, openai, deepseek, minimax"
         )),
     }
 }
@@ -688,7 +714,87 @@ fn run_version() -> Result<()> {
     Ok(())
 }
 
-/// List past sessions.
+/// Provider metadata for auth login.
+struct ProviderMeta {
+    name: &'static str,
+    display_name: &'static str,
+}
+
+const AUTH_PROVIDERS: &[ProviderMeta] = &[
+    ProviderMeta { name: "anthropic", display_name: "Anthropic (Claude)" },
+    ProviderMeta { name: "openai", display_name: "OpenAI (GPT-4.1)" },
+    ProviderMeta { name: "deepseek", display_name: "DeepSeek (V3 / R1)" },
+    ProviderMeta { name: "minimax", display_name: "MiniMax (M2.7)" },
+];
+
+/// Run the auth subcommand.
+fn run_auth(cmd: &cli::Command) -> Result<()> {
+    match cmd {
+        cli::Command::Auth { command: cli::AuthCommand::Login { provider } } => {
+            run_auth_login(provider.as_ref())
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// Interactive auth login.
+fn run_auth_login(provider_arg: Option<&String>) -> Result<()> {
+    let provider_meta = if let Some(name) = provider_arg {
+        AUTH_PROVIDERS.iter().find(|p| p.name == name).with_context(|| {
+            format!("unknown provider '{name}' — valid: anthropic, openai, deepseek, minimax")
+        })?
+    } else {
+        let items: Vec<&str> = AUTH_PROVIDERS.iter().map(|p| p.display_name).collect();
+        let sel = dialoguer::Select::new()
+            .with_prompt("Select a provider")
+            .items(&items)
+            .default(0)
+            .interact()?;
+        &AUTH_PROVIDERS[sel]
+    };
+
+    let api_key = dialoguer::Password::new()
+        .with_prompt(format!("Enter your {} API key", provider_meta.display_name))
+        .allow_empty_password(false)
+        .interact()?;
+    let api_key = api_key.trim().to_string();
+
+    if api_key.is_empty() {
+        anyhow::bail!("API key cannot be empty");
+    }
+
+    let config_path = {
+        let dirs = directories::BaseDirs::new().context("cannot determine home directory")?;
+        dirs.config_dir().join("flok").join("flok.toml")
+    };
+
+    let mut config: flok_core::config::FlokConfig = if config_path.exists() {
+        let content = std::fs::read_to_string(&config_path)?;
+        toml::from_str(&content).unwrap_or_default()
+    } else {
+        flok_core::config::FlokConfig::default()
+    };
+
+    config.provider.insert(
+        provider_meta.name.to_string(),
+        flok_core::config::ProviderConfig { api_key: Some(api_key), base_url: None },
+    );
+
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let content = toml::to_string_pretty(&config)?;
+    std::fs::write(&config_path, content)?;
+
+    #[allow(clippy::print_stdout)]
+    {
+        println!("✓ Saved {} API key to {}", provider_meta.display_name, config_path.display());
+    }
+
+    Ok(())
+}
+
 fn run_sessions(db: &flok_db::Db, _project_filter: Option<&str>, limit: usize) -> Result<()> {
     // List all projects first, then sessions for each
     // For simplicity, get sessions for the current project

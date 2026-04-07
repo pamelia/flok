@@ -80,6 +80,7 @@ blake3 = "1"
 lru = "0.12"
 jsonschema = "0.28"
 tokio-stream = "0.1"
+url = "2"
 
 # Tree-sitter (for bash command parsing in permission system)
 tree-sitter = "0.25"

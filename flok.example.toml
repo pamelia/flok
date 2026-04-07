@@ -15,3 +15,7 @@
 [provider.deepseek]
 # api_key = "sk-..."       # Or set DEEPSEEK_API_KEY env var
 # base_url = "https://api.deepseek.com/v1"
+
+# MiniMax provider configuration (uses Anthropic-compatible API)
+[provider.minimax]
+# api_key = "..."          # Or set MINIMAX_API_KEY env var

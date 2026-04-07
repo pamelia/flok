@@ -900,6 +900,10 @@ impl SessionEngine {
                             "read"
                                 | "glob"
                                 | "grep"
+                                | "lsp_diagnostics"
+                                | "lsp_goto_definition"
+                                | "lsp_find_references"
+                                | "lsp_symbols"
                                 | "webfetch"
                                 | "question"
                                 | "todowrite"
@@ -1679,68 +1683,39 @@ impl SessionEngine {
             approved.push((i, Arc::clone(tool), args));
         }
 
-        // Phase 2: Execute approved calls — safe concurrently, non-safe sequentially.
         let mut safe_batch: Vec<(usize, Arc<dyn crate::tool::Tool>, serde_json::Value)> =
-            Vec::new();
-        let mut non_safe_batch: Vec<(usize, Arc<dyn crate::tool::Tool>, serde_json::Value)> =
             Vec::new();
 
         for (i, tool, args) in approved {
             if tool.permission_level() == crate::tool::PermissionLevel::Safe {
                 safe_batch.push((i, tool, args));
-            } else {
-                non_safe_batch.push((i, tool, args));
+                continue;
             }
-        }
 
-        // Phase 2a: Safe tools concurrently
-        if !safe_batch.is_empty() && !self.cancel_token.is_cancelled() {
-            let futs: Vec<_> = safe_batch
-                .into_iter()
-                .map(|(i, tool, args)| {
-                    let tc = &tool_calls[i];
-                    let ctx = ctx.clone();
-                    let session_id = self.session_id.clone();
-                    let bus = self.state.bus.clone();
-                    let tc_name = tc.name.clone();
-                    let tc_id = tc.id.clone();
+            execute_safe_batch(
+                &mut safe_batch,
+                tool_calls,
+                &ctx,
+                &self.session_id,
+                &self.state.bus,
+                &mut pre_results,
+                self.cancel_token.is_cancelled(),
+            )
+            .await;
 
-                    async move {
-                        bus.send(BusEvent::ToolCallStarted {
-                            session_id: session_id.clone(),
-                            tool_name: tc_name.clone(),
-                            tool_call_id: tc_id.clone(),
-                        });
-
-                        let result =
-                            execute_single_tool(&*tool, args, &ctx, &tc_id, &tc_name).await;
-
-                        bus.send(BusEvent::ToolCallCompleted {
-                            session_id,
-                            tool_name: tc_name,
-                            tool_call_id: tc_id,
-                            is_error: result.is_error,
-                        });
-
-                        (i, result)
-                    }
-                })
-                .collect();
-
-            let concurrent_results = futures::future::join_all(futs).await;
-            for (i, result) in concurrent_results {
-                pre_results[i] = Some(truncate_result(result));
-            }
-        }
-
-        // Phase 2b: Non-safe tools sequentially
-        for (i, tool, args) in non_safe_batch {
             if self.cancel_token.is_cancelled() {
                 pre_results[i] = Some(ToolResult {
                     tool_call_id: tool_calls[i].id.clone(),
                     content: "Cancelled by user.".into(),
                     is_error: true,
                 });
+                for (j, _, _) in safe_batch.drain(..) {
+                    pre_results[j] = Some(ToolResult {
+                        tool_call_id: tool_calls[j].id.clone(),
+                        content: "Cancelled by user.".into(),
+                        is_error: true,
+                    });
+                }
                 continue;
             }
 
@@ -1763,6 +1738,17 @@ impl SessionEngine {
             pre_results[i] = Some(truncate_result(result));
         }
 
+        execute_safe_batch(
+            &mut safe_batch,
+            tool_calls,
+            &ctx,
+            &self.session_id,
+            &self.state.bus,
+            &mut pre_results,
+            self.cancel_token.is_cancelled(),
+        )
+        .await;
+
         pre_results
             .into_iter()
             .enumerate()
@@ -1774,6 +1760,68 @@ impl SessionEngine {
                 })
             })
             .collect()
+    }
+}
+
+async fn execute_safe_batch(
+    safe_batch: &mut Vec<(usize, Arc<dyn crate::tool::Tool>, serde_json::Value)>,
+    tool_calls: &[ToolCall],
+    ctx: &crate::tool::ToolContext,
+    session_id: &str,
+    bus: &crate::bus::Bus,
+    pre_results: &mut [Option<ToolResult>],
+    cancelled: bool,
+) {
+    if safe_batch.is_empty() {
+        return;
+    }
+
+    if cancelled {
+        for (i, _, _) in safe_batch.drain(..) {
+            pre_results[i] = Some(ToolResult {
+                tool_call_id: tool_calls[i].id.clone(),
+                content: "Cancelled by user.".into(),
+                is_error: true,
+            });
+        }
+        return;
+    }
+
+    let batch = std::mem::take(safe_batch);
+    let futs: Vec<_> = batch
+        .into_iter()
+        .map(|(i, tool, args)| {
+            let tc = &tool_calls[i];
+            let ctx = ctx.clone();
+            let session_id = session_id.to_string();
+            let bus = bus.clone();
+            let tc_name = tc.name.clone();
+            let tc_id = tc.id.clone();
+
+            async move {
+                bus.send(BusEvent::ToolCallStarted {
+                    session_id: session_id.clone(),
+                    tool_name: tc_name.clone(),
+                    tool_call_id: tc_id.clone(),
+                });
+
+                let result = execute_single_tool(&*tool, args, &ctx, &tc_id, &tc_name).await;
+
+                bus.send(BusEvent::ToolCallCompleted {
+                    session_id,
+                    tool_name: tc_name,
+                    tool_call_id: tc_id,
+                    is_error: result.is_error,
+                });
+
+                (i, result)
+            }
+        })
+        .collect();
+
+    let concurrent_results = futures::future::join_all(futs).await;
+    for (i, result) in concurrent_results {
+        pre_results[i] = Some(truncate_result(result));
     }
 }
 
@@ -1914,6 +1962,90 @@ fn extract_retry_after(error_msg: &str) -> Option<u64> {
 mod tests {
     use super::*;
 
+    use std::sync::Arc;
+
+    use flok_db::Db;
+    use tempfile::TempDir;
+
+    use crate::bus::Bus;
+    use crate::config::FlokConfig;
+    use crate::lsp::LspManager;
+    use crate::provider::mock::{MockProvider, MockToolCall, MockTurn};
+    use crate::session::PlanMode;
+    use crate::snapshot::SnapshotManager;
+    use crate::token::CostTracker;
+    use crate::tool::{
+        PermissionLevel, PermissionManager, Tool, ToolContext, ToolOutput, ToolRegistry,
+    };
+
+    struct RecordingTool {
+        name: &'static str,
+        permission: PermissionLevel,
+        log: Arc<tokio::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for RecordingTool {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn description(&self) -> &'static str {
+            self.name
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {},
+            })
+        }
+
+        fn permission_level(&self) -> PermissionLevel {
+            self.permission
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> anyhow::Result<ToolOutput> {
+            self.log.lock().await.push(self.name.to_string());
+            Ok(ToolOutput::success(self.name))
+        }
+    }
+
+    fn test_engine_with_tools(
+        temp_dir: &TempDir,
+        provider: Arc<MockProvider>,
+        tools: ToolRegistry,
+    ) -> SessionEngine {
+        let project_root = std::fs::canonicalize(temp_dir.path()).expect("canonical project root");
+        let db = Db::open_in_memory().expect("in-memory db");
+        let project_id = "test-project";
+        db.get_or_create_project(project_id, project_root.to_str().expect("project root utf8"))
+            .expect("create project");
+
+        let snapshot = Arc::new(SnapshotManager::new("test-session", project_root.clone()));
+        let lsp = Arc::new(LspManager::disabled(project_root.clone()));
+        let state = AppState::new(
+            db,
+            FlokConfig::default(),
+            provider as Arc<dyn crate::provider::Provider>,
+            tools,
+            Bus::new(16),
+            PermissionManager::auto_approve(),
+            CostTracker::new("test-model"),
+            PlanMode::new(),
+            project_root,
+            project_id.to_string(),
+            snapshot,
+            lsp,
+        );
+
+        SessionEngine::new(state, "mock/test-model".to_string()).expect("create session engine")
+    }
+
     #[test]
     fn extract_retry_after_from_anthropic_error() {
         let msg = r#"HTTP 429: {"type":"error","error":{"type":"rate_limit_error","message":"Rate limited"},"retry_after": 15}"#;
@@ -1929,5 +2061,36 @@ mod tests {
     fn extract_retry_after_capped() {
         let msg = r#""retry_after": 300"#;
         assert_eq!(extract_retry_after(msg), Some(60)); // Capped
+    }
+
+    #[tokio::test]
+    async fn execute_tool_calls_preserves_write_before_following_safe_tools() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let log = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(MockProvider::new());
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(RecordingTool {
+            name: "write_like",
+            permission: PermissionLevel::Write,
+            log: Arc::clone(&log),
+        }));
+        tools.register(Arc::new(RecordingTool {
+            name: "safe_like",
+            permission: PermissionLevel::Safe,
+            log: Arc::clone(&log),
+        }));
+
+        provider.push_turn(MockTurn::ToolCalls(vec![
+            MockToolCall { name: "write_like".into(), arguments: serde_json::json!({}) },
+            MockToolCall { name: "safe_like".into(), arguments: serde_json::json!({}) },
+        ]));
+        provider.push_turn(MockTurn::Text("done".into()));
+
+        let mut engine = test_engine_with_tools(&temp_dir, Arc::clone(&provider), tools);
+        let result = engine.send_message("run tools").await.expect("send message succeeds");
+
+        assert!(matches!(result, SendMessageResult::Complete(ref text) if text == "done"));
+        assert_eq!(log.lock().await.as_slice(), ["write_like", "safe_like"]);
     }
 }

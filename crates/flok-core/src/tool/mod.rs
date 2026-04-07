@@ -9,6 +9,7 @@ mod edit;
 mod fast_apply;
 mod glob_tool;
 mod grep;
+mod lsp;
 mod memory;
 mod plan;
 mod question;
@@ -27,6 +28,7 @@ pub use edit::EditTool;
 pub use fast_apply::FastApplyTool;
 pub use glob_tool::GlobTool;
 pub use grep::GrepTool;
+pub use lsp::{LspDiagnosticsTool, LspFindReferencesTool, LspGotoDefinitionTool, LspSymbolsTool};
 pub use memory::AgentMemoryTool;
 pub use plan::PlanTool;
 pub use question::{QuestionRequest, QuestionTool};
@@ -45,6 +47,7 @@ use std::sync::Mutex;
 
 use tokio::sync::{mpsc, oneshot};
 
+use crate::lsp::LspManager;
 use crate::permission::arity;
 use crate::permission::rule::{PermissionAction, PermissionRule};
 use crate::permission::{defaults, evaluate};
@@ -290,6 +293,7 @@ pub struct ToolContext {
     pub agent: String,
     /// Cancellation token — tools should check this periodically for long ops.
     pub cancel: tokio_util::sync::CancellationToken,
+    pub lsp: Option<std::sync::Arc<LspManager>>,
 }
 
 impl ToolContext {
@@ -306,6 +310,7 @@ impl ToolContext {
             session_id: "test-session".into(),
             agent: "test-agent".into(),
             cancel: tokio_util::sync::CancellationToken::new(),
+            lsp: None,
         }
     }
 }

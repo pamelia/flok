@@ -441,6 +441,7 @@ impl TaskTool {
             session_id: format!("{parent_session_id}:sub:{description}"),
             agent: "subagent".into(),
             cancel: tokio_util::sync::CancellationToken::new(),
+            lsp: None,
         };
 
         for step in 0..MAX_SUBAGENT_STEPS {
@@ -654,6 +655,7 @@ async fn run_subagent_standalone(
         session_id: format!("{parent_session_id}:bg:{description}"),
         agent: "background".into(),
         cancel: tokio_util::sync::CancellationToken::new(),
+        lsp: None,
     };
 
     for step in 0..MAX_SUBAGENT_STEPS {

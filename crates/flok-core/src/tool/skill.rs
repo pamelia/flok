@@ -171,12 +171,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn test_ctx() -> ToolContext {
-        ToolContext {
-            project_root: PathBuf::from("/nonexistent"),
-            session_id: "test".into(),
-            agent: "test".into(),
-            cancel: tokio_util::sync::CancellationToken::new(),
-        }
+        ToolContext::test(PathBuf::from("/nonexistent"))
     }
 
     #[tokio::test]

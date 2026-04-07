@@ -72,6 +72,12 @@ impl Tool for ReadTool {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to read {}: {}", full_path.display(), e))?;
 
+        if let Some(lsp) = &ctx.lsp {
+            if let Err(error) = lsp.track_read(&full_path, content.clone()).await {
+                tracing::debug!(path = %full_path.display(), %error, "failed to sync read with lsp");
+            }
+        }
+
         let lines: Vec<&str> = content.lines().collect();
         let total = lines.len();
         let start = (offset - 1).min(total);
@@ -102,10 +108,10 @@ impl Tool for ReadTool {
 /// Resolve a file path relative to the project root.
 fn resolve_path(project_root: &std::path::Path, file_path: &str) -> std::path::PathBuf {
     let path = std::path::Path::new(file_path);
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        project_root.join(path)
+    let resolved = if path.is_absolute() { path.to_path_buf() } else { project_root.join(path) };
+    match std::fs::canonicalize(&resolved) {
+        Ok(canonical) if canonical.starts_with(project_root) => canonical,
+        _ => resolved,
     }
 }
 
@@ -115,14 +121,14 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn resolve_path_absolute() {
+    fn resolve_path_blocks_traversal() {
         let root = PathBuf::from("/project");
-        let resolved = resolve_path(&root, "/etc/passwd");
-        assert_eq!(resolved, PathBuf::from("/etc/passwd"));
+        let resolved = resolve_path(&root, "/project/../../../etc/passwd");
+        assert_eq!(resolved, PathBuf::from("/project/../../../etc/passwd"));
     }
 
     #[test]
-    fn resolve_path_relative() {
+    fn resolve_path_allows_inside_root() {
         let root = PathBuf::from("/project");
         let resolved = resolve_path(&root, "src/main.rs");
         assert_eq!(resolved, PathBuf::from("/project/src/main.rs"));

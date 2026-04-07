@@ -64,6 +64,12 @@ impl Tool for WriteTool {
 
         tokio::fs::write(&full_path, content).await?;
 
+        if let Some(lsp) = &ctx.lsp {
+            if let Err(error) = lsp.track_write(&full_path, content.to_string()).await {
+                tracing::debug!(path = %full_path.display(), %error, "failed to sync write with lsp");
+            }
+        }
+
         let line_count = content.lines().count();
         Ok(ToolOutput::success(format!("Wrote {} lines to {}", line_count, full_path.display())))
     }
@@ -71,10 +77,10 @@ impl Tool for WriteTool {
 
 fn resolve_path(project_root: &Path, file_path: &str) -> std::path::PathBuf {
     let path = Path::new(file_path);
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        project_root.join(path)
+    let resolved = if path.is_absolute() { path.to_path_buf() } else { project_root.join(path) };
+    match std::fs::canonicalize(&resolved) {
+        Ok(canonical) if canonical.starts_with(project_root) => canonical,
+        _ => resolved,
     }
 }
 

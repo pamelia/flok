@@ -8,6 +8,7 @@ use flok_db::Db;
 
 use crate::bus::Bus;
 use crate::config::FlokConfig;
+use crate::lsp::LspManager;
 use crate::provider::Provider;
 use crate::snapshot::SnapshotManager;
 use crate::token::CostTracker;
@@ -64,6 +65,7 @@ pub struct AppState {
     pub project_root: PathBuf,
     pub project_id: String,
     pub snapshot: Arc<SnapshotManager>,
+    pub lsp: Arc<LspManager>,
 }
 
 impl AppState {
@@ -81,6 +83,7 @@ impl AppState {
         project_root: PathBuf,
         project_id: String,
         snapshot: Arc<SnapshotManager>,
+        lsp: Arc<LspManager>,
     ) -> Self {
         Self {
             db,
@@ -94,6 +97,7 @@ impl AppState {
             project_root,
             project_id,
             snapshot,
+            lsp,
         }
     }
 
@@ -111,6 +115,7 @@ impl AppState {
             session_id: session_id.to_string(),
             agent: "primary".to_string(),
             cancel,
+            lsp: Some(Arc::clone(&self.lsp)),
         }
     }
 }

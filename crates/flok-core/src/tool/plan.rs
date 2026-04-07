@@ -90,12 +90,7 @@ mod tests {
     use super::*;
 
     fn test_ctx(dir: &std::path::Path) -> ToolContext {
-        ToolContext {
-            project_root: dir.to_path_buf(),
-            session_id: "test".into(),
-            agent: "test".into(),
-            cancel: tokio_util::sync::CancellationToken::new(),
-        }
+        ToolContext::test(dir.to_path_buf())
     }
 
     #[tokio::test]

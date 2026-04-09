@@ -3,11 +3,10 @@
 //! Tracks mouse-drag selection within a single panel, extracts the selected
 //! text, and copies it to the system clipboard via `arboard`.
 
-#[cfg(test)]
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-#[cfg(test)]
 use crate::components::app::{DisplayMessage, MessageRole};
+use crate::components::sidebar::{TeamMemberInfo, TeamMemberStatus};
 
 /// Which panel a selection belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,6 +87,97 @@ impl PanelRects {
     }
 }
 
+/// Visible text lines for a panel in the current frame.
+#[derive(Debug, Clone, Default)]
+pub struct VisiblePaneLines {
+    pub rect: PanelRect,
+    pub lines: Vec<String>,
+}
+
+impl VisiblePaneLines {
+    pub fn new(rect: PanelRect, mut lines: Vec<String>) -> Self {
+        lines.truncate(rect.h as usize);
+        while lines.len() < rect.h as usize {
+            lines.push(String::new());
+        }
+        Self { rect, lines }
+    }
+
+    fn resolve_selection(&self, selection: &SelectionState) -> ResolvedSelection {
+        let ((sc, sr), (ec, er)) = selection.normalized();
+        let max_col = self.rect.w.saturating_sub(1);
+        let max_row = self.rect.h.saturating_sub(1);
+
+        let mut start_row = sr.saturating_sub(self.rect.y).min(max_row);
+        let mut end_row = er.saturating_sub(self.rect.y).min(max_row);
+        let mut start_col = sc.saturating_sub(self.rect.x).min(max_col) as usize;
+        let mut end_col = ec.saturating_sub(self.rect.x).min(max_col) as usize;
+
+        if selection.mode == SelectionMode::Line {
+            start_col = 0;
+            end_col = max_col as usize;
+        } else if selection.mode == SelectionMode::Word && start_row == end_row {
+            let line = self.lines.get(start_row as usize).map_or("", String::as_str);
+            (start_col, end_col) = expand_word_by_width(line, start_col, end_col);
+        }
+
+        if start_row > end_row {
+            std::mem::swap(&mut start_row, &mut end_row);
+        }
+
+        ResolvedSelection {
+            panel_rect: self.rect,
+            anchor: (self.rect.x + start_col as u16, self.rect.y + start_row),
+            cursor: (self.rect.x + end_col as u16, self.rect.y + end_row),
+        }
+    }
+}
+
+/// Visible text buffers for the selectable panels.
+#[derive(Debug, Clone, Default)]
+pub struct VisiblePanelBuffers {
+    pub messages: VisiblePaneLines,
+    pub sidebar: Option<VisiblePaneLines>,
+    pub input: VisiblePaneLines,
+}
+
+impl VisiblePanelBuffers {
+    fn pane(&self, panel: Panel) -> Option<&VisiblePaneLines> {
+        match panel {
+            Panel::Messages => Some(&self.messages),
+            Panel::Sidebar => self.sidebar.as_ref(),
+            Panel::Input => Some(&self.input),
+        }
+    }
+
+    pub fn resolve_selection(&self, selection: &SelectionState) -> Option<ResolvedSelection> {
+        selection
+            .has_extent()
+            .then(|| self.pane(selection.panel))
+            .flatten()
+            .map(|pane| pane.resolve_selection(selection))
+    }
+}
+
+/// Selection after expanding against a pane's visible text.
+#[derive(Debug, Clone)]
+pub struct ResolvedSelection {
+    pub panel_rect: PanelRect,
+    pub anchor: (u16, u16),
+    pub cursor: (u16, u16),
+}
+
+impl ResolvedSelection {
+    pub fn normalized(&self) -> ((u16, u16), (u16, u16)) {
+        let (a, b) = (self.anchor, self.cursor);
+        if a.1 < b.1 || (a.1 == b.1 && a.0 <= b.0) {
+            (a, b)
+        } else {
+            (b, a)
+        }
+    }
+}
+
 /// Tracks an in-progress or completed text selection.
 #[derive(Debug, Clone)]
 pub struct SelectionState {
@@ -154,22 +244,15 @@ impl SelectionState {
     /// `scroll_offset` is the scroll offset in rows (0 for unscrolled).
     /// Coordinates in `self` are absolute terminal coords.
     #[cfg(test)]
-    pub fn extract_text(
-        &self,
-        lines: &[String],
-        panel_rect: PanelRect,
-        scroll_offset: u16,
-    ) -> String {
+    pub fn extract_text(&self, lines: &[String], panel_rect: PanelRect) -> String {
         if !self.has_extent() {
             return String::new();
         }
 
         let ((sc, sr), (ec, er)) = self.normalized();
 
-        // Convert absolute screen coords to panel-relative row indices,
-        // accounting for scroll offset.
-        let first_row = sr.saturating_sub(panel_rect.y) + scroll_offset;
-        let last_row = er.saturating_sub(panel_rect.y) + scroll_offset;
+        let first_row = sr.saturating_sub(panel_rect.y);
+        let last_row = er.saturating_sub(panel_rect.y);
 
         // Column offsets relative to the panel's left edge.
         let start_col = sc.saturating_sub(panel_rect.x) as usize;
@@ -228,12 +311,11 @@ impl SelectionState {
 
 /// Extract a substring from `s` between display column `start` (inclusive)
 /// and `end` (inclusive), using character display widths.
-#[cfg(test)]
-fn substr_by_width(s: &str, start: usize, end: usize) -> String {
+pub(crate) fn substr_by_width(s: &str, start: usize, end: usize) -> String {
     let mut result = String::new();
     let mut col = 0;
     for ch in s.chars() {
-        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
         if col + w > end + 1 {
             break;
         }
@@ -329,10 +411,62 @@ pub fn compute_panel_rects(
     }
 }
 
-// ── Line buffer construction (used by tests) ────────────────────────────
+pub fn compute_input_height(text: &str, paste_indicator: Option<&str>, panel_width: u16) -> u16 {
+    build_input_lines(text, paste_indicator, panel_width).len() as u16
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_visible_panel_buffers(
+    rects: PanelRects,
+    messages: &[DisplayMessage],
+    streaming: &str,
+    reasoning: &str,
+    is_waiting: bool,
+    message_scroll: u16,
+    input_text: &str,
+    paste_indicator: Option<&str>,
+    title: &str,
+    model: &str,
+    input_tokens: u64,
+    output_tokens: u64,
+    cost: f64,
+    context_pct: f64,
+    team_name: &str,
+    team_members: &[TeamMemberInfo],
+    sidebar_scroll: u16,
+) -> VisiblePanelBuffers {
+    let messages_lines = visible_window(
+        &build_message_lines(messages, streaming, reasoning, is_waiting, rects.messages.w),
+        message_scroll,
+        rects.messages.h,
+    );
+    let input_lines = build_input_lines(input_text, paste_indicator, rects.input.w);
+
+    VisiblePanelBuffers {
+        messages: VisiblePaneLines::new(rects.messages, messages_lines),
+        sidebar: rects.sidebar.map(|sidebar_rect| {
+            let version = format!("flok v{}", env!("CARGO_PKG_VERSION"));
+            build_sidebar_visible_lines(
+                sidebar_rect,
+                title,
+                model,
+                input_tokens,
+                output_tokens,
+                cost,
+                context_pct,
+                team_name,
+                team_members,
+                &version,
+                sidebar_scroll,
+            )
+        }),
+        input: VisiblePaneLines::new(rects.input, input_lines),
+    }
+}
+
+// ── Line buffer construction ────────────────────────────────────────────
 
 /// Build a flat list of visual lines from the message list.
-#[cfg(test)]
 pub fn build_message_lines(
     messages: &[DisplayMessage],
     streaming: &str,
@@ -340,52 +474,50 @@ pub fn build_message_lines(
     is_waiting: bool,
     panel_width: u16,
 ) -> Vec<String> {
-    let pw = panel_width as usize;
-    // Left padding in the messages panel is 2.
-    let content_w = pw.saturating_sub(3); // 2 left pad + 1 right pad
+    let content_w = panel_width as usize;
     let mut lines: Vec<String> = Vec::new();
 
     for msg in messages {
-        // Each message has padding_top: 1 (blank line before header)
-        lines.push(String::new());
-
         match msg.role {
             MessageRole::User => {
-                // "  > You" (2 padding_left + header)
-                lines.push("  \u{25B6} You".to_string());
-                // blank line (padding_top: 1 on content)
                 lines.push(String::new());
-                // Content with 4 indent (2 msg padding + 2 content padding)
-                let indent = 4;
-                let wrap_w = content_w.saturating_sub(indent);
+                lines.push("  \u{2503}".to_string());
+                lines.push(String::new());
+                let prefix = "  \u{2503}  ";
+                let wrap_w = content_w.saturating_sub(prefix.width() + 1);
                 for wl in wrap_text(&msg.content, wrap_w) {
-                    lines.push(format!("{:indent$}{wl}", "", indent = indent));
+                    lines.push(format!("{prefix}{wl}"));
                 }
+                lines.push("  \u{2503}".to_string());
             }
             MessageRole::Assistant => {
-                lines.push("  \u{25B6} Assistant".to_string());
                 lines.push(String::new());
-                let indent = 4;
-                let wrap_w = content_w.saturating_sub(indent);
-                // Strip markdown formatting for plain text extraction.
+                let prefix = "    ";
+                let wrap_w = content_w.saturating_sub(prefix.width());
                 let plain = strip_markdown(&msg.content);
                 for wl in wrap_text(&plain, wrap_w) {
-                    lines.push(format!("{:indent$}{wl}", "", indent = indent));
+                    lines.push(format!("{prefix}{wl}"));
                 }
             }
             MessageRole::System => {
-                lines.push("  \u{26A0} System".to_string());
-                let indent = 4;
-                let wrap_w = content_w.saturating_sub(indent);
+                lines.push(String::new());
+                lines.push("  \u{2503}".to_string());
+                lines.push("  \u{2503}  \u{26A0} System".to_string());
+                lines.push(String::new());
+                let prefix = "  \u{2503}  ";
+                let wrap_w = content_w.saturating_sub(prefix.width());
                 for wl in wrap_text(&msg.content, wrap_w) {
-                    lines.push(format!("{:indent$}{wl}", "", indent = indent));
+                    lines.push(format!("{prefix}{wl}"));
                 }
+                lines.push("  \u{2503}".to_string());
             }
             MessageRole::ToolCall => {
-                let indent = 4;
-                let wrap_w = content_w.saturating_sub(indent);
-                for wl in wrap_text(&msg.content, wrap_w) {
-                    lines.push(format!("{:indent$}{wl}", "", indent = indent));
+                let first_prefix = "    \u{2502} ";
+                let cont_prefix = "      ";
+                let wrap_w = content_w.saturating_sub(first_prefix.width());
+                for (idx, wl) in wrap_text(&msg.content, wrap_w).into_iter().enumerate() {
+                    let prefix = if idx == 0 { first_prefix } else { cont_prefix };
+                    lines.push(format!("{prefix}{wl}"));
                 }
             }
         }
@@ -394,25 +526,23 @@ pub fn build_message_lines(
     // Reasoning
     if !reasoning.is_empty() && streaming.is_empty() {
         lines.push(String::new());
-        lines.push("    \u{1F4AD} Thinking...".to_string());
+        lines.push("    \u{2502} \u{1F4AD} Thinking...".to_string());
         lines.push(String::new());
-        let indent = 6;
-        let wrap_w = content_w.saturating_sub(indent);
+        let prefix = "      ";
+        let wrap_w = content_w.saturating_sub(prefix.width());
         for wl in wrap_text(reasoning, wrap_w) {
-            lines.push(format!("{:indent$}{wl}", "", indent = indent));
+            lines.push(format!("{prefix}{wl}"));
         }
     }
 
     // Streaming
     if !streaming.is_empty() {
         lines.push(String::new());
-        lines.push("  \u{25B6} Assistant ...".to_string());
-        lines.push(String::new());
-        let indent = 4;
-        let wrap_w = content_w.saturating_sub(indent);
+        let prefix = "    ";
+        let wrap_w = content_w.saturating_sub(prefix.width());
         let plain = strip_markdown(streaming);
         for wl in wrap_text(&plain, wrap_w) {
-            lines.push(format!("{:indent$}{wl}", "", indent = indent));
+            lines.push(format!("{prefix}{wl}"));
         }
     } else if is_waiting {
         lines.push(String::new());
@@ -423,9 +553,9 @@ pub fn build_message_lines(
 }
 
 /// Build visual lines for the sidebar.
-#[cfg(test)]
-#[allow(dead_code, clippy::too_many_arguments)]
-pub fn build_sidebar_lines(
+#[allow(clippy::too_many_arguments)]
+pub fn build_sidebar_visible_lines(
+    rect: PanelRect,
     title: &str,
     model: &str,
     input_tokens: u64,
@@ -433,41 +563,95 @@ pub fn build_sidebar_lines(
     cost: f64,
     context_pct: f64,
     team_name: &str,
-    team_members: &[(String, &str)], // (name, status_word)
-) -> Vec<String> {
-    let mut lines = Vec::new();
+    team_members: &[TeamMemberInfo],
+    version: &str,
+    scroll_offset: u16,
+) -> VisiblePaneLines {
+    let mut body_lines = vec![
+        String::new(),
+        format!("   {title}"),
+        format!("   {model}"),
+        String::new(),
+        "   CONTEXT".to_string(),
+        format!("   In  {}", format_tokens(input_tokens)),
+        format!("   Out {}", format_tokens(output_tokens)),
+    ];
 
-    lines.push(title.to_string());
-    lines.push(model.to_string());
-    lines.push(String::new());
-    lines.push("CONTEXT".to_string());
-    lines.push(format!("In  {}", format_tokens(input_tokens)));
-    lines.push(format!("Out {}", format_tokens(output_tokens)));
     if cost > 0.0 {
         if cost < 0.01 {
-            lines.push(format!("Cost ${cost:.4}"));
+            body_lines.push(format!("   Cost ${cost:.4}"));
         } else {
-            lines.push(format!("Cost ${cost:.2}"));
+            body_lines.push(format!("   Cost ${cost:.2}"));
         }
     }
     if context_pct > 0.0 {
-        lines.push(format!("Ctx  {:.0}%", context_pct.min(100.0)));
+        body_lines.push(format!("   Ctx  {:.0}%", context_pct.min(100.0)));
     }
 
     if !team_name.is_empty() {
-        lines.push(String::new());
-        lines.push(format!("AGENTS ({} agents)", team_members.len()));
-        lines.push(team_name.to_string());
-        for (name, status) in team_members {
-            lines.push(format!("  @{name} {status}"));
+        body_lines.push(String::new());
+        body_lines.push("   AGENTS".to_string());
+        let display_team = if team_name.len() > 33 {
+            format!("{}...", &team_name[..30])
+        } else {
+            team_name.to_string()
+        };
+        body_lines.push(format!("   {display_team}"));
+        for member in team_members {
+            let icon = match member.status {
+                TeamMemberStatus::Running => "\u{25CB}",
+                TeamMemberStatus::Completed | TeamMemberStatus::Failed => "\u{25CF}",
+            };
+            body_lines.push(format!("     {icon} {}", member.display_name()));
         }
     }
 
+    let body_height = rect.h.saturating_sub(1);
+    let mut lines = visible_window(&body_lines, scroll_offset, body_height);
+    lines.push(format!("   {version}"));
+    VisiblePaneLines::new(rect, lines)
+}
+
+pub fn build_input_lines(
+    text: &str,
+    paste_indicator: Option<&str>,
+    panel_width: u16,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(indicator) = paste_indicator {
+        lines.push(format!("   {indicator}"));
+    }
+
+    let inner_prefix = "  \u{2502} ";
+    let wrap_w = panel_width as usize;
+    let content_w = wrap_w.saturating_sub(inner_prefix.width() + 2);
+    let mut wrapped = wrap_text(text, content_w.max(1));
+    if wrapped.is_empty() {
+        wrapped.push(String::new());
+    }
+
+    let max_inner_rows = 6usize;
+    if wrapped.len() > max_inner_rows {
+        let start = wrapped.len().saturating_sub(max_inner_rows);
+        wrapped = wrapped[start..].to_vec();
+    }
+
+    lines.push("  \u{250C}".to_string());
+    for line in wrapped {
+        lines.push(format!("{inner_prefix}{line}"));
+    }
+    lines.push("  \u{2514}".to_string());
+
+    while lines.len() < paste_indicator.map_or(3, |_| 4) {
+        let insert_at = lines.len().saturating_sub(1);
+        lines.insert(insert_at, inner_prefix.to_string());
+    }
+
+    lines.truncate(paste_indicator.map_or(8, |_| 9));
     lines
 }
 
 /// Wrap text into lines that fit within `max_width` display columns.
-#[cfg(test)]
 fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
     if max_width == 0 {
         return vec![text.to_string()];
@@ -501,7 +685,6 @@ fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
 }
 
 /// Minimal markdown stripping for plain-text extraction.
-#[cfg(test)]
 fn strip_markdown(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for line in s.lines() {
@@ -528,7 +711,6 @@ fn strip_markdown(s: &str) -> String {
     out
 }
 
-#[cfg(test)]
 fn format_tokens(n: u64) -> String {
     if n >= 1_000_000 {
         format!("{:.1}M", n as f64 / 1_000_000.0)
@@ -537,6 +719,50 @@ fn format_tokens(n: u64) -> String {
     } else {
         n.to_string()
     }
+}
+
+fn visible_window(lines: &[String], scroll_offset: u16, height: u16) -> Vec<String> {
+    let start = scroll_offset as usize;
+    let end = (start + height as usize).min(lines.len());
+    let mut visible = lines[start..end].to_vec();
+    while visible.len() < height as usize {
+        visible.push(String::new());
+    }
+    visible
+}
+
+fn expand_word_by_width(s: &str, start_col: usize, end_col: usize) -> (usize, usize) {
+    #[derive(Clone, Copy)]
+    struct Span {
+        start: usize,
+        end: usize,
+        whitespace: bool,
+    }
+
+    let mut spans = Vec::new();
+    let mut col = 0;
+    for ch in s.chars() {
+        let width = UnicodeWidthChar::width(ch).unwrap_or(1).max(1);
+        spans.push(Span { start: col, end: col + width - 1, whitespace: ch.is_whitespace() });
+        col += width;
+    }
+
+    let Some(mut left) =
+        spans.iter().position(|span| span.start <= end_col && span.end >= start_col)
+    else {
+        return (start_col, end_col);
+    };
+    let mut right = left;
+    let whitespace = spans[left].whitespace;
+
+    while left > 0 && spans[left - 1].whitespace == whitespace {
+        left -= 1;
+    }
+    while right + 1 < spans.len() && spans[right + 1].whitespace == whitespace {
+        right += 1;
+    }
+
+    (spans[left].start, spans[right].end)
 }
 
 #[cfg(test)]
@@ -634,7 +860,7 @@ mod tests {
             cursor: (4, 0),
             mode: SelectionMode::Char,
         };
-        assert_eq!(sel.extract_text(&lines, rect, 0), "Hello");
+        assert_eq!(sel.extract_text(&lines, rect), "Hello");
     }
 
     #[test]
@@ -647,27 +873,21 @@ mod tests {
             cursor: (3, 2),
             mode: SelectionMode::Char,
         };
-        let text = sel.extract_text(&lines, rect, 0);
+        let text = sel.extract_text(&lines, rect);
         assert_eq!(text, "one\nLine two\nLine");
     }
 
     #[test]
-    fn extract_text_with_scroll_offset() {
-        let lines = vec![
-            "Row 0".to_string(),
-            "Row 1".to_string(),
-            "Row 2 visible".to_string(),
-            "Row 3 visible".to_string(),
-        ];
+    fn extract_text_with_visible_window() {
+        let lines = vec!["Row 2 visible".to_string(), "Row 3 visible".to_string()];
         let rect = PanelRect { x: 0, y: 0, w: 80, h: 2 };
-        // Screen row 0 with scroll_offset=2 maps to lines[2]
         let sel = SelectionState {
             panel: Panel::Messages,
             anchor: (0, 0),
             cursor: (4, 0),
             mode: SelectionMode::Char,
         };
-        assert_eq!(sel.extract_text(&lines, rect, 2), "Row 2");
+        assert_eq!(sel.extract_text(&lines, rect), "Row 2");
     }
 
     #[test]
@@ -682,7 +902,7 @@ mod tests {
             cursor: (16, 5),
             mode: SelectionMode::Char,
         };
-        assert_eq!(sel.extract_text(&lines, rect, 0), "llo w");
+        assert_eq!(sel.extract_text(&lines, rect), "llo w");
     }
 
     #[test]
@@ -711,11 +931,46 @@ mod tests {
             DisplayMessage { role: MessageRole::Assistant, content: "hello".into() },
         ];
         let lines = build_message_lines(&msgs, "", "", false, 80);
-        // Should contain user header and assistant header
-        assert!(lines.iter().any(|l| l.contains("You")));
-        assert!(lines.iter().any(|l| l.contains("Assistant")));
         assert!(lines.iter().any(|l| l.contains("hi")));
         assert!(lines.iter().any(|l| l.contains("hello")));
+    }
+
+    #[test]
+    fn resolve_word_selection_uses_visible_panel_lines() {
+        let pane = VisiblePaneLines::new(
+            PanelRect { x: 0, y: 0, w: 20, h: 1 },
+            vec!["hello sidebar".to_string()],
+        );
+        let selection = SelectionState {
+            panel: Panel::Messages,
+            anchor: (1, 0),
+            cursor: (1, 0),
+            mode: SelectionMode::Word,
+        };
+
+        let resolved = pane.resolve_selection(&selection);
+        assert_eq!(resolved.normalized(), ((0, 0), (4, 0)));
+    }
+
+    #[test]
+    fn sidebar_visible_lines_keep_version_pinned() {
+        let rect = PanelRect { x: 0, y: 0, w: 39, h: 4 };
+        let visible = build_sidebar_visible_lines(
+            rect,
+            "Session",
+            "model",
+            10,
+            20,
+            0.0,
+            0.0,
+            "team-name",
+            &[TeamMemberInfo { name: "worker-ABC12345".into(), status: TeamMemberStatus::Running }],
+            "flok v0.0.1",
+            3,
+        );
+
+        assert_eq!(visible.lines.len(), 4);
+        assert_eq!(visible.lines.last().map(String::as_str), Some("   flok v0.0.1"));
     }
 
     #[test]

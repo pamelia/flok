@@ -20,13 +20,18 @@ use crate::worktree::WorktreeManager;
 use super::{Tool, ToolContext, ToolOutput};
 
 /// Maximum number of prompt loop iterations for a sub-agent.
-const MAX_SUBAGENT_STEPS: usize = 5;
+///
+/// Matches `MAX_TOOL_ROUNDS` in the main session engine — sub-agents do
+/// the same kind of work (LLM calls + tool calls) and need the same
+/// headroom. This is a doom-loop safety valve, not a performance throttle.
+const MAX_SUBAGENT_STEPS: usize = 25;
 
 /// Maximum concurrent background agent API calls.
 ///
 /// Limits how many sub-agents can call `provider.stream()` simultaneously.
 /// This prevents rate-limiting when spawning multiple reviewers in parallel.
-const MAX_CONCURRENT_AGENTS: usize = 2;
+/// Set to 3 to match the typical reviewer team size (3 specialists).
+const MAX_CONCURRENT_AGENTS: usize = 3;
 
 /// Maximum retry attempts for sub-agent API calls.
 const MAX_SUBAGENT_RETRIES: u32 = 3;

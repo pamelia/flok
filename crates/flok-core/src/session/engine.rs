@@ -939,6 +939,16 @@ impl SessionEngine {
                 max_tokens: 16_384,
             };
 
+            // Separate streaming text between rounds so the TUI doesn't
+            // concatenate consecutive round outputs on a single line.
+            if rounds > 1 {
+                self.state.bus.send(BusEvent::TextDelta {
+                    session_id: self.session_id.clone(),
+                    message_id: String::new(),
+                    delta: "\n\n".to_string(),
+                });
+            }
+
             let (text, reasoning, tool_calls) =
                 match self.stream_completion_with_retry(request).await {
                     Ok(result) => result,

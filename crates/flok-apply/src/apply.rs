@@ -214,9 +214,11 @@ fn try_ellipsis_merge(original: &str, snippet: &str) -> Result<String, ApplyErro
             Some((rel_offset, _score)) => {
                 let abs_offset = orig_pos + rel_offset;
 
-                // If this is not the first segment, or if we start with ellipsis,
-                // preserve original lines between last position and this match
-                if i > 0 || starts_with_ellipsis {
+                // Preserve untouched original content that appears before this
+                // matched segment. This keeps prefixes intact for mid-file and
+                // non-contiguous edits where the snippet starts after the file
+                // header/imports rather than at line 1.
+                if abs_offset >= orig_pos {
                     for &line in &orig_lines[orig_pos..abs_offset] {
                         result.push(line.to_string());
                     }
@@ -579,6 +581,42 @@ fn another_function() {
         assert_eq!(segments.len(), 2);
         assert_eq!(segments[0], vec!["fn main() {", "    let x = 1;"]);
         assert_eq!(segments[1], vec!["    println!(\"done\");", "}"]);
+    }
+
+    #[test]
+    fn ellipsis_merge_preserves_prefix_before_first_match() {
+        let original = "\
+use std::io;
+
+fn helper() {
+    println!(\"helper\");
+}
+
+fn alpha() {
+    println!(\"old alpha\");
+}
+
+fn beta() {
+    println!(\"old beta\");
+}
+";
+
+        let snippet = "\
+fn alpha() {
+    println!(\"new alpha\");
+}
+// ... existing code ...
+fn beta() {
+    println!(\"new beta\");
+}
+";
+
+        let result = apply_edit(original, snippet).unwrap();
+        assert_eq!(result.strategy, Strategy::EllipsisMerge);
+        assert!(result.content.contains("use std::io;"));
+        assert!(result.content.contains("fn helper()"));
+        assert!(result.content.contains("println!(\"new alpha\");"));
+        assert!(result.content.contains("println!(\"new beta\");"));
     }
 
     #[test]

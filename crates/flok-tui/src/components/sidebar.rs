@@ -29,15 +29,6 @@ impl TeamMemberInfo {
         }
         &self.name
     }
-
-    /// Human-readable status word.
-    pub fn status_word(&self) -> &'static str {
-        match self.status {
-            TeamMemberStatus::Running => "working",
-            TeamMemberStatus::Completed => "done",
-            TeamMemberStatus::Failed => "failed",
-        }
-    }
 }
 
 /// Status of a team member.
@@ -89,10 +80,7 @@ pub fn Sidebar(mut hooks: Hooks, props: &mut SidebarProps) -> impl Into<AnyEleme
         format!("${:.2}", props.session_cost)
     };
 
-    // Team summary
-    let active_count =
-        props.team_members.iter().filter(|m| m.status == TeamMemberStatus::Running).count();
-    let total_count = props.team_members.len();
+    // (team counts removed — sidebar now shows just names + status icons)
 
     // Internal handle if parent doesn't provide one.
     let internal_handle = hooks.use_ref(ScrollViewHandle::default);
@@ -176,37 +164,32 @@ pub fn Sidebar(mut hooks: Hooks, props: &mut SidebarProps) -> impl Into<AnyEleme
                             None
                         } else {
                             let team_name = props.team_name.clone();
-                            let members = props.team_members.clone();
-                            let summary = if active_count > 0 {
-                                format!("{active_count} active, {total_count} total")
+                            // Truncate team name to fit sidebar (35 usable chars)
+                            let display_team = if team_name.len() > 33 {
+                                format!("{}...", &team_name[..30])
                             } else {
-                                format!("{total_count} agents")
+                                team_name
                             };
+                            let members = props.team_members.clone();
                             Some(element! {
-                                View(padding_top: 1u32) {
-                                    // Header
+                                View(padding_top: 1u32, flex_direction: FlexDirection::Column) {
                                     Text(
-                                        content: format!("AGENTS ({summary})"),
-                                        color: theme.warning,
+                                        content: "AGENTS",
+                                        color: theme.primary,
                                         weight: Weight::Bold,
                                     )
-                                    // Team name on its own line
-                                    Text(content: team_name, color: theme.text_muted)
-                                    // Each agent on its own row
+                                    Text(content: display_team, color: theme.text_muted)
                                     #(members.iter().map(|m| {
                                         let (icon, color) = match m.status {
-                                            TeamMemberStatus::Running => ("~", theme.warning),
-                                            TeamMemberStatus::Completed => ("*", theme.success),
-                                            TeamMemberStatus::Failed => ("x", theme.error),
+                                            TeamMemberStatus::Running => ("\u{25CB}", theme.warning),
+                                            TeamMemberStatus::Completed => ("\u{25CF}", theme.success),
+                                            TeamMemberStatus::Failed => ("\u{25CF}", theme.error),
                                         };
-                                        let name = m.display_name();
-                                        let status = m.status_word();
+                                        let name = m.display_name().to_string();
                                         element! {
-                                            View(key: m.name.clone()) {
-                                                Text(
-                                                    content: format!("  {icon} @{name} {status}"),
-                                                    color: color,
-                                                )
+                                            View(key: m.name.clone(), flex_direction: FlexDirection::Row) {
+                                                Text(content: format!("  {icon} "), color: color)
+                                                Text(content: name, color: theme.text)
                                             }
                                         }
                                     }))

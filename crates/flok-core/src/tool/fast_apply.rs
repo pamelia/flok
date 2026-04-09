@@ -63,7 +63,10 @@ impl Tool for FastApplyTool {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("missing required parameter: snippet"))?;
 
-        let resolved = resolve_path(&ctx.project_root, file_path);
+        let resolved = match resolve_path(&ctx.project_root, file_path) {
+            Ok(path) => path,
+            Err(error) => return Ok(ToolOutput::error(error.to_string())),
+        };
 
         // Read the original file
         let original = match tokio::fs::read_to_string(&resolved).await {
@@ -113,13 +116,25 @@ impl Tool for FastApplyTool {
     }
 }
 
-fn resolve_path(project_root: &Path, file_path: &str) -> PathBuf {
+fn resolve_path(project_root: &Path, file_path: &str) -> anyhow::Result<PathBuf> {
+    let project_root =
+        std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
     let path = Path::new(file_path);
     let resolved = if path.is_absolute() { path.to_path_buf() } else { project_root.join(path) };
-    match std::fs::canonicalize(&resolved) {
-        Ok(canonical) if canonical.starts_with(project_root) => canonical,
-        _ => resolved,
+
+    if !crate::permission::path::is_within_project(&resolved, &project_root) {
+        anyhow::bail!("Path escapes project root: {}", resolved.display());
     }
+
+    if let Some(parent) = resolved.parent() {
+        if let Ok(canonical_parent) = std::fs::canonicalize(parent) {
+            if !canonical_parent.starts_with(&project_root) {
+                anyhow::bail!("Path escapes project root via symlink: {}", resolved.display());
+            }
+        }
+    }
+
+    Ok(resolved)
 }
 
 #[cfg(test)]
@@ -140,6 +155,21 @@ mod tests {
         assert!(!result.is_error);
         assert!(result.content.contains("Created new file"));
         assert!(dir.path().join("new_file.rs").exists());
+    }
+
+    #[tokio::test]
+    async fn fast_apply_blocks_path_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolContext::test(dir.path().to_path_buf());
+
+        let args = serde_json::json!({
+            "file_path": "../escape.rs",
+            "snippet": "fn main() {}"
+        });
+
+        let result = FastApplyTool.execute(args, &ctx).await.unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains("escapes project root"));
     }
 
     #[tokio::test]

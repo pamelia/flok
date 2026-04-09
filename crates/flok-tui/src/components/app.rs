@@ -75,9 +75,9 @@ fn FlokApp(mut hooks: Hooks, props: &mut FlokAppProps) -> impl Into<AnyElement<'
     let mut last_click_time: State<Option<u64>> = hooks.use_state(|| None); // millis since epoch
     let mut last_click_pos: State<(u16, u16)> = hooks.use_state(|| (0, 0));
     let mut click_count: State<u8> = hooks.use_state(|| 0);
-    // Text extracted from the canvas by SelectionOverlay during draw().
-    // Uses Ref (not State) to avoid deadlock — writing State inside draw()
-    // triggers a re-render which re-enters the render pass.
+    // Resolved selection for highlight geometry.
+    let mut resolved_selection: Ref<Option<selection::ResolvedSelection>> = hooks.use_ref(|| None);
+    // Text extracted from the overlay's canvas draw.
     let extracted_text: Ref<String> = hooks.use_ref(String::new);
 
     // ── Overlay state ───────────────────────────────────────────────────
@@ -114,10 +114,45 @@ fn FlokApp(mut hooks: Hooks, props: &mut FlokAppProps) -> impl Into<AnyElement<'
     let show_sidebar = sidebar_open.get() && term_width >= 120;
 
     // ── Compute panel rects for mouse routing ───────────────────────────
-    // Estimate input height (3 lines + 1 margin).
-    let input_h: u16 = 4;
+    let input_snapshot = input_text.read().clone();
+    let paste_indicator_snapshot = paste_indicator.read().clone();
+    let main_panel_width = term_width.saturating_sub(if show_sidebar { 39 } else { 0 });
+    let input_h = selection::compute_input_height(
+        &input_snapshot,
+        paste_indicator_snapshot.as_deref(),
+        main_panel_width,
+    );
     let panel_rects =
         selection::compute_panel_rects(term_width, term_height, show_sidebar, input_h);
+
+    let msgs_snapshot = messages.read().clone();
+    let stream_snapshot = streaming_text.read().clone();
+    let reasoning_snapshot = streaming_reasoning.read().clone();
+    let title_snapshot = session_title.read().clone();
+    let team_name_snapshot = team_name.read().clone();
+    let team_members_snapshot = team_members.read().clone();
+    let sidebar_buffers = selection::build_visible_panel_buffers(
+        panel_rects,
+        &msgs_snapshot,
+        &stream_snapshot,
+        &reasoning_snapshot,
+        waiting.get(),
+        msg_scroll.read().scroll_offset().max(0) as u16,
+        &input_snapshot,
+        paste_indicator_snapshot.as_deref(),
+        &title_snapshot,
+        &model_name,
+        input_tokens.get(),
+        output_tokens.get(),
+        session_cost.get(),
+        context_pct.get(),
+        &team_name_snapshot,
+        &team_members_snapshot,
+        sidebar_scroll.read().scroll_offset().max(0) as u16,
+    );
+    let resolved_selection_now =
+        selection.read().as_ref().and_then(|sel| sidebar_buffers.resolve_selection(sel));
+    resolved_selection.set(resolved_selection_now.clone());
 
     // ── Channel polling futures ─────────────────────────────────────────
     let mut ui_rx_ref = hooks.use_ref(|| props.ui_rx.take());
@@ -390,15 +425,16 @@ fn FlokApp(mut hooks: Hooks, props: &mut FlokAppProps) -> impl Into<AnyElement<'
                     let shift = modifiers.contains(KeyModifiers::SHIFT);
 
                     // If there is an active selection, Ctrl+C copies it.
-                    let has_selection = {
-                        let guard = selection.read();
-                        guard.as_ref().is_some_and(SelectionState::has_extent)
-                    };
+                    let has_selection =
+                        selection.read().as_ref().is_some_and(SelectionState::has_extent);
                     if has_selection {
                         if ctrl && code == KeyCode::Char('c') {
-                            let text = extracted_text.read().clone();
+                            let copied = {
+                                let text = extracted_text.read().clone();
+                                !text.is_empty() && selection::copy_to_clipboard(&text)
+                            };
                             selection.set(None);
-                            if !text.is_empty() && selection::copy_to_clipboard(&text) {
+                            if copied {
                                 toast.set(Some("Copied to clipboard".into()));
                             }
                             return;
@@ -643,13 +679,13 @@ fn FlokApp(mut hooks: Hooks, props: &mut FlokAppProps) -> impl Into<AnyElement<'
     }
 
     // ── Build element tree ──────────────────────────────────────────────
-    let msgs = messages.read().clone();
-    let stream = streaming_text.read().clone();
-    let reasoning = streaming_reasoning.read().clone();
-    let input = input_text.read().clone();
-    let title = session_title.read().clone();
+    let msgs = msgs_snapshot;
+    let stream = stream_snapshot;
+    let reasoning = reasoning_snapshot;
+    let input = input_snapshot;
+    let title = title_snapshot;
     let is_scrolled_up = msg_scrolled_up.get();
-    let sel_for_overlay = selection.read().clone();
+    let sel_for_overlay = resolved_selection_now;
 
     element! {
         View(
@@ -1075,16 +1111,17 @@ fn handle_mouse(
             }
         }
         MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
-            // The SelectionOverlay reads the canvas during draw() and stores
-            // the selected text in `extracted_text`. We read it here.
+            if let Some(ref mut sel) = *selection.write() {
+                let (c, r) = rects.clamp_to(sel.panel, mouse.column, mouse.row);
+                sel.extend(c, r);
+            }
             let text = extracted_text.read().clone();
-            // Clear the selection (overlay will clear extracted_text on next draw).
             selection.set(None);
 
             tracing::debug!(
                 text_len = text.len(),
                 text_preview = &text[..text.len().min(80)],
-                "selection copy from canvas"
+                "selection copy from visible buffers"
             );
 
             if text.is_empty() {

@@ -48,6 +48,36 @@ pub struct FlokConfig {
     /// "*" = "ask"
     /// ```
     pub permission: std::collections::HashMap<String, PermissionToolConfig>,
+    /// Runtime provider fallback behavior.
+    pub runtime_fallback: RuntimeFallbackConfig,
+}
+
+/// Runtime provider fallback behavior.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RuntimeFallbackConfig {
+    /// Whether runtime provider fallback is enabled.
+    pub enabled: bool,
+    /// HTTP status codes that trigger fallback.
+    pub retry_on_errors: Vec<u16>,
+    /// Total attempts across the full fallback chain.
+    pub max_attempts: u32,
+    /// Provider cooldown duration after a retriable failure.
+    pub cooldown_seconds: u64,
+    /// Whether to emit `BusEvent::ProviderFallback` notifications.
+    pub notify_on_fallback: bool,
+}
+
+impl Default for RuntimeFallbackConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            retry_on_errors: vec![429, 500, 502, 503, 529],
+            max_attempts: 3,
+            cooldown_seconds: 120,
+            notify_on_fallback: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -150,6 +180,8 @@ pub struct ProviderConfig {
     /// `--model` CLI flag nor top-level `model` config is set — the first
     /// provider (alphabetical by key) with a `default_model` wins.
     pub default_model: Option<String>,
+    /// Ordered list of fallback providers to try after retriable failures.
+    pub fallback: Vec<String>,
 }
 
 /// Serialize an `Option<SecretString>` by exposing its plaintext.
@@ -250,6 +282,9 @@ fn merge_config(target: &mut FlokConfig, source: &FlokConfig) {
         if value.default_model.is_some() {
             entry.default_model.clone_from(&value.default_model);
         }
+        if !value.fallback.is_empty() {
+            entry.fallback.clone_from(&value.fallback);
+        }
     }
     target.lsp = source.lsp.clone();
     // Worktree config: source overrides target entirely if present in source file
@@ -258,6 +293,9 @@ fn merge_config(target: &mut FlokConfig, source: &FlokConfig) {
     // Permission config: merge at the permission-type level
     for (key, value) in &source.permission {
         target.permission.insert(key.clone(), value.clone());
+    }
+    if source.runtime_fallback != RuntimeFallbackConfig::default() {
+        target.runtime_fallback = source.runtime_fallback.clone();
     }
 }
 
@@ -293,6 +331,7 @@ mod tests {
         assert!(config.provider.is_empty());
         assert!(config.lsp.enabled);
         assert_eq!(config.lsp.rust.command, "rust-analyzer");
+        assert_eq!(config.runtime_fallback, RuntimeFallbackConfig::default());
     }
 
     #[test]
@@ -354,6 +393,7 @@ mod tests {
                     api_key: Some(SecretString::from("key-123".to_string())),
                     base_url: None,
                     default_model: None,
+                    fallback: Vec::new(),
                 },
             )]
             .into_iter()
@@ -391,6 +431,7 @@ mod tests {
                 api_key: Some(SecretString::from("sk-test-roundtrip".to_string())),
                 base_url: None,
                 default_model: None,
+                fallback: Vec::new(),
             },
         );
         let config = FlokConfig { provider, ..Default::default() };
@@ -414,6 +455,7 @@ mod tests {
             api_key: Some(SecretString::from("plain-text-xyz".to_string())),
             base_url: None,
             default_model: None,
+            fallback: Vec::new(),
         };
         let rendered = format!("{provider:?}");
         assert!(!rendered.contains("plain-text-xyz"), "Debug output leaked plaintext: {rendered}");
@@ -522,6 +564,7 @@ mod tests {
         let config: FlokConfig = toml::from_str(toml_str).unwrap();
         assert!(config.model.is_none());
         assert!(config.provider["anthropic"].default_model.is_none());
+        assert!(config.provider["anthropic"].fallback.is_empty());
     }
 
     #[test]
@@ -549,6 +592,7 @@ mod tests {
                 api_key: Some(SecretString::from("sk-base".to_string())),
                 base_url: None,
                 default_model: None,
+                fallback: Vec::new(),
             },
         );
         let overlay = FlokConfig {
@@ -558,6 +602,7 @@ mod tests {
                     api_key: None,
                     base_url: None,
                     default_model: Some("opus-4.7".into()),
+                    fallback: Vec::new(),
                 },
             )]
             .into_iter()
@@ -571,5 +616,52 @@ mod tests {
             "api_key from base must survive an overlay that only sets default_model",
         );
         assert_eq!(base.provider["anthropic"].default_model.as_deref(), Some("opus-4.7"),);
+    }
+
+    #[test]
+    fn parse_runtime_fallback_config() {
+        let toml_str = "
+            [runtime_fallback]
+            enabled = false
+            retry_on_errors = [429, 503]
+            max_attempts = 5
+            cooldown_seconds = 30
+            notify_on_fallback = false
+        ";
+
+        let config: FlokConfig = toml::from_str(toml_str).unwrap();
+        assert!(!config.runtime_fallback.enabled);
+        assert_eq!(config.runtime_fallback.retry_on_errors, vec![429, 503]);
+        assert_eq!(config.runtime_fallback.max_attempts, 5);
+        assert_eq!(config.runtime_fallback.cooldown_seconds, 30);
+        assert!(!config.runtime_fallback.notify_on_fallback);
+    }
+
+    #[test]
+    fn parse_provider_fallback_chain() {
+        let toml_str = "
+            [provider.anthropic]
+            fallback = [\"openai\"]
+        ";
+
+        let config: FlokConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.provider["anthropic"].fallback, vec!["openai"]);
+    }
+
+    #[test]
+    fn runtime_fallback_defaults_when_missing() {
+        let config: FlokConfig = toml::from_str("").unwrap();
+        assert_eq!(config.runtime_fallback, RuntimeFallbackConfig::default());
+    }
+
+    #[test]
+    fn provider_fallback_defaults_to_empty_vec() {
+        let toml_str = "
+            [provider.openai]
+            api_key = \"sk-test\"
+        ";
+
+        let config: FlokConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.provider["openai"].fallback.is_empty());
     }
 }

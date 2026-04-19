@@ -5,6 +5,7 @@
 //! `StreamEvent`s.
 
 mod anthropic;
+pub mod fallback;
 mod minimax;
 pub mod mock;
 mod models;
@@ -13,6 +14,7 @@ pub mod registry;
 mod types;
 
 pub use anthropic::AnthropicProvider;
+pub use fallback::{is_retriable, CooldownTracker, FallbackChain};
 pub use minimax::MiniMaxProvider;
 pub use models::{resolve_default_model, ModelInfo, ModelRegistry};
 pub use openai::OpenAiProvider;

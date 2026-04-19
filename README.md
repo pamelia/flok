@@ -26,6 +26,7 @@ AI-assisted coding workflows. Single binary, no runtime dependencies.
 
 **Providers & Models**
 - **Multi-provider support** -- Anthropic Claude (4.6/4), OpenAI GPT-5.4 family, DeepSeek
+- **Automatic provider fallback** -- fail over across configured providers on retriable 429/5xx/529 errors
 - **Model shorthand aliases** -- `sonnet`, `opus`, `haiku`, `gpt-5.4`, `chatgpt-5.4`, `mini`, `nano`, `deepseek`, `r1`
 - **Prompt caching** -- Anthropic cache_control breakpoints for cost savings
 - **Streaming responses** -- real-time text and reasoning delta streaming
@@ -290,6 +291,7 @@ Example `flok.toml`:
 ```toml
 [provider.anthropic]
 # api_key = "sk-ant-..."
+# fallback = ["openai"]
 
 [provider.openai]
 # api_key = "sk-..."
@@ -303,7 +305,18 @@ Example `flok.toml`:
 # enabled = true           # Isolate sub-agents in git worktrees
 # cleanup_on_complete = true
 # auto_merge = true        # Auto-merge worktree changes back
+
+[runtime_fallback]
+# enabled = true
+# retry_on_errors = [429, 500, 502, 503, 529]
+# max_attempts = 3
+# cooldown_seconds = 120
+# notify_on_fallback = true
 ```
+
+Provider fallback is ordered per provider via `[provider.<name>].fallback`. For example,
+`[provider.anthropic] fallback = ["openai", "minimax"]` will try Anthropic first, then
+OpenAI, then MiniMax when the active provider returns a retriable HTTP status.
 
 ### Default Model
 

@@ -608,8 +608,17 @@ fn build_provider_registry(
     config: &flok_core::config::FlokConfig,
 ) -> Result<Arc<ProviderRegistry>> {
     let mut registry = ProviderRegistry::new();
+    registry.set_runtime_fallback(config.runtime_fallback.clone());
     let mut provider_names: Vec<&String> = config.provider.keys().collect();
     provider_names.sort();
+    let fallback_chains = config
+        .provider
+        .iter()
+        .map(|(provider_name, provider_config)| {
+            (provider_name.clone(), provider_config.fallback.clone())
+        })
+        .collect();
+    registry.set_fallback_chains(fallback_chains);
 
     for provider_name in provider_names {
         let Some(provider_config) = config.provider.get(provider_name) else {
@@ -904,6 +913,7 @@ mod credential_tests {
                 api_key: Some(SecretString::from(key.to_string())),
                 base_url: None,
                 default_model: None,
+                fallback: Vec::new(),
             },
         );
         FlokConfig { provider: provider_map, ..Default::default() }
@@ -958,6 +968,7 @@ mod credential_tests {
                 api_key: Some(SecretString::from("sk-ant".to_string())),
                 base_url: None,
                 default_model: Some("opus-4.7".into()),
+                fallback: Vec::new(),
             },
         );
         provider.insert(
@@ -966,11 +977,17 @@ mod credential_tests {
                 api_key: Some(SecretString::from("sk-openai".to_string())),
                 base_url: None,
                 default_model: Some("gpt-5.4".into()),
+                fallback: Vec::new(),
             },
         );
         provider.insert(
             "minimax".to_string(),
-            ProviderConfig { api_key: None, base_url: None, default_model: Some("minimax".into()) },
+            ProviderConfig {
+                api_key: None,
+                base_url: None,
+                default_model: Some("minimax".into()),
+                fallback: Vec::new(),
+            },
         );
 
         let config = FlokConfig { provider, ..Default::default() };

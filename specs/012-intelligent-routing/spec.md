@@ -2,7 +2,9 @@
 
 **Feature Branch**: `012-intelligent-routing`
 **Created**: 2026-03-28
-**Status**: Draft
+**Status**: Accepted
+
+Accepted 2026-04-19: Tier 1 scope locked — provider-level fallback chains + runtime error-driven failover. Tier 2+ explicitly deferred.
 
 ## User Scenarios & Testing
 
@@ -42,6 +44,51 @@
 - All providers down: queue requests, retry with exponential backoff, surface clear error after timeout
 - Very long prompt (>100K tokens): only models with sufficient context window are eligible
 - Model pricing not configured: use zero cost (don't break routing, just skip cost tracking)
+
+## Tier 1 Scope (This Sprint)
+
+**Goal**: When a provider errors on a retriable HTTP status, automatically fail over to a configured fallback provider without user intervention. Deliver provider-level fallback chains (not per-agent).
+
+### Config additions to `flok.toml`
+
+```toml
+# Global fallback policy (new top-level section)
+[runtime_fallback]
+enabled = true
+retry_on_errors = [429, 500, 502, 503, 529]  # Anthropic uses 529 for overloaded
+max_attempts = 3           # total retry budget across chain
+cooldown_seconds = 120     # per-provider cooldown after failure
+notify_on_fallback = true  # emit UI bus event on each failover
+
+# Per-provider fallback chain (new field on existing ProviderConfig)
+[provider.anthropic]
+api_key = "..."
+default_model = "opus-4.7"
+fallback = ["openai", "minimax"]  # NEW — ordered list of provider names
+
+[provider.openai]
+api_key = "..."
+default_model = "gpt-5.4"
+fallback = ["anthropic"]
+```
+
+### Runtime behavior
+
+- `ProviderRegistry::stream_with_fallback(provider_name, request)` wraps `provider.stream()`:
+  1. Attempt `provider.stream(request)`
+  2. On error OR HTTP status in `retry_on_errors`:
+     - Mark provider in cooldown (in-memory `HashMap<String, Instant>`)
+     - Pop next provider from chain (skip any in cooldown)
+     - If next is None OR `max_attempts` exceeded → surface error with list of tried providers
+     - Else: construct new request using next provider's `default_model`, emit `BusEvent::ProviderFallback`, retry
+- When a provider is in cooldown, `ProviderRegistry::get()` skips it in lookups during the retry chain (not for direct user requests)
+- Cooldown is checked at each fallback attempt; expires naturally after `cooldown_seconds`
+
+### Scope of integration
+
+- Main session engine `prompt_loop` uses fallback for primary provider streams
+- `task` tool's `stream_with_retry` uses fallback for sub-agent streams
+- BOTH surface `ProviderFallback` events to the bus for UI toast
 
 ## Requirements
 
@@ -112,6 +159,14 @@
 - **FR-012**: Automatic routing MUST be opt-in via `routing.auto = true` (default `false`). When `routing.auto = false`, the user's explicitly selected model (or the tier's configured model) is used for all requests without complexity scoring. This is the v1.0 starting point; the `ComplexityScorer` is layered on top.
 - **FR-013**: Flok MUST support auto-upgrade on failure: if a lower-tier model produces repeated failures (3+ consecutive tool errors or doom loop detection), automatically retry the request with the next tier up. Configurable via `routing.auto_upgrade_on_failure = true` (default `true`).
 - **FR-014**: Routing decisions MUST be visible in the TUI status bar: show the current model name and routing tier. Full routing reason is logged at debug level.
+
+- **FR-015**: Config MUST support `[runtime_fallback]` section with `enabled`, `retry_on_errors`, `max_attempts`, `cooldown_seconds`, and `notify_on_fallback` fields.
+- **FR-016**: `ProviderConfig` MUST support an optional `fallback` field — ordered list of provider names.
+- **FR-017**: When a provider stream fails with a status in `retry_on_errors`, the runtime MUST attempt the next provider in the chain (skipping cooldowns) up to `max_attempts` total attempts.
+- **FR-018**: Each fallback attempt MUST emit `BusEvent::ProviderFallback { session_id, from, to, reason }` when `notify_on_fallback` is true.
+- **FR-019**: Cooldown tracking MUST be in-memory (not persisted); providers in cooldown MUST be skipped during fallback selection.
+- **FR-020**: When all providers in a chain have failed or are in cooldown, the runtime MUST surface a structured error listing each attempted provider and its failure reason.
+- **FR-021**: The fallback logic MUST work for both lead-session streams and sub-agent (`task` tool) streams.
 
 - **FR-011**: Default routing MUST be inferred from available providers when no explicit config exists:
   - If only Anthropic is available: Haiku → explore, Sonnet → build, Opus → plan
@@ -385,6 +440,16 @@ fn categorize_model(model_id: &str) -> ModelCategory {
 4. **Learning-based routing (train on past sessions)**: Deferred. Interesting for post-1.0, but adds complexity. Static heuristics are a better starting point.
 5. **Per-tool routing (different model for each tool call)**: Rejected. Too granular. The three-tier system is sufficient and simpler.
 
+## Future Work (Tier 2+)
+
+- **Tier 2**: Per-agent fallback chains (`[agents.oracle] model = "gpt-5.4", fallback = [...]`). Currently Tier 1 is provider-level; per-agent is richer but requires config schema for `[agents.X]` which doesn't yet exist in flok.
+- **Tier 2**: Per-agent `prompt_append` for custom system-prompt extensions via config.
+- **Tier 3**: Categories (visual-engineering, ultrabrain, quick, etc.) as a delegation abstraction above `subagent_type`.
+- **Tier 3**: Model variants (`xhigh`/`high`/`medium`/`low`) mapping to extended-thinking or reasoning_effort.
+- **Tier 3**: Per-model concurrency limits (beyond per-provider).
+- **Tier 3**: Content-complexity-based routing (cheap model for simple tasks, expensive for hard).
+- **Out-of-scope always**: Persistent cooldown state across restarts (ephemeral is fine).
+
 ## Success Criteria
 
 - **SC-001**: Routing decision latency < 1ms (no LLM call, pure heuristics)
@@ -392,6 +457,11 @@ fn categorize_model(model_id: &str) -> ModelCategory {
 - **SC-003**: Fallback from rate-limited model to backup completes in < 500ms
 - **SC-004**: Complexity scoring accuracy > 80% (manual evaluation on test corpus)
 - **SC-005**: Zero routing-related conversation quality degradation for standard tasks
+
+- **SC-006**: Given a configured `fallback = ["openai"]` on provider.anthropic, when Anthropic returns HTTP 529, the request completes successfully via OpenAI within 10 seconds (single retry latency).
+- **SC-007**: When all providers in a chain fail, the user sees a clear error identifying which providers were tried and why each failed.
+- **SC-008**: A provider in cooldown for 120s is not retried within that window even if another failure occurs.
+- **SC-009**: `BusEvent::ProviderFallback` is emitted exactly once per successful failover.
 
 ## Assumptions
 
@@ -405,5 +475,5 @@ fn categorize_model(model_id: &str) -> ModelCategory {
 - ~~Should we support auto-upgrade on failure (if cheap model produces poor output, retry with better model)?~~ **Decision: Yes.** If a cheap model produces poor output (repeated tool errors, doom loop detection), automatically retry with the next tier up. Add an `auto_upgrade_on_failure` flag (default `true`).
 - ~~Should routing decisions be visible in the TUI (which model was selected and why)?~~ **Decision: Yes.** Show the selected model and routing tier in the TUI status bar. Log the full routing reason at debug level. The user should always know which model is being used.
 - ~~Should we add a `routing.auto = false` config to disable automatic routing entirely?~~ **Decision: Yes. Start here.** The v1.0 initial implementation should ship with `routing.auto = false` as the default — users explicitly pick a model (or configure tiers manually). Automatic complexity-based routing is built on top of this foundation and enabled via `routing.auto = true`. This means the `ModelRouter` and tier config are implemented first as explicit/manual routing, and the `ComplexityScorer` heuristics are layered in as a follow-up.
-- Should cost budget be per-session, per-day, or configurable?
-- How should routing interact with prompt caching? (switching models invalidates cache)
+- ~~Should cost budget be per-session, per-day, or configurable?~~ **Decision: Per-session for Tier 1.** Per-day/configurable deferred to Tier 2.
+- ~~How should routing interact with prompt caching? (switching models invalidates cache)~~ **Decision: Switching models invalidates the cache.** This is an acceptable trade-off for reliability in Tier 1.

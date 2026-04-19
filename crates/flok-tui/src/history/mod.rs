@@ -37,6 +37,7 @@ pub(crate) enum HistoryItem {
     System { text: String, level: SystemLevel },
     ToolCall { name: String, preview: String, is_error: bool, duration_ms: Option<u64> },
     TeamEvent { kind: TeamEventKind, agent: String, detail: String },
+    ProviderFallback { from: String, to: String, reason: String },
     Divider,
 }
 
@@ -59,6 +60,14 @@ impl HistoryItem {
 
     pub(crate) fn system_error(text: impl Into<String>) -> Self {
         Self::System { text: text.into(), level: SystemLevel::Error }
+    }
+
+    pub(crate) fn provider_fallback(
+        from: impl Into<String>,
+        to: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self::ProviderFallback { from: from.into(), to: to.into(), reason: reason.into() }
     }
 
     #[expect(dead_code, reason = "reserved transcript separator for later UX polish")]
@@ -129,6 +138,14 @@ mod tests {
             HistoryItem::System { text, level } => {
                 assert_eq!(text, "boom");
                 assert_eq!(level, SystemLevel::Error);
+            }
+            _ => panic!("wrong variant"),
+        }
+        match HistoryItem::provider_fallback("anthropic", "openai", "HTTP 529") {
+            HistoryItem::ProviderFallback { from, to, reason } => {
+                assert_eq!(from, "anthropic");
+                assert_eq!(to, "openai");
+                assert_eq!(reason, "HTTP 529");
             }
             _ => panic!("wrong variant"),
         }

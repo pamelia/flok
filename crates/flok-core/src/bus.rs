@@ -95,6 +95,14 @@ pub enum BusEvent {
     /// A team member failed.
     TeamMemberFailed { session_id: String, team_id: String, agent_name: String, error: String },
 
+    /// Runtime provider fallback switched providers after a retriable failure.
+    ProviderFallback {
+        session_id: String,
+        from_provider: String,
+        to_provider: String,
+        reason: String,
+    },
+
     /// A session was branched (new session created from a branch point).
     SessionBranched { parent_session_id: String, new_session_id: String, from_message_id: String },
 

@@ -10,7 +10,6 @@
 use std::fmt::Write;
 use std::sync::Arc;
 
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
@@ -1425,119 +1424,104 @@ impl SessionEngine {
         &self,
         request: CompletionRequest,
     ) -> anyhow::Result<(String, String, Vec<ToolCall>)> {
-        let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
+        let initial_provider = ModelRegistry::provider_name(&request.model).to_string();
+        let initial_model = request.model.clone();
+        let mut partial_text = String::new();
+        let mut partial_reasoning = String::new();
+        let bus = self.state.bus.clone();
+        let session_id = self.session_id.clone();
+        let cost_tracker = &self.state.cost_tracker;
 
-        // Only move the provider Arc into the spawn (Db is !Send).
-        // Keep the JoinHandle so we can abort on cancellation.
-        let provider = Arc::clone(&self.state.provider);
-        let provider_handle = tokio::spawn(async move {
-            if let Err(e) = provider.stream(request, tx).await {
-                tracing::error!("Provider stream error: {e}");
-            }
-        });
-
-        let mut text = String::new();
-        let mut reasoning = String::new();
-        let mut tool_calls: Vec<ToolCall> = Vec::new();
-        let stream_timeout = std::time::Duration::from_secs(60);
-
-        loop {
-            tokio::select! {
-                biased;
-
-                // Cancellation takes priority
-                () = self.cancel_token.cancelled() => {
-                    provider_handle.abort();
-                    tracing::info!("stream cancelled by user");
-                    return Err(CancelledError {
-                        partial_text: text,
-                        partial_reasoning: reasoning,
-                    }.into());
-                }
-
-                result = tokio::time::timeout(stream_timeout, rx.recv()) => {
-                    let event = match result {
-                        Ok(Some(event)) => event,
-                        Ok(None) => break, // Channel closed
-                        Err(_) => {
-                            // 60s with no event — stream is hung
-                            tracing::warn!("stream timeout: no event for 60s, aborting");
-                            provider_handle.abort();
-                            return Err(anyhow::anyhow!(
-                                "Stream timeout: no response from provider for 60 seconds. \
-                                 The model may be overloaded. Try again."
-                            ));
+        let result = self
+            .state
+            .provider_registry
+            .stream_with_fallback_internal(
+                crate::provider::registry::FallbackStreamContext {
+                    initial_provider: &initial_provider,
+                    initial_model: &initial_model,
+                    bus: &bus,
+                    session_id: &session_id,
+                    cancel_token: Some(&self.cancel_token),
+                },
+                request,
+                |event, _completion| match event {
+                    StreamEvent::TextDelta(delta) => {
+                        if !delta.is_empty() {
+                            partial_text.push_str(delta);
+                            bus.send(BusEvent::TextDelta {
+                                session_id: session_id.clone(),
+                                message_id: String::new(),
+                                delta: delta.clone(),
+                            });
                         }
-                    };
-                    match event {
-                        StreamEvent::TextDelta(delta) => {
-                            if !delta.is_empty() {
-                                text.push_str(&delta);
-                                self.state.bus.send(BusEvent::TextDelta {
-                                    session_id: self.session_id.clone(),
-                                    message_id: String::new(),
-                                    delta,
-                                });
-                            }
+                    }
+                    StreamEvent::ReasoningDelta(delta) => {
+                        if !delta.is_empty() {
+                            partial_reasoning.push_str(delta);
+                            bus.send(BusEvent::ReasoningDelta {
+                                session_id: session_id.clone(),
+                                delta: delta.clone(),
+                            });
                         }
-                        StreamEvent::ReasoningDelta(delta) => {
-                            if !delta.is_empty() {
-                                reasoning.push_str(&delta);
-                                self.state.bus.send(BusEvent::ReasoningDelta {
-                                    session_id: self.session_id.clone(),
-                                    delta,
-                                });
-                            }
-                        }
-                        StreamEvent::ToolCallStart { index, id, name } => {
-                            while tool_calls.len() <= index {
-                                tool_calls.push(ToolCall::default());
-                            }
-                            tool_calls[index].id = id;
-                            tool_calls[index].name = name;
-                        }
-                        StreamEvent::ToolCallDelta { index, delta } => {
-                            if let Some(tc) = tool_calls.get_mut(index) {
-                                tc.arguments.push_str(&delta);
-                            }
-                        }
-                        StreamEvent::Usage {
+                    }
+                    StreamEvent::Usage {
+                        input_tokens,
+                        output_tokens,
+                        cache_read_tokens,
+                        cache_creation_tokens,
+                    } => {
+                        tracing::debug!(
                             input_tokens,
                             output_tokens,
                             cache_read_tokens,
-                            cache_creation_tokens,
-                        } => {
-                            tracing::debug!(input_tokens, output_tokens, cache_read_tokens, "token usage");
-                            self.state.cost_tracker.record(
-                                input_tokens,
-                                output_tokens,
-                                cache_read_tokens,
-                                cache_creation_tokens,
-                            );
-                            self.state.bus.send(BusEvent::TokenUsage {
-                                session_id: self.session_id.clone(),
-                                input_tokens,
-                                output_tokens,
-                            });
-                            self.state.bus.send(BusEvent::CostUpdate {
-                                session_id: self.session_id.clone(),
-                                total_cost_usd: self.state.cost_tracker.estimated_cost_usd(),
-                            });
-                        }
-                        StreamEvent::Done => break,
-                        StreamEvent::Error(e) => {
-                            return Err(anyhow::anyhow!("Provider error: {e}"));
-                        }
+                            "token usage"
+                        );
+                        cost_tracker.record(
+                            *input_tokens,
+                            *output_tokens,
+                            *cache_read_tokens,
+                            *cache_creation_tokens,
+                        );
+                        bus.send(BusEvent::TokenUsage {
+                            session_id: session_id.clone(),
+                            input_tokens: *input_tokens,
+                            output_tokens: *output_tokens,
+                        });
+                        bus.send(BusEvent::CostUpdate {
+                            session_id: session_id.clone(),
+                            total_cost_usd: cost_tracker.estimated_cost_usd(),
+                        });
                     }
-                }
+                    StreamEvent::ToolCallStart { .. }
+                    | StreamEvent::ToolCallDelta { .. }
+                    | StreamEvent::Done
+                    | StreamEvent::Error(_) => {}
+                },
+            )
+            .await;
+
+        match result {
+            Ok(response) => Ok((
+                response.text,
+                response.reasoning,
+                response
+                    .tool_calls
+                    .into_iter()
+                    .map(|tool_call| ToolCall {
+                        id: tool_call.id,
+                        name: tool_call.name,
+                        arguments: tool_call.arguments,
+                    })
+                    .collect(),
+            )),
+            Err(err)
+                if err.downcast_ref::<crate::provider::registry::StreamCancelled>().is_some() =>
+            {
+                tracing::info!("stream cancelled by user");
+                Err(CancelledError { partial_text, partial_reasoning }.into())
             }
+            Err(err) => Err(err),
         }
-
-        // Filter out incomplete tool calls (padding entries from content_block indexing)
-        let tool_calls: Vec<ToolCall> =
-            tool_calls.into_iter().filter(|tc| !tc.id.is_empty() && !tc.name.is_empty()).collect();
-
-        Ok((text, reasoning, tool_calls))
     }
 
     /// Stream a completion with retry on transient errors (429, 529, 500, overloaded).
@@ -1548,64 +1532,7 @@ impl SessionEngine {
         &self,
         request: CompletionRequest,
     ) -> anyhow::Result<(String, String, Vec<ToolCall>)> {
-        let max_retries = 3u32;
-        let mut attempt = 0u32;
-
-        loop {
-            let result = self.stream_completion(request.clone()).await;
-
-            match &result {
-                Ok(_) => return result,
-                Err(e) => {
-                    // Never retry cancellations
-                    if e.downcast_ref::<CancelledError>().is_some() {
-                        return result;
-                    }
-
-                    let err_msg = e.to_string();
-                    let is_retryable = err_msg.contains("429")
-                        || err_msg.contains("529")
-                        || err_msg.contains("500")
-                        || err_msg.contains("overloaded")
-                        || err_msg.contains("rate_limit")
-                        || err_msg.contains("capacity");
-
-                    attempt += 1;
-                    if !is_retryable || attempt > max_retries {
-                        return result;
-                    }
-
-                    // Try to extract retry-after from error message (Anthropic includes it)
-                    let retry_after = extract_retry_after(&err_msg);
-                    let backoff_secs: u64 = 1 << (attempt - 1);
-                    let delay_secs = retry_after.unwrap_or(backoff_secs);
-                    let delay = std::time::Duration::from_secs(delay_secs);
-                    tracing::warn!(
-                        attempt,
-                        max_retries,
-                        delay_secs = delay.as_secs(),
-                        error = %err_msg,
-                        "retrying after transient error"
-                    );
-
-                    let reason = if err_msg.contains("timeout") || err_msg.contains("Timeout") {
-                        "Stream timeout"
-                    } else if err_msg.contains("429") || err_msg.contains("rate_limit") {
-                        "Rate limited"
-                    } else {
-                        "Provider error"
-                    };
-                    self.state.bus.send(BusEvent::Error {
-                        message: format!(
-                            "{reason} — retrying in {}s (attempt {attempt}/{max_retries})",
-                            delay.as_secs()
-                        ),
-                    });
-
-                    tokio::time::sleep(delay).await;
-                }
-            }
-        }
+        self.stream_completion(request).await
     }
 
     /// Execute a batch of tool calls.
@@ -1985,26 +1912,6 @@ fn validate_tool_args(args: &serde_json::Value, schema: &serde_json::Value) -> R
     }
 }
 
-/// Try to extract a retry-after delay from an error message.
-///
-/// Anthropic's rate limit responses include `"retry_after": N` in JSON body.
-/// We parse it from the error string since we don't have the raw response.
-fn extract_retry_after(error_msg: &str) -> Option<u64> {
-    // Look for "retry_after": N or retry-after: N patterns
-    if let Some(pos) = error_msg.find("retry_after") {
-        let rest = &error_msg[pos..];
-        // Find the number after the colon
-        if let Some(colon) = rest.find(':') {
-            let after_colon = rest[colon + 1..].trim_start();
-            let num_str: String = after_colon.chars().take_while(char::is_ascii_digit).collect();
-            if let Ok(secs) = num_str.parse::<u64>() {
-                return Some(secs.min(60)); // Cap at 60s
-            }
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2103,23 +2010,6 @@ mod tests {
         );
 
         SessionEngine::new(state, "mock/test-model".to_string()).expect("create session engine")
-    }
-
-    #[test]
-    fn extract_retry_after_from_anthropic_error() {
-        let msg = r#"HTTP 429: {"type":"error","error":{"type":"rate_limit_error","message":"Rate limited"},"retry_after": 15}"#;
-        assert_eq!(extract_retry_after(msg), Some(15));
-    }
-
-    #[test]
-    fn extract_retry_after_missing() {
-        assert_eq!(extract_retry_after("some random error"), None);
-    }
-
-    #[test]
-    fn extract_retry_after_capped() {
-        let msg = r#""retry_after": 300"#;
-        assert_eq!(extract_retry_after(msg), Some(60)); // Capped
     }
 
     #[tokio::test]

@@ -8,14 +8,11 @@
 
 use std::sync::Arc;
 
-use tokio::sync::mpsc;
-use tokio::sync::Semaphore;
-
 use crate::agent;
 use crate::bus::BusEvent;
 use crate::config::WorktreeConfig;
 use crate::provider::{
-    CompletionRequest, Message, MessageContent, ModelRegistry, ProviderRegistry, StreamEvent,
+    CompletionRequest, Message, MessageContent, ModelRegistry, ProviderRegistry,
 };
 use crate::team::{TeamMessage, TeamRegistry};
 use crate::worktree::WorktreeManager;
@@ -28,9 +25,6 @@ use super::{Tool, ToolContext, ToolOutput};
 /// the same kind of work (LLM calls + tool calls) and need the same
 /// headroom. This is a doom-loop safety valve, not a performance throttle.
 const MAX_SUBAGENT_STEPS: usize = 25;
-
-/// Maximum retry attempts for sub-agent API calls.
-const MAX_SUBAGENT_RETRIES: u32 = 3;
 
 /// Spawn a sub-agent to handle a task.
 pub struct TaskTool {
@@ -281,9 +275,7 @@ impl Tool for TaskTool {
 #[derive(Clone)]
 struct SubagentTarget {
     provider_name: String,
-    provider: Arc<dyn crate::provider::Provider>,
     model_id: String,
-    semaphore: Arc<Semaphore>,
 }
 
 impl TaskTool {
@@ -296,18 +288,15 @@ impl TaskTool {
             self.default_provider.clone()
         };
 
-        let provider = self.provider_registry.get(&provider_name).ok_or_else(|| {
+        self.provider_registry.get(&provider_name).ok_or_else(|| {
             anyhow::anyhow!(
                 "Provider '{provider_name}' is not configured for sub-agent model '{}'. Available providers: {}",
                 model_id,
                 self.provider_registry.describe()
             )
         })?;
-        let semaphore = self.provider_registry.semaphore(&provider_name).ok_or_else(|| {
-            anyhow::anyhow!("Provider '{provider_name}' is missing a concurrency semaphore")
-        })?;
 
-        Ok(SubagentTarget { provider_name, provider, model_id, semaphore })
+        Ok(SubagentTarget { provider_name, model_id })
     }
 
     /// Execute a background sub-agent that runs asynchronously and reports
@@ -355,10 +344,9 @@ impl TaskTool {
         );
 
         // Clone everything needed for the spawned task
-        let provider = Arc::clone(&target.provider);
+        let provider_registry = Arc::clone(&self.provider_registry);
         let provider_name = target.provider_name.clone();
         let model_id = target.model_id.clone();
-        let semaphore = Arc::clone(&target.semaphore);
         let tools = Arc::clone(&self.tools);
         let bus = self.bus.clone();
         let session_id = ctx.session_id.clone();
@@ -388,10 +376,11 @@ impl TaskTool {
             });
 
             let result = run_subagent_standalone(
-                provider,
+                provider_registry,
+                &provider_name,
                 &model_id,
-                semaphore,
                 tools,
+                bus.clone(),
                 &system,
                 &prompt,
                 &session_id,
@@ -514,10 +503,15 @@ impl TaskTool {
                 max_tokens: 8192,
             };
 
-            // Use retry + concurrency-limited streaming
-            let (text, tool_calls) =
-                stream_with_retry(&target.provider, request, description, &target.semaphore)
-                    .await?;
+            // Use fallback-aware concurrency-limited streaming.
+            let (text, tool_calls) = stream_with_retry(
+                &self.provider_registry,
+                &target.provider_name,
+                request,
+                &self.bus,
+                &sub_ctx.session_id,
+            )
+            .await?;
 
             // Store the assistant message
             let mut parts: Vec<MessageContent> = Vec::new();
@@ -578,132 +572,40 @@ struct SubToolCall {
     arguments: String,
 }
 
-/// Stream a completion with retry and backoff for sub-agents.
-///
-/// Acquires the provider-local concurrency semaphore before each attempt,
-/// isolating rate limiting between configured providers.
+/// Stream a completion with runtime provider fallback for sub-agents.
 async fn stream_with_retry(
-    provider: &Arc<dyn crate::provider::Provider>,
+    provider_registry: &ProviderRegistry,
+    provider_name: &str,
     request: CompletionRequest,
-    description: &str,
-    semaphore: &Arc<Semaphore>,
+    bus: &crate::bus::Bus,
+    session_id: &str,
 ) -> anyhow::Result<(String, Vec<SubToolCall>)> {
-    let mut last_error = None;
+    let initial_model = request.model.clone();
+    let (text, tool_calls) = provider_registry
+        .stream_with_fallback(provider_name, &initial_model, request, bus, session_id)
+        .await?;
 
-    for attempt in 0..MAX_SUBAGENT_RETRIES {
-        if attempt > 0 {
-            // Exponential backoff: 1s, 2s, 4s
-            let delay = std::time::Duration::from_secs(1 << (attempt - 1));
-            tracing::info!(
-                attempt,
-                delay_secs = delay.as_secs(),
-                description,
-                "sub-agent retrying after backoff"
-            );
-            tokio::time::sleep(delay).await;
-        }
-
-        // Acquire the provider-local concurrency semaphore.
-        let available = semaphore.available_permits();
-        if available == 0 {
-            tracing::debug!(
-                description,
-                attempt,
-                provider = provider.name(),
-                "waiting for provider semaphore (all permits in use)"
-            );
-        }
-        let _permit = semaphore
-            .acquire()
-            .await
-            .map_err(|e| anyhow::anyhow!("provider semaphore closed: {e}"))?;
-        tracing::debug!(
-            description,
-            attempt,
-            provider = provider.name(),
-            "acquired provider semaphore, streaming LLM request"
-        );
-
-        let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
-        let prov = Arc::clone(provider);
-        let req = request.clone();
-        let desc_owned = description.to_string();
-        tokio::spawn(async move {
-            if let Err(e) = prov.stream(req, tx).await {
-                tracing::error!(description = %desc_owned, "sub-agent stream error: {e}");
-            }
-        });
-
-        let mut text = String::new();
-        let mut tool_calls: Vec<SubToolCall> = Vec::new();
-        let timeout_duration = std::time::Duration::from_secs(60);
-        let mut had_error = false;
-
-        loop {
-            let event = match tokio::time::timeout(timeout_duration, rx.recv()).await {
-                Ok(Some(event)) => event,
-                Ok(None) => break,
-                Err(_) => {
-                    last_error = Some(anyhow::anyhow!(
-                        "sub-agent stream timeout (60s, attempt {}/{})",
-                        attempt + 1,
-                        MAX_SUBAGENT_RETRIES
-                    ));
-                    had_error = true;
-                    break;
-                }
-            };
-            match event {
-                StreamEvent::TextDelta(delta) => text.push_str(&delta),
-                StreamEvent::ToolCallStart { index, id, name } => {
-                    while tool_calls.len() <= index {
-                        tool_calls.push(SubToolCall::default());
-                    }
-                    tool_calls[index].id = id;
-                    tool_calls[index].name = name;
-                }
-                StreamEvent::ToolCallDelta { index, delta } => {
-                    if let Some(tc) = tool_calls.get_mut(index) {
-                        tc.arguments.push_str(&delta);
-                    }
-                }
-                StreamEvent::Done => break,
-                StreamEvent::Error(e) => {
-                    last_error = Some(anyhow::anyhow!(
-                        "sub-agent API error (attempt {}/{}): {e}",
-                        attempt + 1,
-                        MAX_SUBAGENT_RETRIES
-                    ));
-                    had_error = true;
-                    break;
-                }
-                _ => {}
-            }
-        }
-
-        if !had_error {
-            // Filter empty tool calls
-            let tool_calls: Vec<_> = tool_calls
-                .into_iter()
-                .filter(|tc| !tc.id.is_empty() && !tc.name.is_empty())
-                .collect();
-            return Ok((text, tool_calls));
-        }
-        // else: retry
-    }
-
-    Err(last_error.unwrap_or_else(|| {
-        anyhow::anyhow!("sub-agent failed after {MAX_SUBAGENT_RETRIES} attempts")
-    }))
+    Ok((
+        text,
+        tool_calls
+            .into_iter()
+            .map(|tool_call| SubToolCall {
+                id: tool_call.id,
+                name: tool_call.name,
+                arguments: tool_call.arguments,
+            })
+            .collect(),
+    ))
 }
 
 /// Standalone sub-agent runner for background tasks (no `&self` needed).
 #[allow(clippy::too_many_arguments)]
 async fn run_subagent_standalone(
-    provider: Arc<dyn crate::provider::Provider>,
+    provider_registry: Arc<ProviderRegistry>,
+    provider_name: &str,
     model_id: &str,
-    semaphore: Arc<Semaphore>,
     tools: Arc<crate::tool::ToolRegistry>,
+    bus: crate::bus::Bus,
     system: &str,
     prompt: &str,
     parent_session_id: &str,
@@ -738,8 +640,14 @@ async fn run_subagent_standalone(
         };
 
         // Use retry + concurrency-limited streaming
-        let (text, tool_calls) =
-            stream_with_retry(&provider, request, description, &semaphore).await?;
+        let (text, tool_calls) = stream_with_retry(
+            &provider_registry,
+            provider_name,
+            request,
+            &bus,
+            &sub_ctx.session_id,
+        )
+        .await?;
 
         let mut parts: Vec<MessageContent> = Vec::new();
         if !text.is_empty() {

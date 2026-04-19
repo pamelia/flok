@@ -19,12 +19,14 @@
 [provider.anthropic]
 # api_key = "sk-ant-..."       # Set via: flok auth login --provider anthropic
 # default_model = "opus-4.7"   # Fallback model when `model` above is unset.
+# fallback = ["openai"]        # Try OpenAI automatically on 429/5xx/529
 
 # OpenAI provider configuration
 [provider.openai]
 # api_key = "sk-..."           # Set via: flok auth login --provider openai
 # base_url = "https://api.openai.com/v1"   # Override for compatible APIs
 # default_model = "gpt-5.4"
+# fallback = ["anthropic"]
 
 # DeepSeek provider configuration (uses OpenAI-compatible API)
 [provider.deepseek]
@@ -36,3 +38,10 @@
 [provider.minimax]
 # api_key = "..."              # Set via: flok auth login --provider minimax
 # default_model = "minimax"
+
+[runtime_fallback]
+# enabled = true
+# retry_on_errors = [429, 500, 502, 503, 529]
+# max_attempts = 3              # Total attempts across primary + fallbacks
+# cooldown_seconds = 120        # Provider-wide cooldown after retriable failure
+# notify_on_fallback = true     # Emit inline fallback notices in the TUI

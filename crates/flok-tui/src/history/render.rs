@@ -79,6 +79,9 @@ fn render_lines(item: &HistoryItem, width: u16, theme: &Theme) -> Vec<Line<'stat
         HistoryItem::TeamEvent { kind, agent, detail } => {
             render_team_event(*kind, agent, detail, theme)
         }
+        HistoryItem::ProviderFallback { from, to, reason } => {
+            render_provider_fallback(from, to, reason, width, theme)
+        }
         HistoryItem::Divider => render_divider(width, theme),
     }
 }
@@ -210,6 +213,19 @@ fn render_team_event(
         Span::styled(format!("{icon} "), color_style(color)),
         Span::styled(format!("{agent}: {detail}"), text_style(theme)),
     ])]
+}
+
+fn render_provider_fallback(
+    from: &str,
+    to: &str,
+    reason: &str,
+    width: u16,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    wrap_text(&format!("[fallback: {from} → {to} ({reason})]"), width.saturating_sub(2).max(1))
+        .into_iter()
+        .map(|segment| styled_line(segment, dim_style(theme)))
+        .collect()
 }
 
 fn render_divider(width: u16, theme: &Theme) -> Vec<Line<'static>> {

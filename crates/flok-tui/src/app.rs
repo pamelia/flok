@@ -394,6 +394,21 @@ impl App {
                     self.maintain_chat_drag_lock();
                     self.dirty = true;
                 }
+                flok_core::bus::BusEvent::ProviderFallback {
+                    from_provider,
+                    to_provider,
+                    reason,
+                    ..
+                } => {
+                    self.history.push(HistoryItem::provider_fallback(
+                        from_provider,
+                        to_provider,
+                        reason,
+                    ));
+                    self.chat_view.on_new_content();
+                    self.maintain_chat_drag_lock();
+                    self.dirty = true;
+                }
                 other => {
                     tracing::debug!(event = ?other, "ignoring unsupported bus event in MVP");
                 }

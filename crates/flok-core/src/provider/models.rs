@@ -449,7 +449,12 @@ mod tests {
         let mut provider = HashMap::new();
         provider.insert(
             "zeta-provider".to_string(),
-            ProviderConfig { api_key: None, base_url: None, default_model: Some("sonnet".into()) },
+            ProviderConfig {
+                api_key: None,
+                base_url: None,
+                default_model: Some("sonnet".into()),
+                fallback: Vec::new(),
+            },
         );
         provider.insert(
             "anthropic".to_string(),
@@ -457,6 +462,7 @@ mod tests {
                 api_key: None,
                 base_url: None,
                 default_model: Some("opus-4.7".into()),
+                fallback: Vec::new(),
             },
         );
         let config = FlokConfig { provider, ..Default::default() };
@@ -476,11 +482,21 @@ mod tests {
         let mut provider = HashMap::new();
         provider.insert(
             "anthropic".to_string(),
-            ProviderConfig { api_key: None, base_url: None, default_model: None },
+            ProviderConfig {
+                api_key: None,
+                base_url: None,
+                default_model: None,
+                fallback: Vec::new(),
+            },
         );
         provider.insert(
             "openai".to_string(),
-            ProviderConfig { api_key: None, base_url: None, default_model: Some("gpt-5.4".into()) },
+            ProviderConfig {
+                api_key: None,
+                base_url: None,
+                default_model: Some("gpt-5.4".into()),
+                fallback: Vec::new(),
+            },
         );
         let config = FlokConfig { provider, ..Default::default() };
         // "anthropic" comes first alphabetically but has no default_model, so the

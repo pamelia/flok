@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use secrecy::{ExposeSecret, SecretString};
 use tracing_subscriber::{fmt, EnvFilter};
 
 use flok_core::bus::Bus;
@@ -597,16 +598,16 @@ fn create_provider(
 
     match provider_name {
         "anthropic" => {
-            let api_key = resolve_api_key("ANTHROPIC_API_KEY", "anthropic", config)?;
+            let api_key = resolve_api_key("anthropic", config)?;
             Ok(Arc::new(AnthropicProvider::new(api_key, None)))
         }
         "openai" => {
-            let api_key = resolve_api_key("OPENAI_API_KEY", "openai", config)?;
+            let api_key = resolve_api_key("openai", config)?;
             let base_url = config.provider.get("openai").and_then(|c| c.base_url.clone());
             Ok(Arc::new(flok_core::provider::OpenAiProvider::new(api_key, base_url)))
         }
         "deepseek" => {
-            let api_key = resolve_api_key("DEEPSEEK_API_KEY", "deepseek", config)?;
+            let api_key = resolve_api_key("deepseek", config)?;
             let base_url = config
                 .provider
                 .get("deepseek")
@@ -615,7 +616,7 @@ fn create_provider(
             Ok(Arc::new(flok_core::provider::OpenAiProvider::new(api_key, base_url)))
         }
         "minimax" => {
-            let api_key = resolve_api_key("MINIMAX_API_KEY", "minimax", config)?;
+            let api_key = resolve_api_key("minimax", config)?;
             Ok(Arc::new(MiniMaxProvider::new(api_key, None)))
         }
         "google" => Err(anyhow::anyhow!(
@@ -628,32 +629,39 @@ fn create_provider(
     }
 }
 
-/// Resolve an API key from the environment or config.
+/// Resolve an API key from the config file.
+///
+/// Runtime credentials are read ONLY from the config file — env vars are NOT
+/// consulted (per project policy; see AGENTS.md §0.3 and the docs).
 fn resolve_api_key(
-    env_var: &str,
     config_key: &str,
     config: &flok_core::config::FlokConfig,
-) -> Result<String> {
-    // 1. Environment variable
-    if let Ok(key) = std::env::var(env_var) {
-        if !key.is_empty() {
-            return Ok(key);
-        }
+) -> Result<SecretString> {
+    let provider_config = config.provider.get(config_key).ok_or_else(|| {
+        anyhow::anyhow!(
+            "No API key found for {config_key}. \
+             Run `flok auth login --provider {config_key}` or add \
+             `[provider.{config_key}]` `api_key` to ~/.config/flok/flok.toml"
+        )
+    })?;
+
+    let api_key = provider_config.api_key.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "No API key found for {config_key}. \
+             Run `flok auth login --provider {config_key}` or add \
+             `[provider.{config_key}]` `api_key` to ~/.config/flok/flok.toml"
+        )
+    })?;
+
+    if api_key.expose_secret().is_empty() {
+        anyhow::bail!(
+            "Empty API key for {config_key}. \
+             Run `flok auth login --provider {config_key}` or set a non-empty \
+             `api_key` in ~/.config/flok/flok.toml"
+        );
     }
 
-    // 2. Config file
-    if let Some(provider_config) = config.provider.get(config_key) {
-        if let Some(key) = &provider_config.api_key {
-            if !key.is_empty() {
-                return Ok(key.clone());
-            }
-        }
-    }
-
-    Err(anyhow::anyhow!(
-        "No API key found for {config_key}. Set {env_var} environment variable \
-         or add [provider.{config_key}] api_key to flok.toml"
-    ))
+    Ok(api_key.clone())
 }
 
 /// Get the flok data directory.
@@ -752,6 +760,8 @@ fn run_auth_login(provider_arg: Option<&String>) -> Result<()> {
         anyhow::bail!("API key cannot be empty");
     }
 
+    let secret = SecretString::from(api_key);
+
     let config_path = {
         let dirs = directories::BaseDirs::new().context("cannot determine home directory")?;
         dirs.config_dir().join("flok").join("flok.toml")
@@ -766,21 +776,31 @@ fn run_auth_login(provider_arg: Option<&String>) -> Result<()> {
 
     config.provider.insert(
         provider_meta.name.to_string(),
-        flok_core::config::ProviderConfig { api_key: Some(api_key), base_url: None },
+        flok_core::config::ProviderConfig { api_key: Some(secret), base_url: None },
     );
 
-    if let Some(parent) = config_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let content = toml::to_string_pretty(&config)?;
-    std::fs::write(&config_path, content)?;
+    write_auth_config(&config_path, &config)?;
 
     #[allow(clippy::print_stdout)]
     {
         println!("✓ Saved {} API key to {}", provider_meta.display_name, config_path.display());
     }
 
+    Ok(())
+}
+
+/// Write a `FlokConfig` to `path`, creating parent dirs, then (on Unix) chmod 0600.
+fn write_auth_config(path: &std::path::Path, config: &flok_core::config::FlokConfig) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let content = toml::to_string_pretty(config)?;
+    std::fs::write(path, content)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
     Ok(())
 }
 
@@ -820,4 +840,73 @@ fn run_sessions(db: &flok_db::Db, _project_filter: Option<&str>, limit: usize) -
         println!("\nResume a session: flok --resume <ID>");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod credential_tests {
+    use super::*;
+    use flok_core::config::{FlokConfig, ProviderConfig};
+    use secrecy::{ExposeSecret, SecretString};
+    use std::collections::HashMap;
+
+    fn config_with_key(provider: &str, key: &str) -> FlokConfig {
+        let mut provider_map = HashMap::new();
+        provider_map.insert(
+            provider.to_string(),
+            ProviderConfig { api_key: Some(SecretString::from(key.to_string())), base_url: None },
+        );
+        FlokConfig { provider: provider_map, ..Default::default() }
+    }
+
+    #[test]
+    fn resolve_api_key_reads_from_config() {
+        let config = config_with_key("anthropic", "sk-test-ok");
+        let key = resolve_api_key("anthropic", &config).expect("resolved");
+        assert_eq!(key.expose_secret(), "sk-test-ok");
+    }
+
+    #[test]
+    fn resolve_api_key_errors_when_missing() {
+        let config = FlokConfig::default();
+        let err = resolve_api_key("anthropic", &config).expect_err("expected error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("flok auth login --provider"),
+            "error should direct user to flok auth login, got: {msg}"
+        );
+        assert!(
+            !msg.to_lowercase().contains("environment variable")
+                && !msg.to_lowercase().contains("env var")
+                && !msg.contains("ANTHROPIC_API_KEY")
+                && !msg.contains("OPENAI_API_KEY"),
+            "error should not mention env vars, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_api_key_errors_when_key_empty() {
+        let config = config_with_key("anthropic", "");
+        let err = resolve_api_key("anthropic", &config).expect_err("expected error for empty key");
+        assert!(err.to_string().contains("Empty API key"));
+    }
+
+    #[test]
+    fn secret_string_debug_is_redacted() {
+        let s = SecretString::from("plain-text-xyz".to_string());
+        let rendered = format!("{s:?}");
+        assert!(!rendered.contains("plain-text-xyz"), "Debug leaked plaintext: {rendered}");
+        assert!(rendered.contains("REDACTED"), "Debug missing REDACTED marker: {rendered}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_auth_login_sets_0600_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("flok").join("flok.toml");
+        let config = config_with_key("anthropic", "sk-permtest");
+        write_auth_config(&path, &config).expect("write");
+        let mode = std::fs::metadata(&path).expect("metadata").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "expected 0600, got {mode:o}");
+    }
 }

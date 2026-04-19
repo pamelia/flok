@@ -6,6 +6,7 @@
 
 use futures::StreamExt;
 use reqwest_eventsource::{Event, EventSource};
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
@@ -16,14 +17,14 @@ const DEFAULT_BASE_URL: &str = "https://api.minimax.io/anthropic";
 
 /// `MiniMax` provider using the Anthropic-compatible API.
 pub struct MiniMaxProvider {
-    api_key: String,
+    api_key: SecretString,
     base_url: String,
     client: reqwest::Client,
 }
 
 impl MiniMaxProvider {
     /// Create a new `MiniMax` provider.
-    pub fn new(api_key: String, base_url: Option<String>) -> Self {
+    pub fn new(api_key: SecretString, base_url: Option<String>) -> Self {
         Self {
             api_key,
             base_url: base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
@@ -147,7 +148,7 @@ impl Provider for MiniMaxProvider {
         let req = self
             .client
             .post(&url)
-            .header("x-api-key", &self.api_key)
+            .header("x-api-key", self.api_key.expose_secret())
             .header("anthropic-version", "2023-06-01")
             .header("anthropic-beta", "prompt-caching-2024-07-31")
             .header("content-type", "application/json")
@@ -475,7 +476,7 @@ mod tests {
 
     #[test]
     fn build_request_body_serializes() {
-        let _provider = MiniMaxProvider::new("test-key".into(), None);
+        let _provider = MiniMaxProvider::new(SecretString::from("test-key".to_string()), None);
         let request = CompletionRequest {
             model: "minimax/MiniMax-M2.7".into(),
             system: "You are a helpful assistant.".into(),

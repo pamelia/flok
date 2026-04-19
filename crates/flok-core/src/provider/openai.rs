@@ -4,6 +4,7 @@
 
 use futures::StreamExt;
 use reqwest_eventsource::{Event, EventSource};
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
@@ -14,14 +15,14 @@ const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 
 /// OpenAI-compatible provider.
 pub struct OpenAiProvider {
-    api_key: String,
+    api_key: SecretString,
     base_url: String,
     client: reqwest::Client,
 }
 
 impl OpenAiProvider {
     /// Create a new `OpenAI` provider.
-    pub fn new(api_key: String, base_url: Option<String>) -> Self {
+    pub fn new(api_key: SecretString, base_url: Option<String>) -> Self {
         Self {
             api_key,
             base_url: base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
@@ -161,7 +162,7 @@ impl Provider for OpenAiProvider {
         let req = self
             .client
             .post(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Authorization", format!("Bearer {}", self.api_key.expose_secret()))
             .header("content-type", "application/json")
             .json(&body);
 
@@ -365,6 +366,13 @@ struct ChunkUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_constructs_with_secret_string() {
+        use secrecy::SecretString;
+
+        let _ = OpenAiProvider::new(SecretString::from("test-key".to_string()), None);
+    }
 
     #[test]
     fn parse_text_delta_chunk() {

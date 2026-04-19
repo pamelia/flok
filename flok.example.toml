@@ -1,21 +1,29 @@
 # flok configuration
-# Copy this file to flok.toml and edit as needed.
-# Environment variables take precedence over config file values.
+#
+# Copy this file to ~/.config/flok/flok.toml (or project-local flok.toml or
+# .flok/flok.toml) and edit as needed.
+#
+# API keys are read ONLY from this file at runtime — environment variables
+# are NOT consulted. Set a key interactively via:
+#
+#     flok auth login --provider <anthropic|openai|deepseek|minimax>
+#
+# The CLI writes ~/.config/flok/flok.toml with mode 0600 on Unix.
 
 # Anthropic provider configuration
 [provider.anthropic]
-# api_key = "sk-ant-..."   # Or set ANTHROPIC_API_KEY env var
+# api_key = "sk-ant-..."   # Set via: flok auth login --provider anthropic
 
 # OpenAI provider configuration
 [provider.openai]
-# api_key = "sk-..."       # Or set OPENAI_API_KEY env var
+# api_key = "sk-..."       # Set via: flok auth login --provider openai
 # base_url = "https://api.openai.com/v1"   # Override for compatible APIs
 
 # DeepSeek provider configuration (uses OpenAI-compatible API)
 [provider.deepseek]
-# api_key = "sk-..."       # Or set DEEPSEEK_API_KEY env var
+# api_key = "sk-..."       # Set via: flok auth login --provider deepseek
 # base_url = "https://api.deepseek.com/v1"
 
 # MiniMax provider configuration (uses Anthropic-compatible API)
 [provider.minimax]
-# api_key = "..."          # Or set MINIMAX_API_KEY env var
+# api_key = "..."          # Set via: flok auth login --provider minimax

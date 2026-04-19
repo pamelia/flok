@@ -1,8 +1,11 @@
 # Spec 015 — Token Compression Engine
 
-**Status:** Draft
+**Status:** Accepted
 **Priority:** P0 — Critical path for cost/quality
 **Depends on:** 003 (Session Engine), 004 (Tool System), 006 (Token Cache)
+
+> **Accepted note (2026-04-19):** MVP (shell output 4-stage pipeline) shipped 2026-04-19.
+> Conversation history compression remains Future Work.
 
 ## Summary
 
@@ -85,7 +88,7 @@ Each stage: `fn compress(input: &str, ctx: &CmdContext) -> String`
 - Decorative separators (`---`, `===`, `***` full-width lines)
 - Build tool boilerplate headers/footers
 
-**Stage 2 — Group (lossy, configurable)** — *Deferred to v2*
+**Stage 2 — Group (lossy, configurable)**
 
 **Stage 3 — Truncate (lossy, configurable)**
 - Head/tail mode: first N + last M lines with `... (X lines omitted)` marker
@@ -107,6 +110,32 @@ Priority filters (v1):
 | `git log` | Already handled by git itself |
 | `cargo build` / `npm run build` | Errors + warnings only |
 
+### Functional Requirements (shipped MVP)
+
+- **FR-001:** `bash` tool output MUST pass through a 4-stage compression pipeline
+  (filter, group, truncate, deduplicate) before being embedded in the tool result.
+- **FR-002:** Output ≤ `passthrough_threshold_lines` MUST be emitted unchanged
+  (no headers, no markers).
+- **FR-003:** Grouping MUST collapse exact-match runs of ≥ `group_exact_min` into
+  `<line>\n... (× N times)\n`.
+- **FR-004:** Truncation MUST preserve `head_lines` at the start and `tail_lines`
+  at the end, replacing the middle with
+  `... [N lines elided by compression] ...`.
+- **FR-005:** A final character budget MUST cap total output at `max_chars` with
+  head+tail preservation.
+- **FR-006:** When compression is applied, the tool result MUST include a header
+  line naming the stages that fired (telemetry).
+- **FR-007:** Compression MUST be disableable via `enabled = false` in the
+  `[output_compression]` config section.
+
+### Success Criteria (shipped MVP)
+
+- **SC-001:** A 1000-line repetitive bash output compresses to < 10% of original
+  line count.
+- **SC-002:** A 20-line bash output is emitted byte-for-byte identical to the raw
+  output.
+- **SC-003:** ANSI escape sequences are stripped from output sent to the LLM.
+
 ### Configuration
 
 ```toml
@@ -117,7 +146,7 @@ max_output_tokens = 4096
 
 ---
 
-## Layer 2: Conversation History Compression
+## Layer 2: Conversation History Compression *(Future Work)*
 
 Applied to `tool_result` blocks in the message array before sending to the LLM provider.
 

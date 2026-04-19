@@ -276,6 +276,7 @@ async fn fallback_in_task_tool_sub_agent() {
                 agent: "lead".to_string(),
                 cancel: tokio_util::sync::CancellationToken::new(),
                 lsp: None,
+                output_compression: flok_core::config::OutputCompressionConfig::default(),
             },
         )
         .await

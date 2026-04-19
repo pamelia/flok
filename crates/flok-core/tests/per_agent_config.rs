@@ -95,6 +95,7 @@ fn test_context(project_root: PathBuf) -> ToolContext {
         agent: "lead".to_string(),
         cancel: tokio_util::sync::CancellationToken::new(),
         lsp: None,
+        output_compression: flok_core::config::OutputCompressionConfig::default(),
     }
 }
 

@@ -3,6 +3,7 @@
 use std::fmt::Write;
 use std::time::Duration;
 
+use super::compression::CompressionPipeline;
 use super::{Tool, ToolContext, ToolOutput};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -100,20 +101,34 @@ impl Tool for BashTool {
                     // Never compress error output
                     Ok(ToolOutput::error(content))
                 } else {
-                    // Compress successful output through the shell pipeline
-                    let compressed = crate::compress::compress_shell_output(
-                        &content, command, 16_000, // ~4096 tokens * 4 chars/token
-                    );
-                    if compressed.ratio() > 0.05 {
-                        tracing::debug!(
-                            command,
-                            original = compressed.original_chars,
-                            compressed = compressed.compressed_chars,
-                            ratio = format!("{:.1}%", compressed.ratio() * 100.0),
-                            "shell output compressed"
-                        );
+                    let cfg = &ctx.output_compression;
+                    if !cfg.enabled || !cfg.apply_to_tools.iter().any(|tool| tool == self.name()) {
+                        return Ok(ToolOutput::success(content));
                     }
-                    Ok(ToolOutput::success(compressed.text))
+
+                    let compressed = CompressionPipeline::new(cfg).compress(&content);
+                    if compressed.stages_applied.is_empty() {
+                        return Ok(ToolOutput::success(compressed.output));
+                    }
+
+                    tracing::debug!(
+                        tool = self.name(),
+                        command,
+                        original_lines = compressed.original_lines,
+                        final_lines = compressed.final_lines,
+                        original_chars = compressed.original_chars,
+                        final_chars = compressed.final_chars,
+                        stages = ?compressed.stages_applied,
+                        "tool output compression applied"
+                    );
+
+                    let header = format!(
+                        "[compression: {} → {} lines ({})]\n",
+                        compressed.original_lines,
+                        compressed.final_lines,
+                        compressed.stages_applied.join("+")
+                    );
+                    Ok(ToolOutput::success(format!("{header}{}", compressed.output)))
                 }
             }
             Ok(Err(e)) => Ok(ToolOutput::error(format!("Failed to execute command: {e}"))),

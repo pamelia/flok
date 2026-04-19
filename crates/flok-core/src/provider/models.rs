@@ -42,6 +42,17 @@ impl ModelRegistry {
             // API IDs from https://docs.anthropic.com/en/docs/about-claude/models
             // The provider strips the "anthropic/" prefix before sending.
             ModelInfo {
+                id: "anthropic/claude-opus-4-7",
+                provider: "anthropic",
+                display_name: "Claude Opus 4.7",
+                context_window: 1_000_000,
+                max_output_tokens: 128_000,
+                input_cost_per_m: 5.0,
+                output_cost_per_m: 25.0,
+                supports_tools: true,
+                supports_streaming: true,
+            },
+            ModelInfo {
                 id: "anthropic/claude-opus-4-6",
                 provider: "anthropic",
                 display_name: "Claude Opus 4.6",
@@ -229,6 +240,9 @@ impl ModelRegistry {
             // Anthropic — current models (shorthands + explicit versions merged)
             "sonnet" | "claude-sonnet" | "sonnet-4.6" | "claude-sonnet-4.6"
             | "claude-sonnet-4-6" => "anthropic/claude-sonnet-4-6",
+            "opus-4.7" | "claude-opus-4.7" | "opus-4-7" | "claude-opus-4-7" => {
+                "anthropic/claude-opus-4-7"
+            }
             "opus" | "claude-opus" | "opus-4.6" | "claude-opus-4.6" | "claude-opus-4-6"
             | "opus-4-6" => "anthropic/claude-opus-4-6",
             "haiku" | "claude-haiku" | "haiku-4.5" | "claude-haiku-4.5" | "claude-haiku-4-5" => {
@@ -258,7 +272,7 @@ mod tests {
     #[test]
     fn builtin_registry_has_models() {
         let registry = ModelRegistry::builtin();
-        assert!(registry.all().len() >= 9);
+        assert!(registry.all().len() >= 10);
     }
 
     #[test]
@@ -311,5 +325,11 @@ mod tests {
     #[test]
     fn resolve_opus_4_6() {
         assert_eq!(ModelRegistry::resolve("opus-4.6"), "anthropic/claude-opus-4-6");
+    }
+
+    #[test]
+    fn resolve_opus_4_7() {
+        assert_eq!(ModelRegistry::resolve("opus-4.7"), "anthropic/claude-opus-4-7");
+        assert_eq!(ModelRegistry::resolve("claude-opus-4-7"), "anthropic/claude-opus-4-7");
     }
 }

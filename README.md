@@ -194,6 +194,7 @@ When the LLM requests a write or dangerous operation, you'll see a permission di
 | Shorthand | Model | Provider | Context |
 |-----------|-------|----------|---------|
 | `sonnet` (default) | Claude Sonnet 4.6 | Anthropic | 1M |
+| `opus-4.7` | Claude Opus 4.7 | Anthropic | 1M |
 | `opus` | Claude Opus 4.6 | Anthropic | 1M |
 | `haiku` | Claude Haiku 4.5 | Anthropic | 200K |
 | `gpt-4.1` | GPT-4.1 | OpenAI | ~1M |

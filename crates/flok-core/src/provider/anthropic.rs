@@ -5,6 +5,7 @@
 
 use futures::StreamExt;
 use reqwest_eventsource::{Event, EventSource};
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
@@ -16,14 +17,14 @@ const API_VERSION: &str = "2023-06-01";
 
 /// Anthropic Claude provider.
 pub struct AnthropicProvider {
-    api_key: String,
+    api_key: SecretString,
     base_url: String,
     client: reqwest::Client,
 }
 
 impl AnthropicProvider {
     /// Create a new Anthropic provider.
-    pub fn new(api_key: String, base_url: Option<String>) -> Self {
+    pub fn new(api_key: SecretString, base_url: Option<String>) -> Self {
         Self {
             api_key,
             base_url: base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
@@ -148,7 +149,7 @@ impl Provider for AnthropicProvider {
         let req = self
             .client
             .post(&url)
-            .header("x-api-key", &self.api_key)
+            .header("x-api-key", self.api_key.expose_secret())
             .header("anthropic-version", API_VERSION)
             .header("anthropic-beta", "prompt-caching-2024-07-31")
             .header("content-type", "application/json")
@@ -473,7 +474,7 @@ mod tests {
 
     #[test]
     fn build_request_body_serializes() {
-        let _provider = AnthropicProvider::new("test-key".into(), None);
+        let _provider = AnthropicProvider::new(SecretString::from("test-key".to_string()), None);
         let request = CompletionRequest {
             model: "anthropic/claude-sonnet-4-6".into(),
             system: "You are a helpful assistant.".into(),

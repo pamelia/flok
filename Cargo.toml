@@ -44,6 +44,7 @@ toml = "0.8"
 # Error handling
 anyhow = "1"
 thiserror = "2"
+secrecy = { version = "0.10", features = ["serde"] }
 
 # Database
 rusqlite = { version = "0.32", features = ["bundled", "serde_json"] }

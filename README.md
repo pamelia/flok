@@ -73,7 +73,7 @@ cd flok
 cargo build --release
 
 # Set at least one API key
-export ANTHROPIC_API_KEY="sk-ant-..."
+flok auth login --provider anthropic
 
 # Launch the TUI
 ./target/release/flok
@@ -82,13 +82,19 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 cargo run --release
 ```
 
-### Environment Variables
+### Providing API Keys
 
-| Variable | Provider |
-|----------|----------|
-| `ANTHROPIC_API_KEY` | Anthropic (Claude) |
-| `OPENAI_API_KEY` | OpenAI (GPT) |
-| `DEEPSEEK_API_KEY` | DeepSeek (uses OpenAI-compatible API) |
+Flok reads provider API keys **only** from its config file at runtime — environment
+variables are NOT consulted. The easiest way to set a key is interactively:
+
+```bash
+flok auth login --provider anthropic   # or openai, deepseek, minimax
+```
+
+Repeat for any other provider you use, for example `flok auth login --provider openai`.
+
+This writes `~/.config/flok/flok.toml` with mode `0600` on Unix. You can also edit
+the file manually — see [`flok.example.toml`](./flok.example.toml) for the schema.
 
 ## Usage
 
@@ -272,25 +278,25 @@ Project-local skills can be added in `.flok/skills/<name>.md`.
 
 ## Configuration
 
-Flok looks for configuration in this order:
+Configuration resolution:
+- `.flok/flok.toml` in project root (highest priority)
+- `flok.toml` in project root
+- `~/.config/flok/flok.toml` (user global, lowest priority)
 
-1. Environment variables (highest priority)
-2. `.flok/flok.toml` in project root
-3. `flok.toml` in project root
-4. `~/.config/flok/flok.toml` (global)
+API keys are sourced from the config file only; env vars are not read.
 
 Example `flok.toml`:
 
 ```toml
 [provider.anthropic]
-# api_key = "sk-ant-..."   # Or set ANTHROPIC_API_KEY env var
+# api_key = "sk-ant-..."
 
 [provider.openai]
-# api_key = "sk-..."       # Or set OPENAI_API_KEY env var
+# api_key = "sk-..."
 # base_url = "https://api.openai.com/v1"
 
 [provider.deepseek]
-# api_key = "sk-..."       # Or set DEEPSEEK_API_KEY env var
+# api_key = "sk-..."
 # base_url = "https://api.deepseek.com/v1"
 
 [worktree]

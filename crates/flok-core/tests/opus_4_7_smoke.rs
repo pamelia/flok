@@ -14,6 +14,7 @@
 use flok_core::provider::{
     AnthropicProvider, CompletionRequest, Message, MessageContent, Provider, StreamEvent,
 };
+use secrecy::SecretString;
 
 #[tokio::test]
 #[ignore = "requires ANTHROPIC_API_KEY and makes a real billed API call"]
@@ -24,7 +25,7 @@ async fn opus_4_7_accepts_floks_request_shape() {
         return;
     };
 
-    let provider = AnthropicProvider::new(api_key, None);
+    let provider = AnthropicProvider::new(SecretString::from(api_key), None);
     let request = CompletionRequest {
         model: "anthropic/claude-opus-4-7".into(),
         system: "You are a terse assistant.".into(),

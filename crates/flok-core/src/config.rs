@@ -9,7 +9,8 @@
 
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+use secrecy::{ExposeSecret, SecretString};
+use serde::{Deserialize, Serialize, Serializer};
 
 /// Top-level flok configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -132,10 +133,31 @@ impl Default for WorktreeConfig {
 /// Configuration for a single LLM provider.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
-    /// API key (can also come from environment).
-    pub api_key: Option<String>,
+    /// API key. Read ONLY from the config file at runtime. Wrapped in
+    /// `SecretString` for zeroize-on-drop and redacted `Debug`.
+    #[serde(default, serialize_with = "serialize_api_key_opt")]
+    pub api_key: Option<SecretString>,
     /// Base URL override.
     pub base_url: Option<String>,
+}
+
+/// Serialize an `Option<SecretString>` by exposing its plaintext.
+///
+/// This is the SOLE egress point where the secret plaintext leaves
+/// `SecretString`. Used only by `run_auth_login` when persisting the
+/// config file back to disk. All other code paths must use
+/// `expose_secret()` at the exact use site (e.g. HTTP header build).
+// `serialize_with` from serde requires `&Option<T>`; `Option<&T>` is not
+// a valid shape for this hook, so the `ref_option` lint is a false positive.
+#[allow(clippy::ref_option)]
+fn serialize_api_key_opt<S: Serializer>(
+    secret: &Option<SecretString>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match secret {
+        Some(s) => serializer.serialize_some(s.expose_secret()),
+        None => serializer.serialize_none(),
+    }
 }
 
 /// Detect the project root by walking up from `start_dir` looking for markers.
@@ -240,6 +262,7 @@ pub fn ensure_directories() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use secrecy::{ExposeSecret, SecretString};
 
     #[test]
     fn default_config_is_valid() {
@@ -304,7 +327,10 @@ mod tests {
         let overlay = FlokConfig {
             provider: [(
                 "anthropic".to_string(),
-                ProviderConfig { api_key: Some("key-123".to_string()), base_url: None },
+                ProviderConfig {
+                    api_key: Some(SecretString::from("key-123".to_string())),
+                    base_url: None,
+                },
             )]
             .into_iter()
             .collect(),
@@ -313,7 +339,10 @@ mod tests {
             permission: std::collections::HashMap::new(),
         };
         merge_config(&mut base, &overlay);
-        assert_eq!(base.provider["anthropic"].api_key.as_deref(), Some("key-123"));
+        assert_eq!(
+            base.provider["anthropic"].api_key.as_ref().map(SecretString::expose_secret),
+            Some("key-123"),
+        );
     }
 
     #[test]
@@ -324,7 +353,47 @@ mod tests {
         "#;
         let config: FlokConfig = toml::from_str(toml_str).unwrap();
         assert!(config.provider.contains_key("anthropic"));
-        assert_eq!(config.provider["anthropic"].api_key.as_deref(), Some("sk-test-123"));
+        assert_eq!(
+            config.provider["anthropic"].api_key.as_ref().map(SecretString::expose_secret),
+            Some("sk-test-123"),
+        );
+    }
+
+    #[test]
+    fn serialize_roundtrip_exposes_key() {
+        use std::collections::HashMap;
+        let mut provider = HashMap::new();
+        provider.insert(
+            "anthropic".to_string(),
+            ProviderConfig {
+                api_key: Some(SecretString::from("sk-test-roundtrip".to_string())),
+                base_url: None,
+            },
+        );
+        let config = FlokConfig { provider, ..Default::default() };
+
+        let toml_string = toml::to_string_pretty(&config).expect("serialize");
+        assert!(
+            toml_string.contains("sk-test-roundtrip"),
+            "expected plaintext in serialized TOML, got:\n{toml_string}"
+        );
+
+        let parsed: FlokConfig = toml::from_str(&toml_string).expect("deserialize");
+        assert_eq!(
+            parsed.provider["anthropic"].api_key.as_ref().map(SecretString::expose_secret),
+            Some("sk-test-roundtrip"),
+        );
+    }
+
+    #[test]
+    fn debug_format_is_redacted() {
+        let provider = ProviderConfig {
+            api_key: Some(SecretString::from("plain-text-xyz".to_string())),
+            base_url: None,
+        };
+        let rendered = format!("{provider:?}");
+        assert!(!rendered.contains("plain-text-xyz"), "Debug output leaked plaintext: {rendered}");
+        assert!(rendered.contains("REDACTED"), "Debug output missing REDACTED marker: {rendered}");
     }
 
     #[test]

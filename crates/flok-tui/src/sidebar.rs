@@ -23,6 +23,20 @@ pub(crate) struct SidebarState {
 }
 
 pub(crate) fn render(state: &SidebarState, area: Rect, buf: &mut Buffer, theme: &Theme) {
+    render_into(state, area, buf, theme);
+}
+
+pub(crate) fn visible_rows(state: &SidebarState, area: Rect, theme: &Theme) -> Vec<String> {
+    if area.width == 0 || area.height == 0 {
+        return Vec::new();
+    }
+
+    let mut buf = Buffer::empty(area);
+    render_into(state, area, &mut buf, theme);
+    buffer_rows(&buf, area)
+}
+
+fn render_into(state: &SidebarState, area: Rect, buf: &mut Buffer, theme: &Theme) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -62,6 +76,20 @@ pub(crate) fn render(state: &SidebarState, area: Rect, buf: &mut Buffer, theme: 
     Paragraph::new(lines).wrap(Wrap { trim: false }).render(inner, buf);
 }
 
+fn buffer_rows(buf: &Buffer, area: Rect) -> Vec<String> {
+    let mut rows = Vec::with_capacity(usize::from(area.height));
+    for y in 0..area.height {
+        let row = (0..area.width)
+            .filter_map(|x| buf.cell(ratatui::layout::Position::new(area.x + x, area.y + y)))
+            .map(|cell| cell.symbol().to_string())
+            .collect::<String>()
+            .trim_end()
+            .to_string();
+        rows.push(row);
+    }
+    rows
+}
+
 fn styled(text: String, color: crossterm::style::Color) -> Line<'static> {
     Line::from(Span::styled(text, Style::default().fg(ratatui_color(color))))
 }
@@ -89,11 +117,38 @@ fn ratatui_color(color: crossterm::style::Color) -> ratatui::style::Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::layout::Position;
 
     #[test]
     fn render_does_not_panic() {
         let area = Rect::new(0, 0, 32, 12);
         let mut buf = Buffer::empty(area);
         render(&SidebarState::default(), area, &mut buf, &Theme::dark());
+    }
+
+    #[test]
+    fn visible_rows_matches_render_output_length() {
+        let area = Rect::new(0, 0, 32, 12);
+        let theme = Theme::dark();
+        let state = SidebarState {
+            session_title: "flok".to_string(),
+            model: "test".to_string(),
+            ..Default::default()
+        };
+        let mut buf = Buffer::empty(area);
+
+        render(&state, area, &mut buf, &theme);
+        let rows = visible_rows(&state, area, &theme);
+
+        assert_eq!(rows.len(), usize::from(area.height));
+        for y in 0..area.height {
+            let rendered: String = (0..area.width)
+                .filter_map(|x| buf.cell(Position::new(x, y)))
+                .map(|cell| cell.symbol().to_string())
+                .collect::<String>()
+                .trim_end()
+                .to_string();
+            assert_eq!(rows[usize::from(y)], rendered);
+        }
     }
 }

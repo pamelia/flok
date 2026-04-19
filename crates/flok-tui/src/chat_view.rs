@@ -28,25 +28,7 @@ impl ChatView {
             return;
         }
 
-        let mut all_lines: Vec<Line<'static>> = Vec::new();
-        for item in history {
-            all_lines.extend(crate::history::render::lines(item, area.width, theme));
-        }
-        if let Some(active) = active {
-            let synth = synthesize_active(active);
-            all_lines.extend(crate::history::render::lines(&synth, area.width, theme));
-        }
-
-        let total_lines = all_lines.len();
-        let viewport = area.height as usize;
-
-        let max_offset = total_lines.saturating_sub(viewport);
-        let scroll_offset = self.scroll_offset.min(max_offset);
-
-        let start = total_lines.saturating_sub(viewport + scroll_offset);
-        let end = total_lines.saturating_sub(scroll_offset);
-
-        for (i, line) in all_lines[start..end].iter().enumerate() {
+        for (i, line) in self.visible_lines(history, active, theme, area).iter().enumerate() {
             let row_y = area.y.saturating_add(i as u16);
             if row_y >= area.y.saturating_add(area.height) {
                 break;
@@ -54,6 +36,19 @@ impl ChatView {
             let row = Rect { x: area.x, y: row_y, width: area.width, height: 1 };
             line.clone().render(row, buf);
         }
+    }
+
+    pub(crate) fn visible_rows(
+        &self,
+        history: &[HistoryItem],
+        active: Option<&ActiveItem>,
+        theme: &Theme,
+        area: Rect,
+    ) -> Vec<String> {
+        self.visible_lines(history, active, theme, area)
+            .into_iter()
+            .map(|line| line.spans.into_iter().map(|span| span.content.into_owned()).collect())
+            .collect()
     }
 
     /// Negative `delta` scrolls up (toward older lines); positive scrolls down.
@@ -75,6 +70,40 @@ impl ChatView {
     pub(crate) fn on_new_content(&mut self) {
         let _ = self;
     }
+
+    fn visible_lines(
+        &self,
+        history: &[HistoryItem],
+        active: Option<&ActiveItem>,
+        theme: &Theme,
+        area: Rect,
+    ) -> Vec<Line<'static>> {
+        if area.width == 0 || area.height == 0 {
+            return Vec::new();
+        }
+
+        let mut all_lines: Vec<Line<'static>> = Vec::new();
+        for item in history {
+            all_lines.extend(crate::history::render::lines(item, area.width, theme));
+        }
+        if let Some(active) = active {
+            let synth = synthesize_active(active);
+            all_lines.extend(crate::history::render::lines(&synth, area.width, theme));
+        }
+
+        let viewport = area.height as usize;
+        let total_lines = all_lines.len();
+        let max_offset = total_lines.saturating_sub(viewport);
+        let scroll_offset = self.scroll_offset.min(max_offset);
+        let start = total_lines.saturating_sub(viewport + scroll_offset);
+        let end = total_lines.saturating_sub(scroll_offset);
+
+        let mut visible = all_lines[start..end].to_vec();
+        while visible.len() < viewport {
+            visible.push(Line::default());
+        }
+        visible
+    }
 }
 
 fn synthesize_active(active: &ActiveItem) -> HistoryItem {
@@ -92,7 +121,10 @@ fn synthesize_active(active: &ActiveItem) -> HistoryItem {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::{buffer::Buffer, layout::Rect};
+    use ratatui::{
+        buffer::Buffer,
+        layout::{Position, Rect},
+    };
 
     #[test]
     fn fresh_view_is_at_bottom() {
@@ -131,5 +163,28 @@ mod tests {
         let area = Rect::new(0, 0, 20, 5);
         let mut buf = Buffer::empty(area);
         v.render(&[], None, &crate::theme::Theme::dark(), area, &mut buf);
+    }
+
+    #[test]
+    fn visible_rows_matches_render_output_length() {
+        let v = ChatView::new();
+        let area = Rect::new(0, 0, 20, 4);
+        let theme = crate::theme::Theme::dark();
+        let history = vec![HistoryItem::user("hello world")];
+        let mut buf = Buffer::empty(area);
+
+        v.render(&history, None, &theme, area, &mut buf);
+        let rows = v.visible_rows(&history, None, &theme, area);
+
+        assert_eq!(rows.len(), usize::from(area.height));
+        for y in 0..area.height {
+            let rendered: String = (0..area.width)
+                .filter_map(|x| buf.cell(Position::new(x, y)))
+                .map(|cell| cell.symbol().to_string())
+                .collect::<String>()
+                .trim_end()
+                .to_string();
+            assert_eq!(rows[usize::from(y)], rendered);
+        }
     }
 }

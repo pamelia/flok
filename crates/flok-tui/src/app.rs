@@ -1,20 +1,27 @@
 use anyhow::Result;
-use crossterm::event::{KeyCode, KeyModifiers, MouseEventKind};
+use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::Style,
     widgets::{Block, Borders},
 };
+use std::time::Instant;
 use tokio::sync::mpsc;
 
 use crate::app_event::AppEvent;
 use crate::bottom_pane::BottomPane;
 use crate::chat_view::ChatView;
+use crate::clipboard::Clipboard;
 use crate::footer::FooterState;
 use crate::history::{ActiveItem, HistoryItem, Role, TeamEventKind};
+use crate::selection::{
+    extract_selection_text, paint_selection, ClickTracker, LayoutRects, PanelBuffer, PanelKind,
+    SelectionMode, SelectionPoint, SelectionState,
+};
 use crate::sidebar::SidebarState;
 use crate::tui::Tui;
 use crate::types::{TuiChannels, UiCommand};
+use unicode_width::UnicodeWidthStr;
 
 #[expect(
     clippy::struct_field_names,
@@ -34,6 +41,12 @@ pub(crate) struct App {
     chat_view: ChatView,
     sidebar: SidebarState,
     footer: FooterState,
+    selection: Option<SelectionState>,
+    click_tracker: ClickTracker,
+    clipboard: Clipboard,
+    panel_buffers: Vec<PanelBuffer>,
+    layout_rects: LayoutRects,
+    chat_drag_lock: Option<ChatDragLock>,
 
     terminal_size: (u16, u16),
     waiting_for_response: bool,
@@ -74,6 +87,12 @@ impl App {
             chat_view: ChatView::new(),
             sidebar,
             footer,
+            selection: None,
+            click_tracker: ClickTracker::default(),
+            clipboard: Clipboard::new(),
+            panel_buffers: Vec::new(),
+            layout_rects: LayoutRects::default(),
+            chat_drag_lock: None,
             terminal_size: (80, 24),
             waiting_for_response: false,
             theme,
@@ -174,7 +193,16 @@ impl App {
                 {
                     self.sidebar.visible = !self.sidebar.visible;
                 } else if key.modifiers.contains(KeyModifiers::CONTROL)
-                    && matches!(key.code, KeyCode::Char('c' | 'd'))
+                    && matches!(key.code, KeyCode::Char('c'))
+                {
+                    if self.selection.as_ref().is_some_and(SelectionState::has_extent) {
+                        self.copy_active_selection();
+                        self.selection = None;
+                    } else {
+                        self.running = false;
+                    }
+                } else if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && matches!(key.code, KeyCode::Char('d'))
                 {
                     self.running = false;
                 } else if self.waiting_for_response
@@ -189,17 +217,7 @@ impl App {
                 }
                 self.dirty = true;
             }
-            AppEvent::Mouse(mouse) => match mouse.kind {
-                MouseEventKind::ScrollUp => {
-                    self.scroll_chat(-3);
-                    self.dirty = true;
-                }
-                MouseEventKind::ScrollDown => {
-                    self.scroll_chat(3);
-                    self.dirty = true;
-                }
-                _ => {}
-            },
+            AppEvent::Mouse(mouse) => self.handle_mouse(mouse),
             AppEvent::Paste(s) => {
                 self.bottom_pane.handle_paste(&s);
                 self.dirty = true;
@@ -207,6 +225,7 @@ impl App {
             AppEvent::UiEvent(ui_event) => match ui_event {
                 crate::types::UiEvent::TextDelta(text) => {
                     self.dirty |= crate::stream::ingest_assistant_delta(&mut self.active, &text);
+                    self.maintain_chat_drag_lock();
                 }
                 crate::types::UiEvent::AssistantDone(text) => {
                     self.finish_assistant(text, false);
@@ -229,11 +248,13 @@ impl App {
                     };
                     self.history.push(item);
                     self.chat_view.on_new_content();
+                    self.maintain_chat_drag_lock();
                     self.dirty = true;
                 }
                 crate::types::UiEvent::Error(message) => {
                     self.history.push(HistoryItem::system_error(message));
                     self.chat_view.on_new_content();
+                    self.maintain_chat_drag_lock();
                     self.dirty = true;
                 }
                 crate::types::UiEvent::SessionSwitched { messages } => {
@@ -260,6 +281,8 @@ impl App {
                     self.chat_view.scroll_offset = 0;
                     self.chat_view.follow_bottom = true;
                     self.chat_view.on_new_content();
+                    self.selection = None;
+                    self.release_chat_drag_lock();
                     self.dirty = true;
                 }
                 crate::types::UiEvent::BranchPoints(points) => {
@@ -276,15 +299,18 @@ impl App {
                     };
                     self.history.push(HistoryItem::system_info(body));
                     self.chat_view.on_new_content();
+                    self.maintain_chat_drag_lock();
                     self.dirty = true;
                 }
             },
             AppEvent::BusEvent(bus_event) => match bus_event {
                 flok_core::bus::BusEvent::TextDelta { delta, .. } => {
                     self.dirty |= crate::stream::ingest_assistant_delta(&mut self.active, &delta);
+                    self.maintain_chat_drag_lock();
                 }
                 flok_core::bus::BusEvent::ReasoningDelta { delta, .. } => {
                     self.dirty |= crate::stream::ingest_reasoning_delta(&mut self.active, &delta);
+                    self.maintain_chat_drag_lock();
                 }
                 flok_core::bus::BusEvent::TokenUsage { input_tokens, output_tokens, .. } => {
                     self.sidebar.input_tokens = input_tokens;
@@ -313,6 +339,7 @@ impl App {
                         crate::stream::finalize_tool_call(self.active.take(), is_error, None);
                     self.history.push(item);
                     self.chat_view.on_new_content();
+                    self.maintain_chat_drag_lock();
                     self.dirty = true;
                 }
                 flok_core::bus::BusEvent::StreamingComplete { .. } => {
@@ -324,6 +351,7 @@ impl App {
                         );
                         self.push_history_if_not_duplicate(item);
                         self.chat_view.on_new_content();
+                        self.maintain_chat_drag_lock();
                         self.dirty = true;
                     }
                 }
@@ -343,6 +371,7 @@ impl App {
                         detail: "created".to_string(),
                     });
                     self.chat_view.on_new_content();
+                    self.maintain_chat_drag_lock();
                     self.dirty = true;
                 }
                 flok_core::bus::BusEvent::TeamMemberCompleted { agent_name, .. } => {
@@ -352,6 +381,7 @@ impl App {
                         detail: "completed".to_string(),
                     });
                     self.chat_view.on_new_content();
+                    self.maintain_chat_drag_lock();
                     self.dirty = true;
                 }
                 flok_core::bus::BusEvent::TeamMemberFailed { agent_name, error, .. } => {
@@ -361,6 +391,7 @@ impl App {
                         detail: error,
                     });
                     self.chat_view.on_new_content();
+                    self.maintain_chat_drag_lock();
                     self.dirty = true;
                 }
                 other => {
@@ -407,6 +438,7 @@ impl App {
                             if rest.is_empty() {
                                 self.history.push(HistoryItem::system_warn("Usage: /label <text>"));
                                 self.chat_view.on_new_content();
+                                self.maintain_chat_drag_lock();
                             } else {
                                 let _ = self.channels.cmd_tx.send(UiCommand::SetLabel(rest));
                             }
@@ -432,6 +464,7 @@ impl App {
                                 "Slash: /new /clear /undo /redo /tree /branch /label /plan /build /sidebar /sessions /help /quit",
                             ));
                             self.chat_view.on_new_content();
+                            self.maintain_chat_drag_lock();
                         }
                         "" => {}
                         _ => {
@@ -439,6 +472,7 @@ impl App {
                                 "Unknown command: /{cmdline}"
                             )));
                             self.chat_view.on_new_content();
+                            self.maintain_chat_drag_lock();
                         }
                     }
                 } else if !trimmed.is_empty() {
@@ -447,6 +481,7 @@ impl App {
                     self.footer.waiting = true;
                     self.bottom_pane.set_waiting(true);
                     self.chat_view.on_new_content();
+                    self.maintain_chat_drag_lock();
                     let _ = self.channels.cmd_tx.send(UiCommand::SendMessage(text));
                 }
                 self.dirty = true;
@@ -480,6 +515,7 @@ impl App {
                     };
                     self.push_history_if_not_duplicate(item);
                     self.chat_view.on_new_content();
+                    self.maintain_chat_drag_lock();
                 }
                 self.waiting_for_response = false;
                 self.footer.waiting = false;
@@ -507,34 +543,60 @@ impl App {
         }
     }
 
-    fn render(&self, frame: &mut ratatui::Frame<'_>) {
+    fn render(&mut self, frame: &mut ratatui::Frame<'_>) {
         let area = frame.area();
         if area.width == 0 || area.height == 0 {
             return;
         }
 
         let layout = self.compute_layout(area);
+        self.layout_rects = LayoutRects {
+            chat: layout.chat_inner,
+            sidebar: layout.sidebar,
+            composer: layout.bottom,
+        };
+        self.panel_buffers.clear();
 
         if let Some(sidebar) = layout.sidebar {
             crate::sidebar::render(&self.sidebar, sidebar, frame.buffer_mut(), &self.theme);
+            self.panel_buffers.push(PanelBuffer {
+                rect: sidebar,
+                rows: crate::sidebar::visible_rows(&self.sidebar, sidebar, &self.theme),
+            });
         }
 
         let chat_block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(ratatui_color(self.theme.border)))
             .title(format!(" flok — {} ", self.footer.model));
-        let chat_inner = chat_block.inner(layout.chat);
         frame.render_widget(chat_block, layout.chat);
 
         self.chat_view.render(
             &self.history,
             self.active.as_ref(),
             &self.theme,
-            chat_inner,
+            layout.chat_inner,
             frame.buffer_mut(),
         );
+        self.panel_buffers.push(PanelBuffer {
+            rect: layout.chat_inner,
+            rows: self.chat_view.visible_rows(
+                &self.history,
+                self.active.as_ref(),
+                &self.theme,
+                layout.chat_inner,
+            ),
+        });
         self.bottom_pane.render(layout.bottom, frame.buffer_mut(), &self.theme);
+        self.panel_buffers.push(PanelBuffer {
+            rect: layout.bottom,
+            rows: self.bottom_pane.visible_rows(layout.bottom, &self.theme),
+        });
         crate::footer::render(&self.footer, &self.theme, layout.footer, frame.buffer_mut());
+
+        if let Some(selection) = &self.selection {
+            paint_selection(frame.buffer_mut(), selection, &self.panel_buffers);
+        }
     }
 
     fn compute_layout(&self, area: Rect) -> AppLayout {
@@ -561,7 +623,10 @@ impl App {
         ])
         .split(main);
 
-        AppLayout { chat: rows[0], bottom: rows[1], footer: rows[2], sidebar }
+        let chat = rows[0];
+        let chat_inner = Block::default().borders(Borders::ALL).inner(chat);
+
+        AppLayout { chat, chat_inner, bottom: rows[1], footer: rows[2], sidebar }
     }
 
     fn finish_assistant(&mut self, fallback_text: String, cancelled: bool) {
@@ -571,6 +636,7 @@ impl App {
         self.footer.waiting = false;
         self.bottom_pane.set_waiting(false);
         self.chat_view.on_new_content();
+        self.maintain_chat_drag_lock();
         self.dirty = true;
     }
 
@@ -612,7 +678,7 @@ impl App {
             (KeyCode::PageUp, _) => {
                 let viewport = self
                     .compute_layout(Rect::new(0, 0, self.terminal_size.0, self.terminal_size.1))
-                    .chat
+                    .chat_inner
                     .height;
                 let delta = -i32::from(viewport.max(2) / 2);
                 self.scroll_chat(delta);
@@ -621,7 +687,7 @@ impl App {
             (KeyCode::PageDown, _) => {
                 let viewport = self
                     .compute_layout(Rect::new(0, 0, self.terminal_size.0, self.terminal_size.1))
-                    .chat
+                    .chat_inner
                     .height;
                 let delta = i32::from(viewport.max(2) / 2);
                 self.scroll_chat(delta);
@@ -636,7 +702,7 @@ impl App {
                         self.terminal_size.0,
                         self.terminal_size.1,
                     ))
-                    .chat
+                    .chat_inner
                     .height,
                 );
                 self.chat_view.scroll_offset = total.saturating_sub(viewport);
@@ -655,13 +721,13 @@ impl App {
     fn scroll_chat(&mut self, delta: i32) {
         let layout =
             self.compute_layout(Rect::new(0, 0, self.terminal_size.0, self.terminal_size.1));
-        self.chat_view.handle_scroll(delta, layout.chat.height, self.transcript_height());
+        self.chat_view.handle_scroll(delta, layout.chat_inner.height, self.transcript_height());
     }
 
     fn transcript_height(&self) -> usize {
         let layout =
             self.compute_layout(Rect::new(0, 0, self.terminal_size.0, self.terminal_size.1));
-        let width = layout.chat.width.saturating_sub(2).max(1);
+        let width = layout.chat_inner.width.max(1);
         let mut total = self
             .history
             .iter()
@@ -681,14 +747,287 @@ impl App {
         }
         total
     }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if self.bottom_pane.has_overlay() {
+            return;
+        }
+        if mouse.modifiers.contains(KeyModifiers::SHIFT) {
+            return;
+        }
+
+        let pos = (mouse.column, mouse.row);
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let Some(panel) = PanelKind::identify(pos, &self.layout_rects) else {
+                    if let Some(selection) = self.selection.as_mut() {
+                        selection.clear();
+                    }
+                    self.selection = None;
+                    self.release_chat_drag_lock();
+                    return;
+                };
+                let Some(point) = self.clamped_point(panel, pos.0, pos.1) else {
+                    return;
+                };
+                let count = self.click_tracker.register(Instant::now(), pos.0, pos.1);
+                let mode = SelectionMode::from_click_count(count);
+                let mut selection = SelectionState::start(point).with_mode(mode);
+                if mode != SelectionMode::Char {
+                    if let Some((anchor, head)) = self.expand_selection(point, mode) {
+                        selection.anchor = Some(anchor);
+                        selection.head = Some(head);
+                    }
+                }
+                self.selection = Some(selection);
+                if panel == PanelKind::Chat {
+                    self.acquire_chat_drag_lock();
+                } else {
+                    self.release_chat_drag_lock();
+                }
+                self.dirty = true;
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let Some((panel, _)) = self
+                    .selection
+                    .as_ref()
+                    .and_then(|selection| selection.anchor.map(|anchor| (anchor.panel, anchor)))
+                else {
+                    return;
+                };
+                let Some(point) = self.clamped_point(panel, pos.0, pos.1) else {
+                    return;
+                };
+                if let Some(selection) = self.selection.as_mut() {
+                    selection.extend(point);
+                }
+                self.maintain_chat_drag_lock();
+                self.dirty = true;
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if let Some(selection) = self.selection.as_mut() {
+                    if selection.has_extent() {
+                        let text = extract_selection_text(&self.panel_buffers, selection);
+                        let _copied = self.clipboard.copy(&text);
+                        selection.finish_drag();
+                    } else {
+                        selection.clear();
+                        self.selection = None;
+                    }
+                }
+                self.release_chat_drag_lock();
+                self.dirty = true;
+            }
+            MouseEventKind::ScrollUp => {
+                if self.selection.as_ref().is_some_and(SelectionState::is_dragging) {
+                    return;
+                }
+                self.scroll_chat(-3);
+                self.dirty = true;
+            }
+            MouseEventKind::ScrollDown => {
+                if self.selection.as_ref().is_some_and(SelectionState::is_dragging) {
+                    return;
+                }
+                self.scroll_chat(3);
+                self.dirty = true;
+            }
+            _ => {}
+        }
+    }
+
+    fn clamped_point(&self, panel: PanelKind, col: u16, row: u16) -> Option<SelectionPoint> {
+        let rect = self.layout_rects.rect_for(panel)?;
+        let last_col = rect.right().saturating_sub(1);
+        let last_row = rect.bottom().saturating_sub(1);
+        Some(SelectionPoint {
+            panel,
+            col: col.clamp(rect.x, last_col),
+            row: row.clamp(rect.y, last_row),
+        })
+    }
+
+    fn expand_selection(
+        &self,
+        point: SelectionPoint,
+        mode: SelectionMode,
+    ) -> Option<(SelectionPoint, SelectionPoint)> {
+        let target_rect = self.layout_rects.rect_for(point.panel)?;
+        let panel = self.panel_buffers.iter().find(|buffer| buffer.rect == target_rect)?;
+        let row_index = usize::from(point.row.saturating_sub(panel.rect.y));
+        let line = panel.rows.get(row_index)?;
+        let relative_col = usize::from(point.col.saturating_sub(panel.rect.x));
+
+        match mode {
+            SelectionMode::Char => None,
+            SelectionMode::Word => {
+                let (start_col, end_col) =
+                    crate::selection::expand_word_by_width(line, relative_col, relative_col);
+                Some((
+                    SelectionPoint {
+                        panel: point.panel,
+                        row: point.row,
+                        col: panel.rect.x + start_col as u16,
+                    },
+                    SelectionPoint {
+                        panel: point.panel,
+                        row: point.row,
+                        col: panel.rect.x + end_col as u16,
+                    },
+                ))
+            }
+            SelectionMode::Line => Self::expand_line_selection(point, line, panel.rect),
+            SelectionMode::Paragraph => Self::expand_paragraph_selection(point, panel),
+        }
+    }
+
+    fn expand_line_selection(
+        point: SelectionPoint,
+        line: &str,
+        rect: Rect,
+    ) -> Option<(SelectionPoint, SelectionPoint)> {
+        let line_width = line.width();
+        if line_width == 0 {
+            return None;
+        }
+        Some((
+            SelectionPoint { panel: point.panel, row: point.row, col: rect.x },
+            SelectionPoint {
+                panel: point.panel,
+                row: point.row,
+                col: rect.x + u16::try_from(line_width.saturating_sub(1)).ok()?,
+            },
+        ))
+    }
+
+    fn expand_paragraph_selection(
+        point: SelectionPoint,
+        panel: &PanelBuffer,
+    ) -> Option<(SelectionPoint, SelectionPoint)> {
+        let row_index = usize::from(point.row.saturating_sub(panel.rect.y));
+        let mut start_row = row_index;
+        let mut end_row = row_index;
+
+        while start_row > 0 && !panel.rows[start_row - 1].trim().is_empty() {
+            start_row -= 1;
+        }
+        while end_row + 1 < panel.rows.len() && !panel.rows[end_row + 1].trim().is_empty() {
+            end_row += 1;
+        }
+
+        let end_width = panel.rows.get(end_row)?.width();
+        if end_width == 0 {
+            return None;
+        }
+
+        Some((
+            SelectionPoint {
+                panel: point.panel,
+                row: panel.rect.y + u16::try_from(start_row).ok()?,
+                col: panel.rect.x,
+            },
+            SelectionPoint {
+                panel: point.panel,
+                row: panel.rect.y + u16::try_from(end_row).ok()?,
+                col: panel.rect.x + u16::try_from(end_width.saturating_sub(1)).ok()?,
+            },
+        ))
+    }
+
+    fn copy_active_selection(&mut self) {
+        if let Some(selection) = self.selection.as_ref().filter(|selection| selection.has_extent())
+        {
+            let text = extract_selection_text(&self.panel_buffers, selection);
+            let _copied = self.clipboard.copy(&text);
+        }
+    }
+
+    fn acquire_chat_drag_lock(&mut self) {
+        self.chat_drag_lock = Some(ChatDragLock {
+            transcript_height: self.transcript_height(),
+            scroll_offset: self.chat_view.scroll_offset,
+        });
+        self.chat_view.follow_bottom = false;
+    }
+
+    fn maintain_chat_drag_lock(&mut self) {
+        if let Some(lock) = self.chat_drag_lock {
+            let current_height = self.transcript_height();
+            let growth = current_height.saturating_sub(lock.transcript_height);
+            self.chat_view.scroll_offset = lock.scroll_offset.saturating_add(growth);
+            self.chat_view.follow_bottom = false;
+        }
+    }
+
+    fn release_chat_drag_lock(&mut self) {
+        self.chat_drag_lock = None;
+    }
+
+    pub(crate) fn test_handle_event(&mut self, event: AppEvent) {
+        self.handle_event(event);
+    }
+
+    pub(crate) fn test_render(&mut self, frame: &mut ratatui::Frame<'_>) {
+        self.render(frame);
+    }
+
+    pub(crate) fn test_push_history_item(&mut self, item: HistoryItem) {
+        self.history.push(item);
+        self.chat_view.on_new_content();
+    }
+
+    pub(crate) fn test_set_sidebar_visible(&mut self, visible: bool) {
+        self.sidebar.visible = visible;
+    }
+
+    pub(crate) fn test_set_composer_text(&mut self, text: &str) {
+        self.bottom_pane.handle_paste(text);
+    }
+
+    pub(crate) fn test_set_permission_overlay(
+        &mut self,
+        request: flok_core::tool::PermissionRequest,
+    ) {
+        let overlay = crate::overlays::Overlay::Permission(
+            crate::overlays::permission::PermissionOverlay::new(request),
+        );
+        self.bottom_pane.set_overlay(overlay);
+    }
+
+    pub(crate) fn test_layout_rects(&self) -> LayoutRects {
+        self.layout_rects
+    }
+
+    pub(crate) fn test_copied_text(&self) -> Option<&str> {
+        self.clipboard.last_copied_text.as_deref()
+    }
+
+    pub(crate) fn test_is_running(&self) -> bool {
+        self.running
+    }
+
+    pub(crate) fn test_has_selection(&self) -> bool {
+        self.selection.as_ref().is_some_and(SelectionState::has_extent)
+    }
+
+    pub(crate) fn test_chat_scroll_offset(&self) -> usize {
+        self.chat_view.scroll_offset
+    }
 }
 
 #[derive(Clone, Copy)]
 struct AppLayout {
     chat: Rect,
+    chat_inner: Rect,
     bottom: Rect,
     footer: Rect,
     sidebar: Option<Rect>,
+}
+
+#[derive(Clone, Copy)]
+struct ChatDragLock {
+    transcript_height: usize,
+    scroll_offset: usize,
 }
 
 fn ratatui_color(color: crossterm::style::Color) -> ratatui::style::Color {
@@ -724,6 +1063,7 @@ fn ratatui_color(color: crossterm::style::Color) -> ratatui::style::Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::KeyEvent;
     use tokio::sync::{broadcast, mpsc};
 
     use flok_core::session::PlanMode;
@@ -748,6 +1088,31 @@ mod tests {
         };
 
         (channels, cmd_rx)
+    }
+
+    fn ctrl(ch: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL)
+    }
+
+    fn selection_app() -> App {
+        let (channels, _cmd_rx) = make_channels();
+        let (tx, rx) = mpsc::unbounded_channel::<AppEvent>();
+        let mut app = App::new(channels, tx, rx);
+        app.layout_rects = LayoutRects {
+            chat: Rect::new(0, 0, 20, 3),
+            sidebar: None,
+            composer: Rect::new(0, 3, 20, 3),
+        };
+        app.panel_buffers = vec![PanelBuffer {
+            rect: Rect::new(0, 0, 20, 3),
+            rows: vec!["hello world".to_string(), "second row".to_string(), String::new()],
+        }];
+        let mut selection =
+            SelectionState::start(SelectionPoint { panel: PanelKind::Chat, row: 0, col: 0 });
+        selection.extend(SelectionPoint { panel: PanelKind::Chat, row: 0, col: 4 });
+        selection.finish_drag();
+        app.selection = Some(selection);
+        app
     }
 
     #[tokio::test]
@@ -787,5 +1152,36 @@ mod tests {
 
         let command = cmd_rx.try_recv().expect("cancel command should be queued");
         assert!(matches!(command, UiCommand::Cancel));
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_with_selection_copies_not_quit() {
+        let mut app = selection_app();
+
+        app.handle_event(AppEvent::Key(ctrl('c')));
+
+        assert!(app.running);
+        assert!(app.selection.is_none());
+        assert_eq!(app.clipboard.last_copied_text.as_deref(), Some("hello"));
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_without_selection_quits() {
+        let (channels, _cmd_rx) = make_channels();
+        let (tx, rx) = mpsc::unbounded_channel::<AppEvent>();
+        let mut app = App::new(channels, tx, rx);
+
+        app.handle_event(AppEvent::Key(ctrl('c')));
+
+        assert!(!app.running);
+    }
+
+    #[tokio::test]
+    async fn ctrl_d_always_quits() {
+        let mut app = selection_app();
+
+        app.handle_event(AppEvent::Key(ctrl('d')));
+
+        assert!(!app.running);
     }
 }

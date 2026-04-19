@@ -162,6 +162,20 @@ impl BottomPane {
     }
 
     pub(crate) fn render(&self, area: Rect, buf: &mut Buffer, theme: &Theme) {
+        self.render_into(area, buf, theme);
+    }
+
+    pub(crate) fn visible_rows(&self, area: Rect, theme: &Theme) -> Vec<String> {
+        if area.width == 0 || area.height == 0 {
+            return Vec::new();
+        }
+
+        let mut buf = Buffer::empty(area);
+        self.render_into(area, &mut buf, theme);
+        buffer_rows(&buf, area)
+    }
+
+    fn render_into(&self, area: Rect, buf: &mut Buffer, theme: &Theme) {
         let mut y = area.y;
         let width = area.width;
 
@@ -193,11 +207,26 @@ impl BottomPane {
     }
 }
 
+fn buffer_rows(buf: &Buffer, area: Rect) -> Vec<String> {
+    let mut rows = Vec::with_capacity(usize::from(area.height));
+    for y in 0..area.height {
+        let row = (0..area.width)
+            .filter_map(|x| buf.cell(ratatui::layout::Position::new(area.x + x, area.y + y)))
+            .map(|cell| cell.symbol().to_string())
+            .collect::<String>()
+            .trim_end()
+            .to_string();
+        rows.push(row);
+    }
+    rows
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::overlays::permission::PermissionOverlay;
     use flok_core::tool::{PermissionDecision, PermissionRequest};
+    use ratatui::layout::Position;
     use tokio::sync::oneshot;
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -362,5 +391,28 @@ mod tests {
         let area = Rect::new(0, 0, 20, 8);
         let mut buf = Buffer::empty(area);
         bp.render(area, &mut buf, &theme);
+    }
+
+    #[test]
+    fn visible_rows_matches_render_output_length() {
+        let mut bp = BottomPane::new();
+        bp.handle_paste("hi there");
+        let theme = Theme::dark();
+        let area = Rect::new(0, 0, 20, 4);
+        let mut buf = Buffer::empty(area);
+
+        bp.render(area, &mut buf, &theme);
+        let rows = bp.visible_rows(area, &theme);
+
+        assert_eq!(rows.len(), usize::from(area.height));
+        for y in 0..area.height {
+            let rendered: String = (0..area.width)
+                .filter_map(|x| buf.cell(Position::new(x, y)))
+                .map(|cell| cell.symbol().to_string())
+                .collect::<String>()
+                .trim_end()
+                .to_string();
+            assert_eq!(rows[usize::from(y)], rendered);
+        }
     }
 }

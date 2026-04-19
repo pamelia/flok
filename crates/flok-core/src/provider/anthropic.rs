@@ -502,4 +502,39 @@ mod tests {
         assert!(json.contains("cache_control"));
         assert!(json.contains("ephemeral"));
     }
+
+    #[test]
+    fn opus_4_7_request_omits_fields_rejected_by_api() {
+        let request = CompletionRequest {
+            model: "anthropic/claude-opus-4-7".into(),
+            system: "You are helpful.".into(),
+            messages: vec![super::super::types::Message {
+                role: "user".into(),
+                content: vec![MessageContent::Text { text: "hi".into() }],
+            }],
+            tools: vec![],
+            max_tokens: 128,
+        };
+
+        let body = AnthropicProvider::build_request_body(&request);
+        let json = serde_json::to_string(&body).unwrap();
+
+        assert!(json.contains("claude-opus-4-7"));
+        assert!(
+            !json.contains("\"temperature\""),
+            "Opus 4.7 rejects temperature; it must not be serialized. Body was: {json}"
+        );
+        assert!(
+            !json.contains("\"top_p\""),
+            "Opus 4.7 rejects top_p; it must not be serialized. Body was: {json}"
+        );
+        assert!(
+            !json.contains("\"top_k\""),
+            "Opus 4.7 rejects top_k; it must not be serialized. Body was: {json}"
+        );
+        assert!(
+            !json.contains("\"thinking\""),
+            "Opus 4.7 rejects legacy extended thinking; thinking field must not be serialized. Body was: {json}"
+        );
+    }
 }

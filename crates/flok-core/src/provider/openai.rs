@@ -368,14 +368,14 @@ mod tests {
 
     #[test]
     fn parse_text_delta_chunk() {
-        let data = r#"{"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"gpt-4.1","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}"#;
+        let data = r#"{"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"gpt-5.4","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}"#;
         let event = parse_sse_chunk(data);
         assert!(matches!(event, StreamEvent::TextDelta(t) if t == "Hello"));
     }
 
     #[test]
     fn parse_tool_call_start_chunk() {
-        let data = r#"{"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"gpt-4.1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_abc","type":"function","function":{"name":"read","arguments":""}}]},"finish_reason":null}]}"#;
+        let data = r#"{"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"gpt-5.4","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_abc","type":"function","function":{"name":"read","arguments":""}}]},"finish_reason":null}]}"#;
         let event = parse_sse_chunk(data);
         assert!(
             matches!(event, StreamEvent::ToolCallStart { index: 0, id, name } if id == "call_abc" && name == "read")
@@ -384,7 +384,7 @@ mod tests {
 
     #[test]
     fn parse_tool_call_delta_chunk() {
-        let data = r#"{"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"gpt-4.1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"file"}}]},"finish_reason":null}]}"#;
+        let data = r#"{"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"gpt-5.4","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"file"}}]},"finish_reason":null}]}"#;
         let event = parse_sse_chunk(data);
         assert!(
             matches!(event, StreamEvent::ToolCallDelta { index: 0, delta } if delta == "{\"file")
@@ -393,14 +393,14 @@ mod tests {
 
     #[test]
     fn parse_finish_reason_chunk() {
-        let data = r#"{"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"gpt-4.1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#;
+        let data = r#"{"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"gpt-5.4","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#;
         let event = parse_sse_chunk(data);
         assert!(matches!(event, StreamEvent::Done));
     }
 
     #[test]
     fn parse_usage_chunk() {
-        let data = r#"{"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"gpt-4.1","choices":[],"usage":{"prompt_tokens":100,"completion_tokens":50,"total_tokens":150}}"#;
+        let data = r#"{"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"gpt-5.4","choices":[],"usage":{"prompt_tokens":100,"completion_tokens":50,"total_tokens":150}}"#;
         let event = parse_sse_chunk(data);
         assert!(matches!(event, StreamEvent::Usage { input_tokens: 100, output_tokens: 50, .. }));
     }
@@ -408,7 +408,7 @@ mod tests {
     #[test]
     fn build_request_body_with_tools() {
         let request = CompletionRequest {
-            model: "openai/gpt-4.1".into(),
+            model: "openai/gpt-5.4".into(),
             system: "You are a helper.".into(),
             messages: vec![super::super::types::Message {
                 role: "user".into(),
@@ -423,7 +423,7 @@ mod tests {
         };
 
         let body = OpenAiProvider::build_request_body(&request);
-        assert_eq!(body.model, "gpt-4.1");
+        assert_eq!(body.model, "gpt-5.4");
         assert!(body.stream);
         assert_eq!(body.messages.len(), 2); // system + user
         assert!(body.tools.is_some());
@@ -431,7 +431,7 @@ mod tests {
 
         // Verify serialization
         let json = serde_json::to_string(&body).unwrap();
-        assert!(json.contains("gpt-4.1"));
+        assert!(json.contains("gpt-5.4"));
         assert!(json.contains("function"));
     }
 }

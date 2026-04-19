@@ -89,7 +89,7 @@ mod tests {
 
     #[test]
     fn count_tokens_convenience_function() {
-        let count = count_tokens("fn main() { println!(\"hello\"); }", "openai/gpt-4.1");
+        let count = count_tokens("fn main() { println!(\"hello\"); }", "openai/gpt-5.4");
         assert!(count > 5);
         assert!(count < 20);
     }

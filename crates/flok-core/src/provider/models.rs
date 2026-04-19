@@ -42,6 +42,17 @@ impl ModelRegistry {
             // API IDs from https://docs.anthropic.com/en/docs/about-claude/models
             // The provider strips the "anthropic/" prefix before sending.
             ModelInfo {
+                id: "anthropic/claude-opus-4-7",
+                provider: "anthropic",
+                display_name: "Claude Opus 4.7",
+                context_window: 1_000_000,
+                max_output_tokens: 128_000,
+                input_cost_per_m: 5.0,
+                output_cost_per_m: 25.0,
+                supports_tools: true,
+                supports_streaming: true,
+            },
+            ModelInfo {
                 id: "anthropic/claude-opus-4-6",
                 provider: "anthropic",
                 display_name: "Claude Opus 4.6",
@@ -97,7 +108,41 @@ impl ModelRegistry {
                 supports_tools: true,
                 supports_streaming: true,
             },
-            // OpenAI
+            // OpenAI — current models
+            ModelInfo {
+                id: "openai/gpt-5.4",
+                provider: "openai",
+                display_name: "GPT-5.4",
+                context_window: 1_050_000,
+                max_output_tokens: 128_000,
+                input_cost_per_m: 2.50,
+                output_cost_per_m: 15.00,
+                supports_tools: true,
+                supports_streaming: true,
+            },
+            ModelInfo {
+                id: "openai/gpt-5.4-mini",
+                provider: "openai",
+                display_name: "GPT-5.4 Mini",
+                context_window: 400_000,
+                max_output_tokens: 128_000,
+                input_cost_per_m: 0.75,
+                output_cost_per_m: 4.50,
+                supports_tools: true,
+                supports_streaming: true,
+            },
+            ModelInfo {
+                id: "openai/gpt-5.4-nano",
+                provider: "openai",
+                display_name: "GPT-5.4 Nano",
+                context_window: 400_000,
+                max_output_tokens: 128_000,
+                input_cost_per_m: 0.20,
+                output_cost_per_m: 1.25,
+                supports_tools: true,
+                supports_streaming: true,
+            },
+            // OpenAI — legacy non-reasoning models
             ModelInfo {
                 id: "openai/gpt-4.1",
                 provider: "openai",
@@ -212,7 +257,7 @@ impl ModelRegistry {
     ///
     /// Accepts:
     /// - Full ID: `"anthropic/claude-sonnet-4-20250514"` (returned as-is)
-    /// - Short names: `"sonnet"`, `"opus"`, `"haiku"`, `"gpt-4.1"`, `"flash"`, `"pro"`
+    /// - Short names: `"sonnet"`, `"opus"`, `"haiku"`, `"gpt-5.4"`, `"mini"`, `"nano"`
     /// - Partial names: `"claude-sonnet-4"`, `"claude-opus-4"`
     ///
     /// Returns the full model ID, or the input unchanged if no match.
@@ -229,6 +274,9 @@ impl ModelRegistry {
             // Anthropic — current models (shorthands + explicit versions merged)
             "sonnet" | "claude-sonnet" | "sonnet-4.6" | "claude-sonnet-4.6"
             | "claude-sonnet-4-6" => "anthropic/claude-sonnet-4-6",
+            "opus-4.7" | "claude-opus-4.7" | "opus-4-7" | "claude-opus-4-7" => {
+                "anthropic/claude-opus-4-7"
+            }
             "opus" | "claude-opus" | "opus-4.6" | "claude-opus-4.6" | "claude-opus-4-6"
             | "opus-4-6" => "anthropic/claude-opus-4-6",
             "haiku" | "claude-haiku" | "haiku-4.5" | "claude-haiku-4.5" | "claude-haiku-4-5" => {
@@ -237,8 +285,15 @@ impl ModelRegistry {
             // Anthropic — legacy versions
             "sonnet-4" | "claude-sonnet-4" | "sonnet-4.0" => "anthropic/claude-sonnet-4-20250514",
             "opus-4" | "claude-opus-4" | "opus-4.0" => "anthropic/claude-opus-4-20250514",
+            "gpt-5.4" | "gpt5.4" | "5.4" | "chatgpt-5.4" | "chatgpt5.4" => "openai/gpt-5.4",
+            "gpt-5.4-mini" | "gpt5.4-mini" | "5.4-mini" | "mini" | "chatgpt-5.4-mini" => {
+                "openai/gpt-5.4-mini"
+            }
+            "gpt-5.4-nano" | "gpt5.4-nano" | "5.4-nano" | "nano" | "chatgpt-5.4-nano" => {
+                "openai/gpt-5.4-nano"
+            }
             "gpt-4.1" | "gpt4.1" | "4.1" => "openai/gpt-4.1",
-            "gpt-4.1-mini" | "4.1-mini" | "mini" => "openai/gpt-4.1-mini",
+            "gpt-4.1-mini" | "gpt4.1-mini" | "4.1-mini" => "openai/gpt-4.1-mini",
             "flash" | "gemini-flash" | "gemini-2.5-flash" => "google/gemini-2.5-flash",
             "pro" | "gemini-pro" | "gemini-2.5-pro" => "google/gemini-2.5-pro",
             "deepseek" | "deepseek-v3" | "deepseek-chat" => "deepseek/deepseek-chat",
@@ -258,7 +313,7 @@ mod tests {
     #[test]
     fn builtin_registry_has_models() {
         let registry = ModelRegistry::builtin();
-        assert!(registry.all().len() >= 9);
+        assert!(registry.all().len() >= 10);
     }
 
     #[test]
@@ -311,5 +366,30 @@ mod tests {
     #[test]
     fn resolve_opus_4_6() {
         assert_eq!(ModelRegistry::resolve("opus-4.6"), "anthropic/claude-opus-4-6");
+    }
+
+    #[test]
+    fn resolve_opus_4_7() {
+        assert_eq!(ModelRegistry::resolve("opus-4.7"), "anthropic/claude-opus-4-7");
+        assert_eq!(ModelRegistry::resolve("claude-opus-4-7"), "anthropic/claude-opus-4-7");
+    }
+
+    #[test]
+    fn lookup_openai_gpt_5_4() {
+        let registry = ModelRegistry::builtin();
+        let model = registry.get("openai/gpt-5.4").unwrap();
+        assert_eq!(model.display_name, "GPT-5.4");
+        assert_eq!(model.context_window, 1_050_000);
+        assert_eq!(model.max_output_tokens, 128_000);
+        assert!(model.supports_tools);
+        assert!(model.supports_streaming);
+    }
+
+    #[test]
+    fn resolve_openai_current_shorthands() {
+        assert_eq!(ModelRegistry::resolve("gpt-5.4"), "openai/gpt-5.4");
+        assert_eq!(ModelRegistry::resolve("chatgpt-5.4"), "openai/gpt-5.4");
+        assert_eq!(ModelRegistry::resolve("mini"), "openai/gpt-5.4-mini");
+        assert_eq!(ModelRegistry::resolve("nano"), "openai/gpt-5.4-nano");
     }
 }

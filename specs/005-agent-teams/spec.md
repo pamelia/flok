@@ -194,7 +194,7 @@ model = "anthropic/claude-opus-4.6"   # Deep reasoning for orchestration
 model = "deepseek/deepseek-chat"      # Cheap/fast for file search
 
 [agents.general]
-model = "openai/gpt-4.1"             # Balanced for code gen
+model = "openai/gpt-5.4"             # Balanced for code gen
 ```
 
 The `ProviderRegistry` routes each agent's requests to the correct provider, and the token cache tracks costs per-agent within the team. This enables cost-optimized teams where expensive reasoning models are used only for orchestration, while workers use cheaper models.

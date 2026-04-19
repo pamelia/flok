@@ -29,6 +29,8 @@ Based on the spec content, select 3-5 specialists from:
 | product-reviewer | When the spec has user-facing impact | User value, UX issues, root cause alignment |
 | operations-reviewer | When the spec has deployment/infra concerns | Deployment safety, observability, security |
 
+After selecting specialists, you will spawn EACH selected specialist ONCE PER CONFIGURED PROVIDER. For example, if 4 specialists are selected and 2 providers (Anthropic, OpenAI) are configured, you will spawn 8 sub-agents in total.
+
 ### Phase 3: Parallel Review
 
 1. Create a team: `team_create` with name `spec-review-<spec-name>`
@@ -38,6 +40,21 @@ Based on the spec content, select 3-5 specialists from:
    - For each finding, state: the specific concern, where in the spec it appears, the impact, and a suggested resolution
    - Self-critique: remove speculative findings that lack evidence from the spec
    - Send findings back to lead via `send_message`
+
+### Cross-Coverage Multi-Model Fan-Out
+
+Check your system prompt for the "Available Providers" section. For each configured provider, you MUST spawn every selected specialist.
+
+Example for 2 selected specialists (feasibility, clarity) + 2 providers (Anthropic, OpenAI):
+
+```
+task(subagent_type: "feasibility-reviewer", model: "opus", background: true, team_id: "...", prompt: "...")
+task(subagent_type: "feasibility-reviewer", model: "gpt-5.4", background: true, team_id: "...", prompt: "...")
+task(subagent_type: "clarity-reviewer", model: "opus", background: true, team_id: "...", prompt: "...")
+task(subagent_type: "clarity-reviewer", model: "gpt-5.4", background: true, team_id: "...", prompt: "...")
+```
+
+All agents run in parallel. If only ONE provider is configured, spawn each specialist once without a `model` parameter.
 
 IMPORTANT: Spawn ALL reviewers in a single message. Do NOT spawn them one at a time.
 
@@ -49,6 +66,8 @@ After all reviewers report back, check for conflicting findings:
 - If multiple specialists flag the same concern from different angles, elevate its priority
 - Remove duplicate findings (same section + same concern = duplicate)
 
+**Cross-review challenges are single-model**: when challenging a finding, spawn the challenger on the same model the original reviewer used. Only Phase 3 (initial review) uses cross-coverage multi-model fan-out.
+
 ### Phase 5: Synthesize & Output
 
 1. Deduplicate overlapping findings
@@ -56,6 +75,19 @@ After all reviewers report back, check for conflicting findings:
 3. Determine verdict:
    - **REQUEST_CHANGES** if any critical or high-priority findings exist that would cause implementation failure or user harm
    - **APPROVE** otherwise (minor gaps can be addressed during implementation)
+
+### Cross-Model Synthesis
+
+Each finding arrives tagged with its reviewer AND the model that produced it. Synthesize as follows:
+
+1. **Group findings by topic**: Findings from different models about the same spec section and concern are the SAME finding.
+
+2. **Classify confidence**:
+   - **HIGH CONFIDENCE**: Flagged by the same specialist on BOTH providers. Report first.
+   - **MODEL-SPECIFIC**: Flagged only by one provider. Report, but label with the model (e.g., "[Only flagged by anthropic/opus-4.7]").
+   - **CONTRADICTORY**: One provider says "this is a bug", the other says "this is intentional". Flag for human judgment.
+
+3. **In the final report**, include a summary line: "Reviewed by N specialists × M providers = K total agents. X findings with cross-model agreement, Y model-specific findings, Z contradictions."
 
 Output format:
 
@@ -65,7 +97,7 @@ Output format:
 **Verdict: APPROVE / REQUEST_CHANGES**
 
 ### Critical Findings
-- [Section] Description and suggested resolution
+- [Section] Description and suggested resolution (Provider: <model>)
 
 ### High Priority
 - [Section] Description and suggested resolution
@@ -81,6 +113,7 @@ Output format:
 
 ### Summary
 <1-2 paragraph synthesis of the spec's readiness>
+Reviewed by N specialists × M providers = K total agents. X findings with cross-model agreement, Y model-specific findings, Z contradictions.
 ```
 
 After the review, disband the team with `team_delete`.

@@ -2,7 +2,9 @@
 
 **Feature Branch**: `005-agent-teams`
 **Created**: 2026-03-28
-**Status**: Draft
+**Status**: Accepted
+
+Accepted 2026-04-19: cross-coverage multi-model review is the chosen fan-out strategy; ProviderRegistry + per-provider semaphores are the chosen plumbing.
 
 ## User Scenarios & Testing
 
@@ -68,6 +70,9 @@
 - **FR-009**: Message injection MUST be delivered asynchronously -- the sender does not block on the recipient processing the message.
 - **FR-010**: On session cancellation, all owned teams MUST be disbanded automatically.
 - **FR-011**: On startup, stale teams (active teams from crashed sessions) MUST be reconciled (marked disbanded).
+- **FR-012**: When a sub-agent is dispatched to provider X without an explicit model, flok MUST use `provider.X.default_model` (or fall back to the first model alias that resolves to provider X).
+- **FR-013**: The `task` tool MUST accept an optional `model` parameter. When provided, it MUST resolve via ModelRegistry, extract the provider name, and dispatch the sub-agent to that provider through the registry. When omitted, the sub-agent inherits the caller's provider/model.
+- **FR-014**: The lead's system prompt MUST include a list of available providers (e.g., `Available providers: anthropic (opus-4.7), openai (gpt-5.4)`) so the lead LLM knows what to iterate over for cross-coverage.
 
 ### Built-in Agent Definitions
 
@@ -183,21 +188,74 @@ Key primitives: `team_spawn` (creates agent with channel), `team_message` (point
 
 ### Mixed-Model Team Support (Killer Feature #1)
 
-The killer move: let a lead agent be Claude Opus while teammates are GPT-5.3, Gemini 3, or a local model. Each agent in a team can use a different model, configured via agent definitions or routing tiers (see spec-012):
-
-```toml
-# Per-agent model overrides within a team
-[agents.lead]
-model = "anthropic/claude-opus-4.6"   # Deep reasoning for orchestration
-
-[agents.explore]
-model = "deepseek/deepseek-chat"      # Cheap/fast for file search
-
-[agents.general]
-model = "openai/gpt-5.4"             # Balanced for code gen
-```
+The killer move: let a lead agent be Claude Opus while teammates are GPT-5.3, Gemini 3, or a local model. Each agent in a team can use a different model, configured via agent definitions or routing tiers (see spec-012).
 
 The `ProviderRegistry` routes each agent's requests to the correct provider, and the token cache tracks costs per-agent within the team. This enables cost-optimized teams where expensive reasoning models are used only for orchestration, while workers use cheaper models.
+
+See [Cross-Coverage Multi-Model Review](#cross-coverage-multi-model-review) for how this is used to stress-test reviews across multiple providers.
+
+### Cross-Coverage Multi-Model Review
+
+Motivation: The user wants every finding stress-tested by multiple models, so each specialist reviewer runs once PER configured provider. This ensures that no single model's bias or blind spot compromises the review quality.
+
+**Fan-out algorithm (pseudo-code):**
+```rust
+for specialist in selected_specialists {
+    for provider in configured_providers {
+        task(
+            subagent_type: specialist,
+            model: provider.default_model,
+            background: true,
+            team_id: current_team_id
+        )
+    }
+}
+```
+
+**Example**: 4 specialists (correctness, style, architecture, completeness) + 2 providers (anthropic, openai) = 8 parallel agents.
+
+**Findings Provenance**:
+Findings schema includes `reviewer: "correctness @ anthropic/opus-4.7"` so the lead knows exactly which model produced which finding.
+
+**Lead Synthesis Rules**:
+1. **High Confidence**: Findings flagged by BOTH providers (or a majority of providers).
+2. **Provider-Specific**: Findings flagged by only one provider are still reported but labeled with the provider name.
+3. **Contradictions**: Contradictory findings between models are explicitly flagged for human judgment.
+
+**Rate Limiting**:
+To prevent one provider's requests from starving another, flok uses a per-provider semaphore (see [Provider Registry](#provider-registry)).
+
+### Provider Registry
+
+The `ProviderRegistry` manages the lifecycle and access to multiple LLM providers. It is constructed at startup from the `FlokConfig`.
+
+**Struct Shape**:
+```rust
+pub struct ProviderRegistry {
+    providers: HashMap<String, Arc<dyn Provider>>,
+    default_models: HashMap<String, String>,
+    semaphores: HashMap<String, Arc<tokio::sync::Semaphore>>,
+}
+```
+
+**Methods**:
+- `get(name: &str) -> Option<Arc<dyn Provider>>`: Retrieve a provider by name.
+- `default_model(name: &str) -> Option<&str>`: Get the default model for a provider.
+- `acquire_permit(name: &str) -> Result<SemaphorePermit>`: Acquire a rate-limiting permit for a specific provider.
+- `configured_providers() -> Vec<&str>`: List all providers with valid API keys.
+
+**Construction**:
+1. Iterate over `config.provider` HashMap at startup.
+2. Instantiate every provider that has an `api_key`.
+3. Assign each provider a `Semaphore` with capacity = `config.team.max_per_provider` (default 3).
+
+**Lookup Flow**:
+1. `task` tool receives `model` parameter.
+2. `ModelRegistry::resolve(model)` returns full ID (e.g., `"anthropic/claude-opus-4-7"`).
+3. `ModelRegistry::provider_name(full_id)` extracts provider name (e.g., `"anthropic"`).
+4. `registry.get(provider_name)` retrieves the provider instance.
+5. `registry.acquire_permit(provider_name)` ensures independent rate limiting.
+6. Request is dispatched to the provider.
 
 ### Git Worktree Isolation (Killer Feature #2)
 
@@ -412,6 +470,8 @@ fn cross_review_target(source: &str) -> Option<&str> {
 - **SC-003**: Auto-send-to-lead fires within 100ms of agent completion
 - **SC-004**: Team reconciliation on startup completes in < 100ms
 - **SC-005**: Full spec-review (5 agents, 3 phases) completes in < 5 minutes for a typical spec
+- **SC-006**: Cross-coverage review with 4 specialists × 2 providers = 8 parallel agents completes in < 2 minutes wall-clock for a typical PR
+- **SC-007**: Per-provider semaphore ensures anthropic-side contention never blocks openai-side requests
 
 ## Assumptions
 
@@ -420,9 +480,13 @@ fn cross_review_target(source: &str) -> Option<&str> {
 - Auto-send-to-lead is the right default (agents shouldn't need to remember to report back)
 - 5-minute member timeout is sufficient for most agent tasks
 
-## Open Questions
+## Open Questions (Resolved)
 
-- Should we support inter-team communication (agents from different teams talking)?
-- Should the routing table be configurable or is the hardcoded version sufficient?
-- Should agents be able to spawn their own sub-teams (nested team hierarchy)?
-- How should we handle agent memory conflicts (two agents writing to the same memory key)?
+- **Should we support inter-team communication (agents from different teams talking)?**
+  - Decision: NOT supported in v1. Teams are isolated. Members within a team message each other.
+- **Should the routing table be configurable or is the hardcoded version sufficient?**
+  - Decision: NOT in v1. Hardcoded table is fine. Future: config-driven.
+- **Should agents be able to spawn their own sub-teams (nested team hierarchy)?**
+  - Decision: NOT supported in v1. Flat hierarchy only. Task tool filter prevents recursion.
+- **How should we handle agent memory conflicts (two agents writing to the same memory key)?**
+  - Decision: Last-write-wins with timestamps. Memory writes log both agent name and timestamp. Future enhancement: locking.

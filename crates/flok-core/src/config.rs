@@ -16,6 +16,12 @@ use serde::{Deserialize, Serialize, Serializer};
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct FlokConfig {
+    /// Default model to use when the `--model` CLI flag is not provided.
+    ///
+    /// Accepts any alias supported by [`crate::provider::ModelRegistry`]
+    /// (for example `"sonnet"`, `"opus-4.7"`, `"gpt-5.4"`), or a fully
+    /// qualified ID like `"anthropic/claude-opus-4-7"`.
+    pub model: Option<String>,
     /// Provider configurations keyed by provider name.
     pub provider: std::collections::HashMap<String, ProviderConfig>,
     pub lsp: LspConfig,
@@ -131,14 +137,19 @@ impl Default for WorktreeConfig {
 }
 
 /// Configuration for a single LLM provider.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct ProviderConfig {
     /// API key. Read ONLY from the config file at runtime. Wrapped in
     /// `SecretString` for zeroize-on-drop and redacted `Debug`.
-    #[serde(default, serialize_with = "serialize_api_key_opt")]
+    #[serde(serialize_with = "serialize_api_key_opt")]
     pub api_key: Option<SecretString>,
     /// Base URL override.
     pub base_url: Option<String>,
+    /// Default model for this provider. Used as a fallback when neither
+    /// `--model` CLI flag nor top-level `model` config is set — the first
+    /// provider (alphabetical by key) with a `default_model` wins.
+    pub default_model: Option<String>,
 }
 
 /// Serialize an `Option<SecretString>` by exposing its plaintext.
@@ -225,8 +236,20 @@ pub fn load_config(project_root: &Path) -> anyhow::Result<FlokConfig> {
 
 /// Merge `source` config into `target`. Source values override target values.
 fn merge_config(target: &mut FlokConfig, source: &FlokConfig) {
+    if source.model.is_some() {
+        target.model.clone_from(&source.model);
+    }
     for (key, value) in &source.provider {
-        target.provider.insert(key.clone(), value.clone());
+        let entry = target.provider.entry(key.clone()).or_default();
+        if value.api_key.is_some() {
+            entry.api_key.clone_from(&value.api_key);
+        }
+        if value.base_url.is_some() {
+            entry.base_url.clone_from(&value.base_url);
+        }
+        if value.default_model.is_some() {
+            entry.default_model.clone_from(&value.default_model);
+        }
     }
     target.lsp = source.lsp.clone();
     // Worktree config: source overrides target entirely if present in source file
@@ -330,13 +353,12 @@ mod tests {
                 ProviderConfig {
                     api_key: Some(SecretString::from("key-123".to_string())),
                     base_url: None,
+                    default_model: None,
                 },
             )]
             .into_iter()
             .collect(),
-            lsp: LspConfig::default(),
-            worktree: WorktreeConfig::default(),
-            permission: std::collections::HashMap::new(),
+            ..Default::default()
         };
         merge_config(&mut base, &overlay);
         assert_eq!(
@@ -368,6 +390,7 @@ mod tests {
             ProviderConfig {
                 api_key: Some(SecretString::from("sk-test-roundtrip".to_string())),
                 base_url: None,
+                default_model: None,
             },
         );
         let config = FlokConfig { provider, ..Default::default() };
@@ -390,6 +413,7 @@ mod tests {
         let provider = ProviderConfig {
             api_key: Some(SecretString::from("plain-text-xyz".to_string())),
             base_url: None,
+            default_model: None,
         };
         let rendered = format!("{provider:?}");
         assert!(!rendered.contains("plain-text-xyz"), "Debug output leaked plaintext: {rendered}");
@@ -469,5 +493,83 @@ mod tests {
         .unwrap();
         merge_config(&mut base, &overlay);
         assert!(base.permission.contains_key("bash"));
+    }
+
+    #[test]
+    fn parse_config_with_default_model() {
+        let toml_str = r#"
+            model = "opus-4.7"
+
+            [provider.anthropic]
+            api_key = "sk-test"
+            default_model = "opus-4.7"
+        "#;
+        let config: FlokConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.model.as_deref(), Some("opus-4.7"));
+        assert_eq!(config.provider["anthropic"].default_model.as_deref(), Some("opus-4.7"),);
+        assert_eq!(
+            config.provider["anthropic"].api_key.as_ref().map(SecretString::expose_secret),
+            Some("sk-test"),
+        );
+    }
+
+    #[test]
+    fn parse_config_without_default_model_defaults_to_none() {
+        let toml_str = r#"
+            [provider.anthropic]
+            api_key = "sk-test"
+        "#;
+        let config: FlokConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.model.is_none());
+        assert!(config.provider["anthropic"].default_model.is_none());
+    }
+
+    #[test]
+    fn merge_model_overlay_overrides_base() {
+        let mut base = FlokConfig { model: Some("sonnet".into()), ..Default::default() };
+        let overlay = FlokConfig { model: Some("opus-4.7".into()), ..Default::default() };
+        merge_config(&mut base, &overlay);
+        assert_eq!(base.model.as_deref(), Some("opus-4.7"));
+    }
+
+    #[test]
+    fn merge_model_unset_overlay_preserves_base() {
+        let mut base = FlokConfig { model: Some("sonnet".into()), ..Default::default() };
+        let overlay = FlokConfig::default();
+        merge_config(&mut base, &overlay);
+        assert_eq!(base.model.as_deref(), Some("sonnet"));
+    }
+
+    #[test]
+    fn merge_default_model_overlay_preserves_api_key() {
+        let mut base = FlokConfig::default();
+        base.provider.insert(
+            "anthropic".to_string(),
+            ProviderConfig {
+                api_key: Some(SecretString::from("sk-base".to_string())),
+                base_url: None,
+                default_model: None,
+            },
+        );
+        let overlay = FlokConfig {
+            provider: [(
+                "anthropic".to_string(),
+                ProviderConfig {
+                    api_key: None,
+                    base_url: None,
+                    default_model: Some("opus-4.7".into()),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        merge_config(&mut base, &overlay);
+        assert_eq!(
+            base.provider["anthropic"].api_key.as_ref().map(SecretString::expose_secret),
+            Some("sk-base"),
+            "api_key from base must survive an overlay that only sets default_model",
+        );
+        assert_eq!(base.provider["anthropic"].default_model.as_deref(), Some("opus-4.7"),);
     }
 }

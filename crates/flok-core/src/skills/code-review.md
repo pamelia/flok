@@ -63,6 +63,8 @@ Assess the PR size and select reviewers accordingly:
 
 For spec reviews or architecture changes, also consider: api-reviewer, clarity-reviewer, scope-reviewer, product-reviewer.
 
+After selecting specialists based on PR size, you will spawn EACH selected specialist ONCE PER CONFIGURED PROVIDER. For example, if 3 specialists are selected and 2 providers (Anthropic, OpenAI) are configured, you will spawn 6 sub-agents in total.
+
 ### Phase 3: Team Setup & Parallel Review
 
 1. Create a team: `team_create` with a descriptive name (e.g., `code-review-pr-<N>`)
@@ -71,7 +73,33 @@ For spec reviews or architecture changes, also consider: api-reviewer, clarity-r
    - `background: true`
    - `team_id: <team_id>`
    - `subagent_type`: one of the reviewer agent types listed above
+   - `model`: (Optional) The specific model to use for this task
    - `prompt`: Include the full diff, PR description, and specific review instructions
+
+### Cross-Coverage Multi-Model Fan-Out
+
+Check your system prompt for the "Available Providers" section. For each configured provider, you MUST spawn every selected specialist.
+
+Example for 3 selected specialists (completeness, feasibility, api) + 2 providers (Anthropic, OpenAI):
+
+```
+// Create team
+team_create(name: "code-review-pr-123")  → team_id: "..."
+
+// Fan out: 3 specialists × 2 providers = 6 parallel agents
+task(subagent_type: "completeness-reviewer", model: "opus", background: true, team_id: "...", prompt: "...")
+task(subagent_type: "completeness-reviewer", model: "gpt-5.4", background: true, team_id: "...", prompt: "...")
+task(subagent_type: "feasibility-reviewer", model: "opus", background: true, team_id: "...", prompt: "...")
+task(subagent_type: "feasibility-reviewer", model: "gpt-5.4", background: true, team_id: "...", prompt: "...")
+task(subagent_type: "api-reviewer", model: "opus", background: true, team_id: "...", prompt: "...")
+task(subagent_type: "api-reviewer", model: "gpt-5.4", background: true, team_id: "...", prompt: "...")
+```
+
+All agents run in parallel. Per-provider semaphores ensure load on one provider doesn't block another.
+
+**If only ONE provider is configured**: spawn each specialist once without a `model` parameter. Cross-coverage is not possible, but the review still runs.
+
+**Rate limiting**: Per-provider concurrency is capped at 3 by default. With 6+ agents across providers, some will queue naturally.
 
 IMPORTANT: Spawn ALL reviewers in a single message (multiple tool calls in parallel). Do NOT spawn them one at a time.
 
@@ -94,6 +122,19 @@ After spawning all reviewers, the background agents will complete their reviews 
    - **REQUEST_CHANGES** if any critical or high-priority actionable findings exist
    - **APPROVE** otherwise
 
+### Cross-Model Synthesis
+
+Each finding arrives tagged with its reviewer AND the model that produced it (e.g., "correctness-reviewer @ anthropic/opus-4.7"). Synthesize as follows:
+
+1. **Group findings by topic** (not by reviewer). A "missing null check on line 42" from Anthropic and "unchecked None on line 42" from OpenAI are the SAME finding.
+
+2. **Classify confidence**:
+   - **HIGH CONFIDENCE**: Flagged by the same specialist on BOTH providers. Report first.
+   - **MODEL-SPECIFIC**: Flagged only by one provider. Report, but label with the model (e.g., "[Only flagged by openai/gpt-5.4]").
+   - **CONTRADICTORY**: One provider says "this is a bug", the other says "this is intentional". Flag for human judgment.
+
+3. **In the final report**, include a summary line: "Reviewed by N specialists × M providers = K total agents. X findings with cross-model agreement, Y model-specific findings, Z contradictions."
+
 ### Phase 5: Format Report
 
 Output a structured report:
@@ -104,7 +145,7 @@ Output a structured report:
 **Verdict: APPROVE / REQUEST_CHANGES**
 
 ### Critical Findings
-- [file:line] Description of the issue and suggested fix
+- [file:line] Description of the issue and suggested fix (Provider: <model>)
 
 ### High Priority
 - ...
@@ -120,6 +161,7 @@ Output a structured report:
 
 ### Summary
 <1-2 paragraph synthesis>
+Reviewed by N specialists × M providers = K total agents. X findings with cross-model agreement, Y model-specific findings, Z contradictions.
 ```
 
 ## Important Notes

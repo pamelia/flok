@@ -305,6 +305,33 @@ Example `flok.toml`:
 # auto_merge = true        # Auto-merge worktree changes back
 ```
 
+### Default Model
+
+Set a default model in your config so you don't have to pass `--model` on every run:
+
+```toml
+model = "opus-4.7"
+```
+
+Or per-provider — handy when you switch providers:
+
+```toml
+[provider.anthropic]
+default_model = "opus-4.7"
+
+[provider.openai]
+default_model = "gpt-5.4"
+```
+
+`default_model` accepts any alias listed by `flok models` (or a full ID).
+
+**Precedence** (first match wins):
+
+1. `--model` CLI flag
+2. top-level `model` in `flok.toml`
+3. first `[provider.X].default_model` (alphabetical by provider name)
+4. hardcoded `"sonnet"` fallback
+
 ### AGENTS.md
 
 Drop an `AGENTS.md` file in your project root to inject project-specific instructions

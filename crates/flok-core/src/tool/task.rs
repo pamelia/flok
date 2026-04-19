@@ -9,11 +9,14 @@
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
+use tokio::sync::Semaphore;
 
 use crate::agent;
 use crate::bus::BusEvent;
 use crate::config::WorktreeConfig;
-use crate::provider::{CompletionRequest, Message, MessageContent, StreamEvent};
+use crate::provider::{
+    CompletionRequest, Message, MessageContent, ModelRegistry, ProviderRegistry, StreamEvent,
+};
 use crate::team::{TeamMessage, TeamRegistry};
 use crate::worktree::WorktreeManager;
 
@@ -26,26 +29,17 @@ use super::{Tool, ToolContext, ToolOutput};
 /// headroom. This is a doom-loop safety valve, not a performance throttle.
 const MAX_SUBAGENT_STEPS: usize = 25;
 
-/// Maximum concurrent background agent API calls.
-///
-/// Limits how many sub-agents can call `provider.stream()` simultaneously.
-/// This prevents rate-limiting when spawning multiple reviewers in parallel.
-/// Set to 3 to match the typical reviewer team size (3 specialists).
-const MAX_CONCURRENT_AGENTS: usize = 3;
-
 /// Maximum retry attempts for sub-agent API calls.
 const MAX_SUBAGENT_RETRIES: u32 = 3;
 
-/// Global semaphore for throttling concurrent sub-agent API calls.
-static AGENT_SEMAPHORE: std::sync::LazyLock<tokio::sync::Semaphore> =
-    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(MAX_CONCURRENT_AGENTS));
-
 /// Spawn a sub-agent to handle a task.
 pub struct TaskTool {
-    /// The provider for the sub-agent (shared with parent).
-    provider: Arc<dyn crate::provider::Provider>,
-    /// Model ID to use for sub-agent API calls (e.g., "anthropic/claude-opus-4-6").
-    model_id: String,
+    /// Registry of all configured providers available to sub-agents.
+    provider_registry: Arc<ProviderRegistry>,
+    /// Provider name inherited from the caller when `model` is omitted.
+    default_provider: String,
+    /// Model ID inherited from the caller when `model` is omitted.
+    default_model_id: String,
     /// Tool registry (sub-agents get a filtered set — no task tool to prevent recursion).
     tools: Arc<crate::tool::ToolRegistry>,
     /// Bus for emitting events.
@@ -64,8 +58,9 @@ impl TaskTool {
     /// Create a new task tool.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        provider: Arc<dyn crate::provider::Provider>,
-        model_id: String,
+        provider_registry: Arc<ProviderRegistry>,
+        default_provider: String,
+        default_model_id: String,
         tools: Arc<crate::tool::ToolRegistry>,
         bus: crate::bus::Bus,
         project_root: std::path::PathBuf,
@@ -74,8 +69,9 @@ impl TaskTool {
         team_registry: TeamRegistry,
     ) -> Self {
         Self {
-            provider,
-            model_id,
+            provider_registry,
+            default_provider,
+            default_model_id,
             tools,
             bus,
             project_root,
@@ -116,6 +112,10 @@ impl Tool for TaskTool {
                     "type": "string",
                     "description": format!("The type of agent to use:\n{agent_list}")
                 },
+                "model": {
+                    "type": "string",
+                    "description": "Optional model alias or full ID (e.g., 'opus', 'gpt-5.4', 'anthropic/claude-opus-4-7'). If omitted, the sub-agent uses the caller's current provider/model. Use this for cross-coverage multi-model review: spawn the same specialist once per configured provider."
+                },
                 "background": {
                     "type": "boolean",
                     "description": "If true, the agent runs in the background and returns immediately with a task_id. Use with team_id for parallel multi-agent workflows."
@@ -140,6 +140,7 @@ impl Tool for TaskTool {
         let agent_type = args["subagent_type"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("missing required parameter: subagent_type"))?;
+        let requested_model = args.get("model").and_then(serde_json::Value::as_str);
 
         // Look up the agent definition
         let agent_def = agent::get_subagent(agent_type).ok_or_else(|| {
@@ -152,10 +153,20 @@ impl Tool for TaskTool {
 
         tracing::info!(agent = agent_type, description, background, "spawning sub-agent task");
 
+        let target = self.resolve_target(requested_model)?;
+
         // Background mode: spawn the agent and return immediately
         if background {
             return self
-                .execute_background(description, prompt, agent_type, &agent_def, team_id, ctx)
+                .execute_background(
+                    description,
+                    prompt,
+                    agent_type,
+                    &agent_def,
+                    team_id,
+                    ctx,
+                    target,
+                )
                 .await;
         }
 
@@ -213,8 +224,9 @@ impl Tool for TaskTool {
         );
 
         // Run the sub-agent prompt loop with the effective project root
-        let result =
-            self.run_subagent(system, prompt, &ctx.session_id, description, &effective_root).await;
+        let result = self
+            .run_subagent(system, prompt, &ctx.session_id, description, &effective_root, target)
+            .await;
 
         // Merge worktree changes back if applicable
         let mut merge_info = String::new();
@@ -266,11 +278,46 @@ impl Tool for TaskTool {
     }
 }
 
+#[derive(Clone)]
+struct SubagentTarget {
+    provider_name: String,
+    provider: Arc<dyn crate::provider::Provider>,
+    model_id: String,
+    semaphore: Arc<Semaphore>,
+}
+
 impl TaskTool {
+    fn resolve_target(&self, requested_model: Option<&str>) -> anyhow::Result<SubagentTarget> {
+        let model_id =
+            requested_model.map_or_else(|| self.default_model_id.clone(), ModelRegistry::resolve);
+        let provider_name = if requested_model.is_some() {
+            ModelRegistry::provider_name(&model_id).to_string()
+        } else {
+            self.default_provider.clone()
+        };
+
+        let provider = self.provider_registry.get(&provider_name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Provider '{provider_name}' is not configured for sub-agent model '{}'. Available providers: {}",
+                model_id,
+                self.provider_registry.describe()
+            )
+        })?;
+        let semaphore = self.provider_registry.semaphore(&provider_name).ok_or_else(|| {
+            anyhow::anyhow!("Provider '{provider_name}' is missing a concurrency semaphore")
+        })?;
+
+        Ok(SubagentTarget { provider_name, provider, model_id, semaphore })
+    }
+
     /// Execute a background sub-agent that runs asynchronously and reports
     /// results via team messaging.
     ///
     /// Returns immediately with the agent's `task_id`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "background dispatch needs execution context plus routing target"
+    )]
     async fn execute_background(
         &self,
         description: &str,
@@ -279,6 +326,7 @@ impl TaskTool {
         agent_def: &agent::AgentDef,
         team_id: Option<String>,
         ctx: &ToolContext,
+        target: SubagentTarget,
     ) -> anyhow::Result<ToolOutput> {
         let task_id = ulid::Ulid::new().to_string();
         let agent_name = format!("{agent_type}-{}", &task_id[..8]);
@@ -307,8 +355,10 @@ impl TaskTool {
         );
 
         // Clone everything needed for the spawned task
-        let provider = Arc::clone(&self.provider);
-        let model_id = self.model_id.clone();
+        let provider = Arc::clone(&target.provider);
+        let provider_name = target.provider_name.clone();
+        let model_id = target.model_id.clone();
+        let semaphore = Arc::clone(&target.semaphore);
         let tools = Arc::clone(&self.tools);
         let bus = self.bus.clone();
         let session_id = ctx.session_id.clone();
@@ -326,6 +376,8 @@ impl TaskTool {
                 agent_type = %agent_type,
                 task_id = %task_id_clone,
                 team_id = ?team_id_clone,
+                provider = %provider_name,
+                model = %model_id,
                 "background agent task spawned"
             );
 
@@ -338,6 +390,7 @@ impl TaskTool {
             let result = run_subagent_standalone(
                 provider,
                 &model_id,
+                semaphore,
                 tools,
                 &system,
                 &prompt,
@@ -431,6 +484,7 @@ impl TaskTool {
         parent_session_id: &str,
         description: &str,
         effective_root: &std::path::Path,
+        target: SubagentTarget,
     ) -> anyhow::Result<String> {
         let mut messages = vec![Message {
             role: "user".into(),
@@ -453,7 +507,7 @@ impl TaskTool {
             tracing::debug!(step, description, "sub-agent step");
 
             let request = CompletionRequest {
-                model: self.model_id.clone(),
+                model: target.model_id.clone(),
                 system: system.clone(),
                 messages: messages.clone(),
                 tools: filtered_tools.clone(),
@@ -462,7 +516,8 @@ impl TaskTool {
 
             // Use retry + concurrency-limited streaming
             let (text, tool_calls) =
-                stream_with_retry(&self.provider, request, description).await?;
+                stream_with_retry(&target.provider, request, description, &target.semaphore)
+                    .await?;
 
             // Store the assistant message
             let mut parts: Vec<MessageContent> = Vec::new();
@@ -525,12 +580,13 @@ struct SubToolCall {
 
 /// Stream a completion with retry and backoff for sub-agents.
 ///
-/// Acquires the global concurrency semaphore before each attempt,
-/// throttling parallel API calls to prevent rate limiting.
+/// Acquires the provider-local concurrency semaphore before each attempt,
+/// isolating rate limiting between configured providers.
 async fn stream_with_retry(
     provider: &Arc<dyn crate::provider::Provider>,
     request: CompletionRequest,
     description: &str,
+    semaphore: &Arc<Semaphore>,
 ) -> anyhow::Result<(String, Vec<SubToolCall>)> {
     let mut last_error = None;
 
@@ -547,20 +603,26 @@ async fn stream_with_retry(
             tokio::time::sleep(delay).await;
         }
 
-        // Acquire the concurrency semaphore — blocks if too many agents are active
-        let available = AGENT_SEMAPHORE.available_permits();
+        // Acquire the provider-local concurrency semaphore.
+        let available = semaphore.available_permits();
         if available == 0 {
             tracing::debug!(
                 description,
                 attempt,
-                "waiting for agent semaphore (all {MAX_CONCURRENT_AGENTS} permits in use)"
+                provider = provider.name(),
+                "waiting for provider semaphore (all permits in use)"
             );
         }
-        let _permit = AGENT_SEMAPHORE
+        let _permit = semaphore
             .acquire()
             .await
-            .map_err(|e| anyhow::anyhow!("agent semaphore closed: {e}"))?;
-        tracing::debug!(description, attempt, "acquired agent semaphore, streaming LLM request");
+            .map_err(|e| anyhow::anyhow!("provider semaphore closed: {e}"))?;
+        tracing::debug!(
+            description,
+            attempt,
+            provider = provider.name(),
+            "acquired provider semaphore, streaming LLM request"
+        );
 
         let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
         let prov = Arc::clone(provider);
@@ -640,6 +702,7 @@ async fn stream_with_retry(
 async fn run_subagent_standalone(
     provider: Arc<dyn crate::provider::Provider>,
     model_id: &str,
+    semaphore: Arc<Semaphore>,
     tools: Arc<crate::tool::ToolRegistry>,
     system: &str,
     prompt: &str,
@@ -675,7 +738,8 @@ async fn run_subagent_standalone(
         };
 
         // Use retry + concurrency-limited streaming
-        let (text, tool_calls) = stream_with_retry(&provider, request, description).await?;
+        let (text, tool_calls) =
+            stream_with_retry(&provider, request, description, &semaphore).await?;
 
         let mut parts: Vec<MessageContent> = Vec::new();
         if !text.is_empty() {
@@ -723,4 +787,172 @@ async fn run_subagent_standalone(
     }
 
     Err(anyhow::anyhow!("Background sub-agent exceeded {MAX_SUBAGENT_STEPS} steps"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::{Arc, Mutex};
+
+    use tokio::sync::mpsc;
+
+    use crate::bus::Bus;
+    use crate::config::WorktreeConfig;
+    use crate::provider::{Provider, StreamEvent};
+    use crate::team::TeamRegistry;
+
+    #[derive(Debug)]
+    struct RecordingProvider {
+        name: &'static str,
+        response: String,
+        seen_models: Mutex<Vec<String>>,
+    }
+
+    impl RecordingProvider {
+        fn new(name: &'static str, response: &str) -> Self {
+            Self { name, response: response.to_string(), seen_models: Mutex::new(Vec::new()) }
+        }
+
+        fn seen_models(&self) -> Vec<String> {
+            self.seen_models.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for RecordingProvider {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        async fn stream(
+            &self,
+            request: CompletionRequest,
+            tx: mpsc::UnboundedSender<StreamEvent>,
+        ) -> anyhow::Result<()> {
+            self.seen_models
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(request.model);
+            let _ = tx.send(StreamEvent::TextDelta(self.response.clone()));
+            let _ = tx.send(StreamEvent::Done);
+            Ok(())
+        }
+    }
+
+    fn test_task_tool(
+        provider_registry: Arc<ProviderRegistry>,
+        default_provider: &str,
+        default_model_id: &str,
+    ) -> TaskTool {
+        let project_root = std::env::temp_dir();
+        TaskTool::new(
+            provider_registry,
+            default_provider.to_string(),
+            default_model_id.to_string(),
+            Arc::new(crate::tool::ToolRegistry::new()),
+            Bus::new(16),
+            std::fs::canonicalize(&project_root).expect("canonical project root"),
+            Arc::new(WorktreeManager::new("test-project", project_root)),
+            WorktreeConfig { enabled: false, ..WorktreeConfig::default() },
+            TeamRegistry::new(),
+        )
+    }
+
+    fn test_context() -> ToolContext {
+        ToolContext {
+            project_root: std::env::temp_dir(),
+            session_id: "session-1".to_string(),
+            agent: "lead".to_string(),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            lsp: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_with_explicit_model_routes_to_requested_provider() {
+        let anthropic = Arc::new(RecordingProvider::new("anthropic", "anthropic"));
+        let openai = Arc::new(RecordingProvider::new("openai", "openai"));
+        let anthropic_dyn: Arc<dyn Provider> = anthropic.clone();
+        let openai_dyn: Arc<dyn Provider> = openai.clone();
+
+        let mut registry = ProviderRegistry::new();
+        registry.insert("anthropic", anthropic_dyn, Some("anthropic/claude-opus-4-7".into()), 3);
+        registry.insert("openai", openai_dyn, Some("openai/gpt-5.4".into()), 3);
+
+        let tool = test_task_tool(Arc::new(registry), "anthropic", "anthropic/claude-opus-4-7");
+        let output = tool
+            .execute(
+                serde_json::json!({
+                    "description": "cross check",
+                    "prompt": "say which provider handled this",
+                    "subagent_type": "general",
+                    "model": "gpt-5.4"
+                }),
+                &test_context(),
+            )
+            .await
+            .expect("task executes");
+
+        assert!(!output.is_error);
+        assert_eq!(output.content, "openai");
+        assert!(anthropic.seen_models().is_empty());
+        assert_eq!(openai.seen_models(), vec!["openai/gpt-5.4".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn execute_without_model_uses_default_provider_and_model() {
+        let anthropic = Arc::new(RecordingProvider::new("anthropic", "anthropic"));
+        let openai = Arc::new(RecordingProvider::new("openai", "openai"));
+        let anthropic_dyn: Arc<dyn Provider> = anthropic.clone();
+        let openai_dyn: Arc<dyn Provider> = openai.clone();
+
+        let mut registry = ProviderRegistry::new();
+        registry.insert("anthropic", anthropic_dyn, Some("anthropic/claude-opus-4-7".into()), 3);
+        registry.insert("openai", openai_dyn, Some("openai/gpt-5.4".into()), 3);
+
+        let tool = test_task_tool(Arc::new(registry), "anthropic", "anthropic/claude-opus-4-7");
+        let output = tool
+            .execute(
+                serde_json::json!({
+                    "description": "default route",
+                    "prompt": "say which provider handled this",
+                    "subagent_type": "general"
+                }),
+                &test_context(),
+            )
+            .await
+            .expect("task executes");
+
+        assert!(!output.is_error);
+        assert_eq!(output.content, "anthropic");
+        assert_eq!(anthropic.seen_models(), vec!["anthropic/claude-opus-4-7".to_string()]);
+        assert!(openai.seen_models().is_empty());
+    }
+
+    #[tokio::test]
+    async fn execute_with_unknown_provider_model_returns_clear_error() {
+        let anthropic = Arc::new(RecordingProvider::new("anthropic", "anthropic"));
+        let anthropic_dyn: Arc<dyn Provider> = anthropic.clone();
+
+        let mut registry = ProviderRegistry::new();
+        registry.insert("anthropic", anthropic_dyn, Some("anthropic/claude-opus-4-7".into()), 3);
+
+        let tool = test_task_tool(Arc::new(registry), "anthropic", "anthropic/claude-opus-4-7");
+        let error = tool
+            .execute(
+                serde_json::json!({
+                    "description": "unknown route",
+                    "prompt": "this should fail",
+                    "subagent_type": "general",
+                    "model": "google/gemini-2.5-pro"
+                }),
+                &test_context(),
+            )
+            .await
+            .expect_err("unknown provider should error");
+
+        assert!(error.to_string().contains("Provider 'google' is not configured"));
+        assert!(anthropic.seen_models().is_empty());
+    }
 }

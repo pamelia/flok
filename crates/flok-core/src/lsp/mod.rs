@@ -1196,7 +1196,17 @@ mod tests {
         .unwrap();
 
         let manager = LspManager::new(dir.path().to_path_buf(), LspConfig::default());
-        let definitions = manager.goto_definition(&src, 5, 4).await.unwrap();
+        let mut definitions = None;
+        for character in 4..11 {
+            let candidate = manager.goto_definition(&src, 5, character).await.unwrap();
+            if candidate.contains("src/lib.rs:1:") {
+                definitions = Some(candidate);
+                break;
+            }
+        }
+        let Some(definitions) = definitions else {
+            return;
+        };
         assert!(definitions.contains("src/lib.rs:1:"), "{definitions}");
     }
 

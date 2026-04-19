@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use flok_core::bus::{Bus, BusEvent};
-use flok_core::config::{RuntimeFallbackConfig, WorktreeConfig};
+use flok_core::config::{AgentConfig, RuntimeFallbackConfig, WorktreeConfig};
 use flok_core::provider::{CompletionRequest, Provider, ProviderRegistry, StreamEvent};
 use flok_core::team::TeamRegistry;
 use flok_core::tool::{TaskTool, Tool, ToolContext, ToolRegistry};
@@ -254,6 +254,7 @@ async fn fallback_in_task_tool_sub_agent() {
         Arc::clone(&registry),
         "anthropic".to_string(),
         "anthropic/claude-sonnet-4-6".to_string(),
+        std::collections::HashMap::<String, AgentConfig>::new(),
         Arc::new(ToolRegistry::new()),
         Bus::new(16),
         project_root.clone(),

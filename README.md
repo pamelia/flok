@@ -338,6 +338,26 @@ default_model = "gpt-5.4"
 
 `default_model` accepts any alias listed by `flok models` (or a full ID).
 
+### Per-Agent Model Overrides
+
+Built-in sub-agents can also override their preferred model, fallback chain, and
+system prompt extension:
+
+```toml
+[agents.explore]
+model = "haiku"
+fallback_models = ["minimax", "nano"]
+prompt_append = "Be concise. Skip non-essential detail."
+
+[agents.feasibility-reviewer]
+model = "opus-4.7"
+prompt_append = "Pay extra attention to operational risks."
+```
+
+When a sub-agent is spawned, `task(model=...)` wins first, then `[agents.<name>]`,
+then the session default model. If `fallback_models` is set for an agent, it
+replaces the provider-level fallback chain for that agent.
+
 **Precedence** (first match wins):
 
 1. `--model` CLI flag

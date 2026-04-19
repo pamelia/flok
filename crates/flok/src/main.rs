@@ -184,6 +184,7 @@ async fn run(args: cli::Args) -> Result<()> {
         Arc::clone(&provider_registry),
         flok_core::provider::ModelRegistry::provider_name(&model_id).to_string(),
         model_id.clone(),
+        config.agents.clone(),
         base_tools,
         bus.clone(),
         project_root.clone(),

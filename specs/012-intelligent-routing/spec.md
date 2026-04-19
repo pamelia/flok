@@ -4,7 +4,7 @@
 **Created**: 2026-03-28
 **Status**: Accepted
 
-Accepted 2026-04-19: Tier 1 scope locked — provider-level fallback chains + runtime error-driven failover. Tier 2+ explicitly deferred.
+Accepted 2026-04-19: Tier 1 scope locked — provider-level fallback chains + runtime error-driven failover. Tier 2 scope locked 2026-04-19: per-agent model + fallback_models + prompt_append. Tier 3 (categories, variants, per-model concurrency, content-complexity routing) remains Future Work.
 
 ## User Scenarios & Testing
 
@@ -90,6 +90,50 @@ fallback = ["anthropic"]
 - `task` tool's `stream_with_retry` uses fallback for sub-agent streams
 - BOTH surface `ProviderFallback` events to the bus for UI toast
 
+## Tier 2 Scope (This Sprint)
+
+**Goal**: Let users configure each agent's preferred model, its fallback chain, and a prompt extension via `[agents.X]` blocks in `flok.toml`. This matches the shape of mature orchestration configs like oh-my-opencode where each agent (oracle, explore, etc.) has its own model and fallback list.
+
+### Config additions
+
+```toml
+# Per-agent config (NEW — applies to built-in subagent_types: explore, general,
+# feasibility-reviewer, complexity-reviewer, completeness-reviewer,
+# operations-reviewer, api-reviewer, clarity-reviewer, scope-reviewer,
+# product-reviewer)
+[agents.oracle]                                          # not a built-in yet — placeholder
+model = "gpt-5.4"
+fallback_models = ["gemini-3.1-pro", "claude-opus-4-7"]
+prompt_append = "Focus on edge cases and security."
+
+[agents.explore]
+model = "minimax-m2.5"
+fallback_models = ["claude-haiku-4-5", "gpt-5-nano"]
+
+[agents.feasibility-reviewer]
+model = "claude-opus-4-7"
+prompt_append = "Pay extra attention to operational risks."
+```
+
+### Resolution precedence (highest to lowest)
+
+When a sub-agent is spawned via `task(subagent_type=X, ...)`:
+
+1. **task call's explicit `model` param** (Tier 1 behavior — already shipped)
+2. **`[agents.X].model`** — agent-level default
+3. **Session default** — what the lead is currently using
+4. **Hardcoded fallback** — `"sonnet"`
+
+When determining the fallback chain for a sub-agent:
+
+1. **If task call specified `model` explicitly** → use Tier 1 provider chain (`[provider.X].fallback`) for that model's provider
+2. **Else if `[agents.X].fallback_models` is set** → use AGENT's list (REPLACES Tier 1 provider chain — agent's explicit list wins by specificity)
+3. **Else** → fall back to provider chain of whatever model resolved in resolution precedence step 2
+
+### System prompt assembly
+
+The agent's effective system prompt = `AgentDef::system_prompt` (the built-in spec) + `\n\n` + `[agents.X].prompt_append` (user customization). Append, not replace. If `prompt_append` is absent, use the built-in unchanged.
+
 ## Requirements
 
 ### Functional Requirements
@@ -167,6 +211,12 @@ fallback = ["anthropic"]
 - **FR-019**: Cooldown tracking MUST be in-memory (not persisted); providers in cooldown MUST be skipped during fallback selection.
 - **FR-020**: When all providers in a chain have failed or are in cooldown, the runtime MUST surface a structured error listing each attempted provider and its failure reason.
 - **FR-021**: The fallback logic MUST work for both lead-session streams and sub-agent (`task` tool) streams.
+- **FR-022**: `flok.toml` MUST support an `[agents.X]` section per built-in agent type. Fields: `model: Option<String>`, `fallback_models: Vec<String>` (default empty), `prompt_append: Option<String>`.
+- **FR-023**: When a sub-agent is spawned without an explicit `model` parameter, the runtime MUST resolve the model in this order: `[agents.X].model` → session default → `"sonnet"` fallback.
+- **FR-024**: When `[agents.X].fallback_models` is set, the sub-agent MUST use that list as its fallback chain, OVERRIDING any provider-level chain from Tier 1. When a sub-agent's task call specifies an explicit `model`, the runtime MUST use the Tier 1 provider chain instead (the task-level override implies the user wants provider-level fallback semantics).
+- **FR-025**: When `[agents.X].prompt_append` is set, the runtime MUST append it to the agent's built-in `system_prompt` (separated by `\n\n`). When absent, the built-in prompt MUST be used unchanged.
+- **FR-026**: Unknown agent names in config (e.g., `[agents.nonexistent]`) MUST log a warning and be ignored — they MUST NOT cause a parse error or runtime crash.
+- **FR-027**: Per-agent fallback MUST share the same `CooldownTracker` as Tier 1, so a provider in cooldown from a lead-session failure is also skipped in agent fallback chains.
 
 - **FR-011**: Default routing MUST be inferred from available providers when no explicit config exists:
   - If only Anthropic is available: Haiku → explore, Sonnet → build, Opus → plan
@@ -440,10 +490,8 @@ fn categorize_model(model_id: &str) -> ModelCategory {
 4. **Learning-based routing (train on past sessions)**: Deferred. Interesting for post-1.0, but adds complexity. Static heuristics are a better starting point.
 5. **Per-tool routing (different model for each tool call)**: Rejected. Too granular. The three-tier system is sufficient and simpler.
 
-## Future Work (Tier 2+)
+## Future Work (Tier 3+)
 
-- **Tier 2**: Per-agent fallback chains (`[agents.oracle] model = "gpt-5.4", fallback = [...]`). Currently Tier 1 is provider-level; per-agent is richer but requires config schema for `[agents.X]` which doesn't yet exist in flok.
-- **Tier 2**: Per-agent `prompt_append` for custom system-prompt extensions via config.
 - **Tier 3**: Categories (visual-engineering, ultrabrain, quick, etc.) as a delegation abstraction above `subagent_type`.
 - **Tier 3**: Model variants (`xhigh`/`high`/`medium`/`low`) mapping to extended-thinking or reasoning_effort.
 - **Tier 3**: Per-model concurrency limits (beyond per-provider).
@@ -462,6 +510,10 @@ fn categorize_model(model_id: &str) -> ModelCategory {
 - **SC-007**: When all providers in a chain fail, the user sees a clear error identifying which providers were tried and why each failed.
 - **SC-008**: A provider in cooldown for 120s is not retried within that window even if another failure occurs.
 - **SC-009**: `BusEvent::ProviderFallback` is emitted exactly once per successful failover.
+- **SC-010**: Configure `[agents.explore] model = "haiku-4-5"`. Spawn explore via `task` without `model` param. The sub-agent uses haiku-4-5 (verified via stream model field).
+- **SC-011**: Configure `[agents.oracle] fallback_models = ["openai/gpt-5.4"]`. Mock primary to fail with HTTP 529. Sub-agent succeeds via gpt-5.4 within 10s. `BusEvent::ProviderFallback` emitted exactly once.
+- **SC-012**: Configure `[agents.feasibility-reviewer] prompt_append = "EXTRA: ..."`. Spawn the agent. The system prompt sent to the LLM contains both the built-in feasibility-reviewer prompt AND the appended text.
+- **SC-013**: Configure `[agents.nonexistent]`. Loading config does not error; a warning is logged.
 
 ## Assumptions
 

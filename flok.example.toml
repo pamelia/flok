@@ -39,6 +39,11 @@
 # api_key = "..."              # Set via: flok auth login --provider minimax
 # default_model = "minimax"
 
+[agents.explore]
+# model = "haiku"                            # Preferred model for this built-in agent
+# fallback_models = ["minimax", "nano"]    # Replaces provider fallback chain for this agent
+# prompt_append = "Be concise."              # Appended to the built-in system prompt
+
 [runtime_fallback]
 # enabled = true
 # retry_on_errors = [429, 500, 502, 503, 529]

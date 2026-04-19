@@ -2,7 +2,7 @@
 
 **Feature Branch**: `010-git-worktree-isolation`
 **Created**: 2026-03-28
-**Status**: Draft
+**Status**: Accepted (2026-04-19 — feature shipped; spec retroactively locked to match built reality.)
 
 ## User Scenarios & Testing
 

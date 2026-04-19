@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Terminal UI components for flok (iocraft-based)"
+description = "Terminal UI for flok (ratatui-based)"
 
 [lints]
 workspace = true
@@ -12,14 +12,17 @@ workspace = true
 [dependencies]
 flok-core = { path = "../flok-core" }
 
-iocraft = { workspace = true }
-crossterm = { workspace = true }
+crossterm = { workspace = true, features = ["event-stream"] }
 tokio = { workspace = true }
+tokio-stream = { workspace = true, features = ["sync"] }
 anyhow = { workspace = true }
-arboard = { workspace = true }
 tracing = { workspace = true }
 unicode-width = { workspace = true }
-taffy = { workspace = true }
+ratatui = { version = "0.29", features = ["scrolling-regions", "unstable-widget-ref"] }
+ratatui-macros = "0.6"
+textwrap = "0.16"
+pulldown-cmark = "0.12"
+unicode-segmentation = "1"
 
 [dev-dependencies]
 insta = { workspace = true }

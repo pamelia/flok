@@ -542,10 +542,8 @@ fn FlokApp(mut hooks: Hooks, props: &mut FlokAppProps) -> impl Into<AnyElement<'
                         KeyCode::Tab => {
                             is_plan.set(!is_plan.get());
                         }
-                        KeyCode::Enter if shift => {
-                            if !waiting.get() {
-                                input_text.write().push('\n');
-                            }
+                        KeyCode::Enter if shift && !waiting.get() => {
+                            input_text.write().push('\n');
                         }
                         KeyCode::Enter => {
                             let text = input_text.read().clone();
@@ -592,18 +590,16 @@ fn FlokApp(mut hooks: Hooks, props: &mut FlokAppProps) -> impl Into<AnyElement<'
                             }
                         }
                         // Readline keybinds
-                        KeyCode::Char('w') if ctrl => {
-                            if !waiting.get() {
-                                let mut text = input_text.read().clone();
-                                let trimmed = text.trim_end().len();
-                                text.truncate(trimmed);
-                                if let Some(pos) = text.rfind(|c: char| c.is_whitespace()) {
-                                    text.truncate(pos + 1);
-                                } else {
-                                    text.clear();
-                                }
-                                input_text.set(text);
+                        KeyCode::Char('w') if ctrl && !waiting.get() => {
+                            let mut text = input_text.read().clone();
+                            let trimmed = text.trim_end().len();
+                            text.truncate(trimmed);
+                            if let Some(pos) = text.rfind(|c: char| c.is_whitespace()) {
+                                text.truncate(pos + 1);
+                            } else {
+                                text.clear();
                             }
+                            input_text.set(text);
                         }
                         KeyCode::Char('a') if ctrl => {
                             input_handle.write().set_cursor_offset(0);

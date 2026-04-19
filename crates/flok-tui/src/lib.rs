@@ -1,12 +1,20 @@
-//! # flok-tui
-//!
-//! Terminal UI for flok. Built on `iocraft` with a declarative, React-like
-//! component model. This crate provides the main TUI application and all
-//! visual components.
-
-mod components;
-pub mod theme;
+mod adapter;
+mod app;
+mod app_event;
+mod bottom_pane;
+mod chat_view;
+mod composer;
+mod footer;
+mod history;
+mod markdown;
+mod overlays;
+mod run;
+mod sidebar;
+mod stream;
+mod theme;
+mod tui;
 pub mod types;
 
-pub use components::app::run_app;
-pub use types::{PermissionPrompt, QuestionDialog, UiCommand, UiEvent};
+pub use flok_core::tool::TodoList;
+pub use run::run_app;
+pub use types::{PermissionPrompt, QuestionDialog, TuiChannels, UiCommand, UiEvent};

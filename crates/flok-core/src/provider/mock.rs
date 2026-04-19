@@ -110,7 +110,7 @@ impl Provider for MockProvider {
 
 impl std::fmt::Debug for MockProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let len = self.turns.lock().map(|q| q.len()).unwrap_or(0);
+        let len = self.turns.lock().map_or(0, |q| q.len());
         f.debug_struct("MockProvider").field("remaining_turns", &len).finish()
     }
 }

@@ -879,7 +879,7 @@ fn format_diagnostics_snapshot(
         .iter()
         .filter(|(path, _)| if is_file { *path == target } else { path.starts_with(target) })
         .collect();
-    entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+    entries.sort_by_key(|(left, _)| *left);
 
     for (path, diagnostics) in entries {
         for diagnostic in

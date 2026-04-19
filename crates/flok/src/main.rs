@@ -684,7 +684,9 @@ fn run_models() -> Result<()> {
             );
         }
         println!("\n{} models available", models.len());
-        println!("\nShorthands: sonnet, opus, haiku, gpt-4.1, mini, flash, pro, deepseek, r1");
+        println!(
+            "\nShorthands: sonnet, opus, haiku, gpt-5.4, chatgpt-5.4, mini, nano, gpt-4.1, flash, pro, deepseek, r1"
+        );
     }
     Ok(())
 }
@@ -709,7 +711,7 @@ struct ProviderMeta {
 
 const AUTH_PROVIDERS: &[ProviderMeta] = &[
     ProviderMeta { name: "anthropic", display_name: "Anthropic (Claude)" },
-    ProviderMeta { name: "openai", display_name: "OpenAI (GPT-4.1)" },
+    ProviderMeta { name: "openai", display_name: "OpenAI (GPT-5.4)" },
     ProviderMeta { name: "deepseek", display_name: "DeepSeek (V3 / R1)" },
     ProviderMeta { name: "minimax", display_name: "MiniMax (M2.7)" },
 ];

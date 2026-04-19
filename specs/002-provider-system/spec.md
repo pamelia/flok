@@ -59,12 +59,12 @@
   utility = "anthropic/claude-haiku-4.5"    # Internal: title gen, compaction, summaries
   ```
   The router scores prompt complexity and automatically selects the appropriate tier. This alone can cut costs 3-5x.
-- **FR-003a**: Flok MUST support mixed-model agent teams: each agent within a team can use a different model/provider. A lead agent can be Claude Opus while workers use GPT-4.1 or Gemini -- all in the same session. Per-agent model overrides take precedence over routing tiers.
+- **FR-003a**: Flok MUST support mixed-model agent teams: each agent within a team can use a different model/provider. A lead agent can be Claude Opus while workers use GPT-5.4 or Gemini -- all in the same session. Per-agent model overrides take precedence over routing tiers.
 - **FR-004**: Flok MUST support fallback chains per routing tier:
   ```toml
   [routing.fallbacks]
-  explore = ["openai/gpt-4.1-mini", "google/gemini-2.5-flash"]
-  build = ["openai/gpt-4.1", "google/gemini-2.5-pro"]
+  explore = ["openai/gpt-5.4-mini", "google/gemini-2.5-flash"]
+  build = ["openai/gpt-5.4", "google/gemini-2.5-pro"]
   plan = ["openai/o3", "google/gemini-2.5-pro"]
   ```
 - **FR-005**: Flok MUST implement retry with exponential backoff:
@@ -268,6 +268,6 @@ async fn stream_with_timeout(
 
 ## Open Questions
 
-- ~~Should we bundle a model registry (like opencode's models.dev) or rely purely on config?~~ **Decision: Hardcode a small table.** Ship a built-in registry of ~10 known models (Claude Sonnet 4/Opus 4/Haiku 4.5, GPT-4.1/4.1-mini, Gemini 2.5 Flash/Pro, DeepSeek V3/R1) with context window sizes, pricing, and capability flags. Users can override or add models via `flok.toml`. No external API dependency for the registry.
+- ~~Should we bundle a model registry (like opencode's models.dev) or rely purely on config?~~ **Decision: Hardcode a small table.** Ship a built-in registry of current known models (Claude Sonnet 4/Opus 4/Haiku 4.5, GPT-5.4/5.4-mini/5.4-nano, GPT-4.1/4.1-mini for legacy compatibility, Gemini 2.5 Flash/Pro, DeepSeek V3/R1) with context window sizes, pricing, and capability flags. Users can override or add models via `flok.toml`. No external API dependency for the registry.
 - ~~Should we support Amazon Bedrock and Azure OpenAI from day one?~~ **Decision: No.** Bedrock and Azure OpenAI are deferred post-v1.0. Focus on direct Anthropic, OpenAI, Google Gemini, and OpenAI-compatible APIs.
 - How to handle provider-specific features (e.g., Anthropic's extended thinking) in the unified stream interface?

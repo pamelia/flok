@@ -25,8 +25,8 @@ AI-assisted coding workflows. Single binary, no runtime dependencies.
 ## Features
 
 **Providers & Models**
-- **Multi-provider support** -- Anthropic Claude (4.6/4), OpenAI GPT-4.1, DeepSeek
-- **Model shorthand aliases** -- `sonnet`, `opus`, `haiku`, `gpt-4.1`, `mini`, `deepseek`, `r1`
+- **Multi-provider support** -- Anthropic Claude (4.6/4), OpenAI GPT-5.4 family, DeepSeek
+- **Model shorthand aliases** -- `sonnet`, `opus`, `haiku`, `gpt-5.4`, `chatgpt-5.4`, `mini`, `nano`, `deepseek`, `r1`
 - **Prompt caching** -- Anthropic cache_control breakpoints for cost savings
 - **Streaming responses** -- real-time text and reasoning delta streaming
 
@@ -100,7 +100,8 @@ flok
 
 # Use a specific model
 flok --model opus
-flok -m gpt-4.1
+flok -m gpt-5.4
+flok -m chatgpt-5.4
 
 # Specify working directory
 flok -d /path/to/project
@@ -197,12 +198,15 @@ When the LLM requests a write or dangerous operation, you'll see a permission di
 | `opus-4.7` | Claude Opus 4.7 | Anthropic | 1M |
 | `opus` | Claude Opus 4.6 | Anthropic | 1M |
 | `haiku` | Claude Haiku 4.5 | Anthropic | 200K |
-| `gpt-4.1` | GPT-4.1 | OpenAI | ~1M |
-| `mini` | GPT-4.1 Mini | OpenAI | ~1M |
+| `gpt-5.4` | GPT-5.4 | OpenAI | 1.05M |
+| `chatgpt-5.4` | GPT-5.4 | OpenAI | 1.05M |
+| `mini` | GPT-5.4 Mini | OpenAI | 400K |
+| `nano` | GPT-5.4 Nano | OpenAI | 400K |
+| `gpt-4.1` | GPT-4.1 | OpenAI (legacy) | ~1M |
 | `deepseek` | DeepSeek V3 | DeepSeek | 128K |
 | `r1` | DeepSeek R1 | DeepSeek | 128K |
 
-Legacy: `sonnet-4`, `opus-4` for Claude Sonnet 4 / Opus 4 (previous generation).
+Legacy: `sonnet-4`, `opus-4` for Claude Sonnet 4 / Opus 4, plus explicit `gpt-4.1` / `gpt-4.1-mini` for older OpenAI non-reasoning models.
 
 DeepSeek uses the OpenAI-compatible API format with a different base URL.
 

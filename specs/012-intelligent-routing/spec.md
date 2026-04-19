@@ -65,8 +65,8 @@
 - **FR-003**: Flok MUST support fallback chains per tier:
   ```toml
   [routing.fallbacks]
-  explore = ["openai/gpt-4.1-mini", "google/gemini-2.5-flash"]
-  build = ["openai/gpt-4.1", "google/gemini-2.5-pro"]
+  explore = ["openai/gpt-5.4-mini", "google/gemini-2.5-flash"]
+  build = ["openai/gpt-5.4", "google/gemini-2.5-pro"]
   plan = ["openai/o3", "google/gemini-2.5-pro"]
   ```
 
@@ -115,7 +115,7 @@
 
 - **FR-011**: Default routing MUST be inferred from available providers when no explicit config exists:
   - If only Anthropic is available: Haiku → explore, Sonnet → build, Opus → plan
-  - If only OpenAI is available: GPT-4.1-mini → explore, GPT-4.1 → build, o3 → plan
+  - If only OpenAI is available: GPT-5.4 mini → explore, GPT-5.4 → build, o3 → plan
   - If multiple providers: prefer Anthropic for build (best tool use), any for explore
 
 ### Key Entities

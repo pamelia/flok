@@ -1572,19 +1572,25 @@ fn handle_slash_command(
 
 /// Available models for the model picker.
 fn get_model_list() -> Vec<(&'static str, &'static str, &'static str)> {
-    vec![
-        ("Claude Opus 4.6", "Anthropic", "anthropic/claude-opus-4-6"),
-        ("Claude Sonnet 4.6", "Anthropic", "anthropic/claude-sonnet-4-6"),
-        ("Claude Haiku 4.5", "Anthropic", "anthropic/claude-haiku-4-5-20251001"),
-        ("Claude Sonnet 4 (legacy)", "Anthropic", "anthropic/claude-sonnet-4-20250514"),
-        ("Claude Opus 4 (legacy)", "Anthropic", "anthropic/claude-opus-4-20250514"),
-        ("GPT-4.1", "OpenAI", "openai/gpt-4.1"),
-        ("GPT-4.1 Mini", "OpenAI", "openai/gpt-4.1-mini"),
-        ("Gemini 2.5 Flash", "Google", "google/gemini-2.5-flash"),
-        ("Gemini 2.5 Pro", "Google", "google/gemini-2.5-pro"),
-        ("DeepSeek V3", "DeepSeek", "deepseek/deepseek-chat"),
-        ("DeepSeek R1", "DeepSeek", "deepseek/deepseek-reasoner"),
-    ]
+    let registry = flok_core::provider::ModelRegistry::builtin();
+    let mut models: Vec<_> = registry
+        .all()
+        .into_iter()
+        .map(|model| (model.display_name, provider_display_name(model.provider), model.id))
+        .collect();
+    models.sort_by_key(|(name, provider, _)| (*provider, *name));
+    models
+}
+
+fn provider_display_name(provider: &str) -> &'static str {
+    match provider {
+        "anthropic" => "Anthropic",
+        "openai" => "OpenAI",
+        "google" => "Google",
+        "deepseek" => "DeepSeek",
+        "minimax" => "MiniMax",
+        _ => "Other",
+    }
 }
 
 /// Commands available in the command palette.

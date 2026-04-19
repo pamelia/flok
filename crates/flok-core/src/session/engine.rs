@@ -33,7 +33,11 @@ const MAX_IDENTICAL_CALLS: usize = 3;
 /// - Base instructions for the coding agent
 /// - Project root and current working directory
 /// - AGENTS.md content if it exists in the project root
-fn build_system_prompt(project_root: &std::path::Path) -> String {
+/// - Available multi-provider runtime options for cross-coverage sub-agent dispatch
+fn build_system_prompt(
+    project_root: &std::path::Path,
+    provider_registry: &crate::provider::ProviderRegistry,
+) -> String {
     let mut prompt = String::from(
         r"You are flok, an expert AI coding agent for the terminal.
 
@@ -201,6 +205,38 @@ When referencing specific functions or pieces of code include the pattern `file_
         std::env::consts::OS,
         chrono::Local::now().format("%Y-%m-%d"),
     );
+
+    let configured_providers = provider_registry.configured_providers();
+    let _ = writeln!(prompt, "\n## Available Providers\n");
+    if configured_providers.len() <= 1 {
+        if let Some(provider_name) = configured_providers.first() {
+            let default_model = provider_registry
+                .display_default_model(provider_name)
+                .unwrap_or_else(|| "not set".to_string());
+            let _ = writeln!(prompt, "Available providers: {}.", provider_registry.describe());
+            let _ = writeln!(
+                prompt,
+                "Only {provider_name} is configured (default model: {default_model}) — cross-coverage review will run specialists once."
+            );
+        } else {
+            let _ = writeln!(prompt, "No providers are configured for sub-agent dispatch.");
+        }
+    } else {
+        let _ = writeln!(
+            prompt,
+            "You have these LLM providers configured and can dispatch sub-agents to each via the `task` tool's `model` parameter:"
+        );
+        for provider_name in configured_providers {
+            let default_model = provider_registry
+                .display_default_model(provider_name)
+                .unwrap_or_else(|| "not set".to_string());
+            let _ = writeln!(prompt, "- {provider_name} (default model: {default_model})");
+        }
+        let _ = writeln!(
+            prompt,
+            "\nFor multi-model review (code review, spec review), use cross-coverage: spawn each specialist ONCE PER PROVIDER by calling `task(...)` multiple times with different `model` values. This ensures every finding is stress-tested by every available model."
+        );
+    }
 
     // List available skills (built-in + project-local)
     let _ = writeln!(prompt, "\n# Available Skills\n");
@@ -831,7 +867,8 @@ impl SessionEngine {
             }
 
             let mut messages = self.assemble_messages()?;
-            let system = build_system_prompt(&self.state.project_root);
+            let system =
+                build_system_prompt(&self.state.project_root, &self.state.provider_registry);
 
             // Pre-flight token count: estimate context usage
             let estimated_tokens = estimate_message_tokens(&messages, &system, &token_counter);
@@ -1981,6 +2018,7 @@ mod tests {
     use crate::config::FlokConfig;
     use crate::lsp::LspManager;
     use crate::provider::mock::{MockProvider, MockToolCall, MockTurn};
+    use crate::provider::ProviderRegistry;
     use crate::session::PlanMode;
     use crate::snapshot::SnapshotManager;
     use crate::token::CostTracker;
@@ -2027,7 +2065,7 @@ mod tests {
 
     fn test_engine_with_tools(
         temp_dir: &TempDir,
-        provider: Arc<MockProvider>,
+        provider: &Arc<MockProvider>,
         tools: ToolRegistry,
     ) -> SessionEngine {
         let project_root = std::fs::canonicalize(temp_dir.path()).expect("canonical project root");
@@ -2038,10 +2076,21 @@ mod tests {
 
         let snapshot = Arc::new(SnapshotManager::new("test-session", project_root.clone()));
         let lsp = Arc::new(LspManager::disabled(project_root.clone()));
+        let provider_concrete: Arc<MockProvider> = Arc::clone(provider);
+        let provider_dyn: Arc<dyn crate::provider::Provider> = provider_concrete;
+        let mut provider_registry = ProviderRegistry::new();
+        provider_registry.insert(
+            "mock",
+            Arc::clone(&provider_dyn),
+            Some("mock/test-model".into()),
+            3,
+        );
+        let provider_registry = Arc::new(provider_registry);
         let state = AppState::new(
             db,
             FlokConfig::default(),
-            provider as Arc<dyn crate::provider::Provider>,
+            provider_dyn,
+            provider_registry,
             tools,
             Bus::new(16),
             PermissionManager::auto_approve(),
@@ -2097,10 +2146,31 @@ mod tests {
         ]));
         provider.push_turn(MockTurn::Text("done".into()));
 
-        let mut engine = test_engine_with_tools(&temp_dir, Arc::clone(&provider), tools);
+        let mut engine = test_engine_with_tools(&temp_dir, &provider, tools);
         let result = engine.send_message("run tools").await.expect("send message succeeds");
 
         assert!(matches!(result, SendMessageResult::Complete(ref text) if text == "done"));
         assert_eq!(log.lock().await.as_slice(), ["write_like", "safe_like"]);
+    }
+
+    #[test]
+    fn build_system_prompt_lists_configured_providers() {
+        let anthropic: Arc<dyn crate::provider::Provider> = Arc::new(MockProvider::new());
+        let openai: Arc<dyn crate::provider::Provider> = Arc::new(MockProvider::new());
+        let mut provider_registry = ProviderRegistry::new();
+        provider_registry.insert(
+            "anthropic",
+            anthropic,
+            Some("anthropic/claude-opus-4-7".into()),
+            3,
+        );
+        provider_registry.insert("openai", openai, Some("openai/gpt-5.4".into()), 3);
+
+        let prompt = build_system_prompt(std::path::Path::new("/tmp/project"), &provider_registry);
+
+        assert!(prompt.contains("## Available Providers"));
+        assert!(prompt.contains("- anthropic (default model: opus-4.7)"));
+        assert!(prompt.contains("- openai (default model: gpt-5.4)"));
+        assert!(prompt.contains("task` tool's `model` parameter"));
     }
 }

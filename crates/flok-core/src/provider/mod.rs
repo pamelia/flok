@@ -9,12 +9,14 @@ mod minimax;
 pub mod mock;
 mod models;
 mod openai;
+pub mod registry;
 mod types;
 
 pub use anthropic::AnthropicProvider;
 pub use minimax::MiniMaxProvider;
-pub use models::{ModelInfo, ModelRegistry};
+pub use models::{resolve_default_model, ModelInfo, ModelRegistry};
 pub use openai::OpenAiProvider;
+pub use registry::{ProviderRegistry, DEFAULT_PERMITS_PER_PROVIDER};
 pub use types::{
     CompletionRequest, Message, MessageContent, Provider, StreamEvent, ToolDefinition,
 };

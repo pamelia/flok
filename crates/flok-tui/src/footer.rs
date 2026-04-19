@@ -21,8 +21,8 @@ const PLAN_BADGE_TEXT: &str = " PLAN ";
 const BUILD_BADGE_TEXT: &str = " BUILD ";
 const HINT_SEPARATOR: &str = "   ";
 /// Hint priority: kept first, dropped last. So `Esc cancel` is dropped first
-/// when width gets tight, and `Ctrl+B sidebar` is the final hint to remain.
-const HINTS: [&str; 4] = ["Ctrl+B sidebar", "Ctrl+C quit", "Tab plan", "Esc cancel"];
+/// when width gets tight, and `Tab plan` is the final hint to remain.
+const HINTS: [&str; 2] = ["Tab plan", "Esc cancel"];
 
 pub(crate) fn render(state: &FooterState, theme: &Theme, area: Rect, buf: &mut Buffer) {
     if area.width == 0 || area.height == 0 {
@@ -195,8 +195,6 @@ mod tests {
         render(&state, &theme, area, &mut buf);
 
         let row = buffer_text(&buf, 0);
-        assert!(!row.contains("Ctrl+B"), "row: {row:?}");
-        assert!(!row.contains("Ctrl+C"), "row: {row:?}");
         assert!(!row.contains("Tab plan"), "row: {row:?}");
         assert!(!row.contains("Esc cancel"), "row: {row:?}");
         assert!(!row.contains("streaming"), "row: {row:?}");
@@ -217,7 +215,7 @@ mod tests {
         assert!(row.contains("sonnet"), "row: {row:?}");
         assert!(!row.contains("ctx"), "row: {row:?}");
         assert!(!row.contains("streaming"), "row: {row:?}");
-        assert!(!row.contains("Ctrl+B"), "row: {row:?}");
+        assert!(!row.contains("Tab plan"), "row: {row:?}");
     }
 
     #[test]
@@ -229,8 +227,6 @@ mod tests {
         render(&state, &theme, area, &mut buf);
 
         let row = buffer_text(&buf, 0);
-        assert!(row.contains("Ctrl+B sidebar"), "row: {row:?}");
-        assert!(row.contains("Ctrl+C quit"), "row: {row:?}");
         assert!(row.contains("Tab plan"), "row: {row:?}");
         assert!(row.contains("Esc cancel"), "row: {row:?}");
     }
@@ -272,8 +268,7 @@ mod tests {
         render(&state, &theme, area, &mut buf);
 
         let row = buffer_text(&buf, 0);
-        assert!(row.contains("Ctrl+B sidebar"), "row: {row:?}");
-        assert!(!row.contains("Esc cancel"), "row: {row:?}");
+        assert!(row.contains("Tab plan"), "row: {row:?}");
     }
 
     #[test]

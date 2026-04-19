@@ -9,7 +9,7 @@ use flok_db::Db;
 use crate::bus::Bus;
 use crate::config::FlokConfig;
 use crate::lsp::LspManager;
-use crate::provider::Provider;
+use crate::provider::{Provider, ProviderRegistry};
 use crate::snapshot::SnapshotManager;
 use crate::token::CostTracker;
 use crate::tool::{PermissionManager, ToolContext, ToolRegistry};
@@ -57,6 +57,7 @@ pub struct AppState {
     pub db: Db,
     pub config: FlokConfig,
     pub provider: Arc<dyn Provider>,
+    pub provider_registry: Arc<ProviderRegistry>,
     pub tools: ToolRegistry,
     pub bus: Bus,
     pub permissions: PermissionManager,
@@ -75,6 +76,7 @@ impl AppState {
         db: Db,
         config: FlokConfig,
         provider: Arc<dyn Provider>,
+        provider_registry: Arc<ProviderRegistry>,
         tools: ToolRegistry,
         bus: Bus,
         permissions: PermissionManager,
@@ -89,6 +91,7 @@ impl AppState {
             db,
             config,
             provider,
+            provider_registry,
             tools,
             bus,
             permissions,

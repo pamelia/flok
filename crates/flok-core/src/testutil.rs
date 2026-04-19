@@ -14,6 +14,7 @@ use crate::bus::Bus;
 use crate::config::FlokConfig;
 use crate::lsp::LspManager;
 use crate::provider::mock::{MockProvider, MockTurn};
+use crate::provider::ProviderRegistry;
 use crate::session::{AppState, PlanMode, SessionEngine};
 use crate::snapshot::SnapshotManager;
 use crate::token::CostTracker;
@@ -71,6 +72,9 @@ impl TestHarness {
 
         let mock = Arc::new(MockProvider::new());
         let provider: Arc<dyn crate::provider::Provider> = Arc::clone(&mock) as _;
+        let mut provider_registry = ProviderRegistry::new();
+        provider_registry.insert("mock", Arc::clone(&provider), Some("mock/test-model".into()), 3);
+        let provider_registry = Arc::new(provider_registry);
 
         // Register the core tools (no question, todowrite, team, task, webfetch --
         // those need channels or external state that isn't relevant for most tests)
@@ -95,6 +99,7 @@ impl TestHarness {
             db,
             FlokConfig::default(),
             provider,
+            provider_registry,
             tools,
             bus,
             permissions,

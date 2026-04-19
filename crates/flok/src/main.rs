@@ -15,7 +15,9 @@ use tracing_subscriber::{fmt, EnvFilter};
 use flok_core::bus::Bus;
 use flok_core::config;
 use flok_core::lsp::LspManager;
-use flok_core::provider::{AnthropicProvider, MiniMaxProvider};
+use flok_core::provider::{
+    AnthropicProvider, MiniMaxProvider, ProviderRegistry, DEFAULT_PERMITS_PER_PROVIDER,
+};
 use flok_core::session::{AppState, SessionEngine};
 use flok_core::snapshot::SnapshotManager;
 use flok_core::team::TeamRegistry;
@@ -93,10 +95,9 @@ async fn run(args: cli::Args) -> Result<()> {
     // Load config (merges global + project + .flok layers)
     let config = config::load_config(&project_root)?;
 
-    // Resolve model (supports shorthand like "sonnet", "opus", "haiku")
-    let model_id = flok_core::provider::ModelRegistry::resolve(
-        &args.model.unwrap_or_else(|| "sonnet".to_string()),
-    );
+    // Resolve model: --model flag > config.model > provider default_model > "sonnet".
+    let model_id =
+        flok_core::provider::resolve_default_model(args.model.as_deref(), &config, "sonnet");
 
     // Initialize database
     let db_dir = data_dir()?.join("db");
@@ -127,6 +128,7 @@ async fn run(args: cli::Args) -> Result<()> {
 
     // Create provider based on model prefix
     let provider: Arc<dyn flok_core::provider::Provider> = create_provider(&model_id, &config)?;
+    let provider_registry = build_provider_registry(&config)?;
 
     // Shared state for interactive tools
     let todo_list = TodoList::new();
@@ -179,7 +181,8 @@ async fn run(args: cli::Args) -> Result<()> {
     // Snapshot the base tools for the task tool (before registering task itself)
     let base_tools = Arc::new(tools.clone());
     tools.register(Arc::new(TaskTool::new(
-        Arc::clone(&provider),
+        Arc::clone(&provider_registry),
+        flok_core::provider::ModelRegistry::provider_name(&model_id).to_string(),
         model_id.clone(),
         base_tools,
         bus.clone(),
@@ -219,6 +222,7 @@ async fn run(args: cli::Args) -> Result<()> {
             db,
             config,
             provider,
+            provider_registry,
             tools,
             bus.clone(),
             permissions,
@@ -278,6 +282,7 @@ async fn run(args: cli::Args) -> Result<()> {
         db,
         config,
         provider,
+        provider_registry,
         tools,
         bus.clone(),
         permissions,
@@ -596,10 +601,52 @@ fn create_provider(
 ) -> Result<Arc<dyn flok_core::provider::Provider>> {
     let provider_name = flok_core::provider::ModelRegistry::provider_name(model_id);
 
+    create_provider_for_name(provider_name, config)
+}
+
+fn build_provider_registry(
+    config: &flok_core::config::FlokConfig,
+) -> Result<Arc<ProviderRegistry>> {
+    let mut registry = ProviderRegistry::new();
+    let mut provider_names: Vec<&String> = config.provider.keys().collect();
+    provider_names.sort();
+
+    for provider_name in provider_names {
+        let Some(provider_config) = config.provider.get(provider_name) else {
+            continue;
+        };
+
+        if provider_config.api_key.is_none() {
+            tracing::debug!(provider = %provider_name, "skipping provider without API key");
+            continue;
+        }
+
+        let provider = create_provider_for_name(provider_name, config)?;
+        let default_model = provider_config
+            .default_model
+            .as_deref()
+            .map(flok_core::provider::ModelRegistry::resolve);
+
+        registry.insert(
+            provider_name.clone(),
+            provider,
+            default_model,
+            DEFAULT_PERMITS_PER_PROVIDER,
+        );
+    }
+
+    Ok(Arc::new(registry))
+}
+
+fn create_provider_for_name(
+    provider_name: &str,
+    config: &flok_core::config::FlokConfig,
+) -> Result<Arc<dyn flok_core::provider::Provider>> {
     match provider_name {
         "anthropic" => {
             let api_key = resolve_api_key("anthropic", config)?;
-            Ok(Arc::new(AnthropicProvider::new(api_key, None)))
+            let base_url = config.provider.get("anthropic").and_then(|c| c.base_url.clone());
+            Ok(Arc::new(AnthropicProvider::new(api_key, base_url)))
         }
         "openai" => {
             let api_key = resolve_api_key("openai", config)?;
@@ -623,7 +670,7 @@ fn create_provider(
             "Google Gemini provider not yet implemented. Use Anthropic or OpenAI."
         )),
         _ => Err(anyhow::anyhow!(
-            "Unknown provider '{provider_name}' for model '{model_id}'. \
+            "Unknown provider '{provider_name}'. \
              Supported providers: anthropic, openai, deepseek, minimax"
         )),
     }
@@ -774,10 +821,10 @@ fn run_auth_login(provider_arg: Option<&String>) -> Result<()> {
         flok_core::config::FlokConfig::default()
     };
 
-    config.provider.insert(
-        provider_meta.name.to_string(),
-        flok_core::config::ProviderConfig { api_key: Some(secret), base_url: None },
-    );
+    // Preserve any existing provider fields (e.g. base_url, default_model) when
+    // updating just the api_key.
+    let entry = config.provider.entry(provider_meta.name.to_string()).or_default();
+    entry.api_key = Some(secret);
 
     write_auth_config(&config_path, &config)?;
 
@@ -853,7 +900,11 @@ mod credential_tests {
         let mut provider_map = HashMap::new();
         provider_map.insert(
             provider.to_string(),
-            ProviderConfig { api_key: Some(SecretString::from(key.to_string())), base_url: None },
+            ProviderConfig {
+                api_key: Some(SecretString::from(key.to_string())),
+                base_url: None,
+                default_model: None,
+            },
         );
         FlokConfig { provider: provider_map, ..Default::default() }
     }
@@ -896,6 +947,41 @@ mod credential_tests {
         let rendered = format!("{s:?}");
         assert!(!rendered.contains("plain-text-xyz"), "Debug leaked plaintext: {rendered}");
         assert!(rendered.contains("REDACTED"), "Debug missing REDACTED marker: {rendered}");
+    }
+
+    #[test]
+    fn build_provider_registry_includes_configured_providers_with_keys() {
+        let mut provider = HashMap::new();
+        provider.insert(
+            "anthropic".to_string(),
+            ProviderConfig {
+                api_key: Some(SecretString::from("sk-ant".to_string())),
+                base_url: None,
+                default_model: Some("opus-4.7".into()),
+            },
+        );
+        provider.insert(
+            "openai".to_string(),
+            ProviderConfig {
+                api_key: Some(SecretString::from("sk-openai".to_string())),
+                base_url: None,
+                default_model: Some("gpt-5.4".into()),
+            },
+        );
+        provider.insert(
+            "minimax".to_string(),
+            ProviderConfig { api_key: None, base_url: None, default_model: Some("minimax".into()) },
+        );
+
+        let config = FlokConfig { provider, ..Default::default() };
+        let registry = build_provider_registry(&config).expect("provider registry");
+
+        assert_eq!(registry.configured_providers(), vec!["anthropic", "openai"]);
+        assert_eq!(registry.default_model("anthropic"), Some("anthropic/claude-opus-4-7"));
+        assert_eq!(registry.default_model("openai"), Some("openai/gpt-5.4"));
+        assert!(registry.semaphore("anthropic").is_some());
+        assert!(registry.semaphore("openai").is_some());
+        assert!(registry.semaphore("minimax").is_none());
     }
 
     #[cfg(unix)]

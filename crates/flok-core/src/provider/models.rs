@@ -5,6 +5,8 @@
 
 use std::collections::HashMap;
 
+use crate::config::FlokConfig;
+
 /// Information about a known model.
 #[derive(Debug, Clone)]
 pub struct ModelInfo {
@@ -306,9 +308,42 @@ impl ModelRegistry {
     }
 }
 
+/// Resolve the model ID to use, given a CLI override and loaded config.
+///
+/// Precedence (first match wins):
+/// 1. `cli_model` — the `--model` CLI flag.
+/// 2. `config.model` — top-level `model = "..."` in `flok.toml`.
+/// 3. First `provider.<name>.default_model` (alphabetical by provider key).
+/// 4. `default_fallback` — the hardcoded safety-net alias.
+///
+/// Each candidate is normalized through [`ModelRegistry::resolve`] so that
+/// short aliases like `"opus-4.7"` become full IDs like
+/// `"anthropic/claude-opus-4-7"`.
+pub fn resolve_default_model(
+    cli_model: Option<&str>,
+    config: &FlokConfig,
+    default_fallback: &str,
+) -> String {
+    if let Some(m) = cli_model {
+        return ModelRegistry::resolve(m);
+    }
+    if let Some(m) = config.model.as_deref() {
+        return ModelRegistry::resolve(m);
+    }
+    let mut names: Vec<&String> = config.provider.keys().collect();
+    names.sort();
+    for name in names {
+        if let Some(m) = config.provider.get(name).and_then(|p| p.default_model.as_deref()) {
+            return ModelRegistry::resolve(m);
+        }
+    }
+    ModelRegistry::resolve(default_fallback)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ProviderConfig;
 
     #[test]
     fn builtin_registry_has_models() {
@@ -391,5 +426,65 @@ mod tests {
         assert_eq!(ModelRegistry::resolve("chatgpt-5.4"), "openai/gpt-5.4");
         assert_eq!(ModelRegistry::resolve("mini"), "openai/gpt-5.4-mini");
         assert_eq!(ModelRegistry::resolve("nano"), "openai/gpt-5.4-nano");
+    }
+
+    #[test]
+    fn resolve_default_model_cli_wins() {
+        let config = FlokConfig { model: Some("sonnet".into()), ..Default::default() };
+        assert_eq!(
+            resolve_default_model(Some("opus-4.7"), &config, "sonnet"),
+            "anthropic/claude-opus-4-7",
+        );
+    }
+
+    #[test]
+    fn resolve_default_model_uses_top_level_config() {
+        let config = FlokConfig { model: Some("opus-4.7".into()), ..Default::default() };
+        assert_eq!(resolve_default_model(None, &config, "sonnet"), "anthropic/claude-opus-4-7",);
+    }
+
+    #[test]
+    fn resolve_default_model_falls_back_to_first_provider_alphabetical() {
+        use std::collections::HashMap;
+        let mut provider = HashMap::new();
+        provider.insert(
+            "zeta-provider".to_string(),
+            ProviderConfig { api_key: None, base_url: None, default_model: Some("sonnet".into()) },
+        );
+        provider.insert(
+            "anthropic".to_string(),
+            ProviderConfig {
+                api_key: None,
+                base_url: None,
+                default_model: Some("opus-4.7".into()),
+            },
+        );
+        let config = FlokConfig { provider, ..Default::default() };
+        // Alphabetical order: "anthropic" < "zeta-provider", so opus-4.7 wins.
+        assert_eq!(resolve_default_model(None, &config, "sonnet"), "anthropic/claude-opus-4-7",);
+    }
+
+    #[test]
+    fn resolve_default_model_uses_fallback_when_nothing_set() {
+        let config = FlokConfig::default();
+        assert_eq!(resolve_default_model(None, &config, "sonnet"), "anthropic/claude-sonnet-4-6",);
+    }
+
+    #[test]
+    fn resolve_default_model_skips_providers_without_default_model() {
+        use std::collections::HashMap;
+        let mut provider = HashMap::new();
+        provider.insert(
+            "anthropic".to_string(),
+            ProviderConfig { api_key: None, base_url: None, default_model: None },
+        );
+        provider.insert(
+            "openai".to_string(),
+            ProviderConfig { api_key: None, base_url: None, default_model: Some("gpt-5.4".into()) },
+        );
+        let config = FlokConfig { provider, ..Default::default() };
+        // "anthropic" comes first alphabetically but has no default_model, so the
+        // resolver should skip it and pick "openai"'s "gpt-5.4".
+        assert_eq!(resolve_default_model(None, &config, "sonnet"), "openai/gpt-5.4");
     }
 }

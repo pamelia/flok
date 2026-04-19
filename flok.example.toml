@@ -10,20 +10,29 @@
 #
 # The CLI writes ~/.config/flok/flok.toml with mode 0600 on Unix.
 
+# Default model to use when the `--model` CLI flag is not given. Accepts any
+# alias supported by `flok models` (e.g. "sonnet", "opus-4.7", "gpt-5.4") or
+# a full ID like "anthropic/claude-opus-4-7".
+# model = "opus-4.7"
+
 # Anthropic provider configuration
 [provider.anthropic]
-# api_key = "sk-ant-..."   # Set via: flok auth login --provider anthropic
+# api_key = "sk-ant-..."       # Set via: flok auth login --provider anthropic
+# default_model = "opus-4.7"   # Fallback model when `model` above is unset.
 
 # OpenAI provider configuration
 [provider.openai]
-# api_key = "sk-..."       # Set via: flok auth login --provider openai
+# api_key = "sk-..."           # Set via: flok auth login --provider openai
 # base_url = "https://api.openai.com/v1"   # Override for compatible APIs
+# default_model = "gpt-5.4"
 
 # DeepSeek provider configuration (uses OpenAI-compatible API)
 [provider.deepseek]
-# api_key = "sk-..."       # Set via: flok auth login --provider deepseek
+# api_key = "sk-..."           # Set via: flok auth login --provider deepseek
 # base_url = "https://api.deepseek.com/v1"
+# default_model = "deepseek"
 
 # MiniMax provider configuration (uses Anthropic-compatible API)
 [provider.minimax]
-# api_key = "..."          # Set via: flok auth login --provider minimax
+# api_key = "..."              # Set via: flok auth login --provider minimax
+# default_model = "minimax"

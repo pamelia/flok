@@ -54,6 +54,7 @@ pub(crate) struct StreamCancelled;
 pub(crate) struct FallbackStreamContext<'a> {
     pub initial_provider: &'a str,
     pub initial_model: &'a str,
+    pub explicit_chain: Option<&'a [(String, String)]>,
     pub bus: &'a Bus,
     pub session_id: &'a str,
     pub cancel_token: Option<&'a CancellationToken>,
@@ -165,11 +166,34 @@ impl ProviderRegistry {
         bus: &Bus,
         session_id: &str,
     ) -> anyhow::Result<(String, Vec<ToolCall>)> {
+        self.stream_with_fallback_chain(
+            initial_provider,
+            initial_model,
+            None,
+            request,
+            bus,
+            session_id,
+        )
+        .await
+    }
+
+    /// Stream a completion request through an explicit fallback chain when
+    /// provided, otherwise through the configured provider chain.
+    pub async fn stream_with_fallback_chain(
+        &self,
+        initial_provider: &str,
+        initial_model: &str,
+        explicit_chain: Option<Vec<(String, String)>>,
+        request: CompletionRequest,
+        bus: &Bus,
+        session_id: &str,
+    ) -> anyhow::Result<(String, Vec<ToolCall>)> {
         let response = self
             .stream_with_fallback_internal(
                 FallbackStreamContext {
                     initial_provider,
                     initial_model,
+                    explicit_chain: explicit_chain.as_deref(),
                     bus,
                     session_id,
                     cancel_token: None,
@@ -191,7 +215,11 @@ impl ProviderRegistry {
     where
         F: FnMut(&StreamEvent, &mut StreamedCompletion),
     {
-        let attempts = self.resolve_attempts(context.initial_provider, context.initial_model);
+        let attempts = self.resolve_attempts(
+            context.initial_provider,
+            context.initial_model,
+            context.explicit_chain,
+        );
         if attempts.is_empty() {
             return Err(anyhow::anyhow!(
                 "Provider '{}' is not configured. Available providers: {}",
@@ -207,6 +235,14 @@ impl ProviderRegistry {
         let mut failures = Vec::new();
 
         for (index, attempt) in attempts.iter().enumerate() {
+            if index > 0 && self.cooldown.is_cooldown(&attempt.provider) {
+                failures.push(format!(
+                    "{} (model {}): provider cooling down",
+                    attempt.provider, attempt.model
+                ));
+                continue;
+            }
+
             let provider = self.get(&attempt.provider).ok_or_else(|| {
                 anyhow::anyhow!("Provider '{}' is not configured", attempt.provider)
             })?;
@@ -368,7 +404,23 @@ impl ProviderRegistry {
         ))
     }
 
-    fn resolve_attempts(&self, initial_provider: &str, initial_model: &str) -> Vec<AttemptTarget> {
+    fn resolve_attempts(
+        &self,
+        initial_provider: &str,
+        initial_model: &str,
+        explicit_chain: Option<&[(String, String)]>,
+    ) -> Vec<AttemptTarget> {
+        explicit_chain.map_or_else(
+            || self.resolve_provider_attempts(initial_provider, initial_model),
+            |chain| self.resolve_explicit_attempts(initial_provider, initial_model, chain),
+        )
+    }
+
+    fn resolve_provider_attempts(
+        &self,
+        initial_provider: &str,
+        initial_model: &str,
+    ) -> Vec<AttemptTarget> {
         let fallback_chain =
             self.fallback_chains.get(initial_provider).map_or(&[][..], Vec::as_slice);
         let chain = FallbackChain {
@@ -383,6 +435,45 @@ impl ProviderRegistry {
             .into_iter()
             .filter_map(|provider| self.resolve_attempt(provider, initial_provider, initial_model))
             .collect()
+    }
+
+    fn resolve_explicit_attempts(
+        &self,
+        initial_provider: &str,
+        initial_model: &str,
+        explicit_chain: &[(String, String)],
+    ) -> Vec<AttemptTarget> {
+        let mut attempts = Vec::with_capacity(explicit_chain.len() + 1);
+        let mut cooled_candidates = 0usize;
+
+        for candidate in std::iter::once(AttemptTarget {
+            provider: initial_provider.to_string(),
+            model: initial_model.to_string(),
+        })
+        .chain(explicit_chain.iter().map(|(provider, model)| AttemptTarget {
+            provider: provider.clone(),
+            model: model.clone(),
+        })) {
+            if self.get(&candidate.provider).is_none() || attempts.contains(&candidate) {
+                continue;
+            }
+
+            if self.cooldown.is_cooldown(&candidate.provider) {
+                cooled_candidates += 1;
+                continue;
+            }
+
+            attempts.push(candidate);
+        }
+
+        if attempts.is_empty() && cooled_candidates > 0 {
+            return vec![AttemptTarget {
+                provider: initial_provider.to_string(),
+                model: initial_model.to_string(),
+            }];
+        }
+
+        attempts
     }
 
     fn resolve_attempt(

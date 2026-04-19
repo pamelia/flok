@@ -7,6 +7,7 @@
 //! 2. Project config (`flok.toml` in project root)
 //! 3. Global config (`~/.config/flok/flok.toml`)
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use secrecy::{ExposeSecret, SecretString};
@@ -23,7 +24,9 @@ pub struct FlokConfig {
     /// qualified ID like `"anthropic/claude-opus-4-7"`.
     pub model: Option<String>,
     /// Provider configurations keyed by provider name.
-    pub provider: std::collections::HashMap<String, ProviderConfig>,
+    pub provider: HashMap<String, ProviderConfig>,
+    /// Per-built-in-agent routing and prompt overrides.
+    pub agents: HashMap<String, AgentConfig>,
     pub lsp: LspConfig,
     /// Git worktree isolation settings.
     pub worktree: WorktreeConfig,
@@ -47,9 +50,21 @@ pub struct FlokConfig {
     /// [permission.external_directory]
     /// "*" = "ask"
     /// ```
-    pub permission: std::collections::HashMap<String, PermissionToolConfig>,
+    pub permission: HashMap<String, PermissionToolConfig>,
     /// Runtime provider fallback behavior.
     pub runtime_fallback: RuntimeFallbackConfig,
+}
+
+/// Per-agent routing and system-prompt overrides.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct AgentConfig {
+    /// Preferred model for this built-in agent.
+    pub model: Option<String>,
+    /// Ordered fallback model IDs or aliases that replace the provider chain.
+    pub fallback_models: Vec<String>,
+    /// Extra text appended to the built-in system prompt.
+    pub prompt_append: Option<String>,
 }
 
 /// Runtime provider fallback behavior.
@@ -140,7 +155,7 @@ impl PermissionToolConfig {
 
 /// Convert all permission config entries into a flat list of rules.
 pub fn permission_config_to_rules<S: std::hash::BuildHasher>(
-    config: &std::collections::HashMap<String, PermissionToolConfig, S>,
+    config: &HashMap<String, PermissionToolConfig, S>,
 ) -> Vec<crate::permission::PermissionRule> {
     config
         .iter()
@@ -284,6 +299,18 @@ fn merge_config(target: &mut FlokConfig, source: &FlokConfig) {
         }
         if !value.fallback.is_empty() {
             entry.fallback.clone_from(&value.fallback);
+        }
+    }
+    for (key, value) in &source.agents {
+        let entry = target.agents.entry(key.clone()).or_default();
+        if value.model.is_some() {
+            entry.model.clone_from(&value.model);
+        }
+        if !value.fallback_models.is_empty() {
+            entry.fallback_models.clone_from(&value.fallback_models);
+        }
+        if value.prompt_append.is_some() {
+            entry.prompt_append.clone_from(&value.prompt_append);
         }
     }
     target.lsp = source.lsp.clone();
@@ -565,6 +592,110 @@ mod tests {
         assert!(config.model.is_none());
         assert!(config.provider["anthropic"].default_model.is_none());
         assert!(config.provider["anthropic"].fallback.is_empty());
+    }
+
+    #[test]
+    fn parse_agents_config_full() {
+        let toml_str = r#"
+            [agents.explore]
+            model = "haiku-4-5"
+            fallback_models = ["minimax", "gpt-5.4-nano"]
+            prompt_append = "Be concise."
+        "#;
+
+        let config: FlokConfig = toml::from_str(toml_str).unwrap();
+        let explore = &config.agents["explore"];
+
+        assert_eq!(explore.model.as_deref(), Some("haiku-4-5"));
+        assert_eq!(explore.fallback_models, vec!["minimax", "gpt-5.4-nano"]);
+        assert_eq!(explore.prompt_append.as_deref(), Some("Be concise."));
+    }
+
+    #[test]
+    fn parse_agents_config_partial() {
+        let toml_str = r#"
+            [agents.explore]
+            model = "haiku"
+
+            [agents.general]
+            prompt_append = "Keep output short."
+        "#;
+
+        let config: FlokConfig = toml::from_str(toml_str).unwrap();
+
+        assert_eq!(config.agents["explore"].model.as_deref(), Some("haiku"));
+        assert!(config.agents["explore"].fallback_models.is_empty());
+        assert!(config.agents["explore"].prompt_append.is_none());
+
+        assert!(config.agents["general"].model.is_none());
+        assert!(config.agents["general"].fallback_models.is_empty());
+        assert_eq!(config.agents["general"].prompt_append.as_deref(), Some("Keep output short."));
+    }
+
+    #[test]
+    fn parse_multiple_agent_blocks() {
+        let toml_str = r#"
+            [agents.explore]
+            model = "haiku"
+
+            [agents.feasibility-reviewer]
+            prompt_append = "Prioritize operational risk."
+        "#;
+
+        let config: FlokConfig = toml::from_str(toml_str).unwrap();
+
+        assert_eq!(config.agents.len(), 2);
+        assert_eq!(config.agents["explore"].model.as_deref(), Some("haiku"));
+        assert_eq!(
+            config.agents["feasibility-reviewer"].prompt_append.as_deref(),
+            Some("Prioritize operational risk."),
+        );
+    }
+
+    #[test]
+    fn parse_no_agents_section() {
+        let config: FlokConfig =
+            toml::from_str("[provider.anthropic]\napi_key = \"sk-test\"").unwrap();
+
+        assert!(config.agents.is_empty());
+    }
+
+    #[test]
+    fn merge_agents_overlay_preserves_unspecified_fields() {
+        let mut base: FlokConfig = toml::from_str(
+            r#"
+            [agents.explore]
+            model = "haiku"
+            fallback_models = ["gpt-5.4"]
+            "#,
+        )
+        .unwrap();
+        let overlay: FlokConfig = toml::from_str(
+            r#"
+            [agents.explore]
+            prompt_append = "Be concise."
+            "#,
+        )
+        .unwrap();
+
+        merge_config(&mut base, &overlay);
+
+        let explore = &base.agents["explore"];
+        assert_eq!(explore.model.as_deref(), Some("haiku"));
+        assert_eq!(explore.fallback_models, vec!["gpt-5.4"]);
+        assert_eq!(explore.prompt_append.as_deref(), Some("Be concise."));
+    }
+
+    #[test]
+    fn parse_unknown_agent_config_does_not_error() {
+        let toml_str = r#"
+            [agents.nonexistent]
+            model = "haiku"
+        "#;
+
+        let config: FlokConfig = toml::from_str(toml_str).unwrap();
+
+        assert_eq!(config.agents["nonexistent"].model.as_deref(), Some("haiku"));
     }
 
     #[test]

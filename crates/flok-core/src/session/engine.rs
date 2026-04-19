@@ -1439,6 +1439,7 @@ impl SessionEngine {
                 crate::provider::registry::FallbackStreamContext {
                     initial_provider: &initial_provider,
                     initial_model: &initial_model,
+                    explicit_chain: None,
                     bus: &bus,
                     session_id: &session_id,
                     cancel_token: Some(&self.cancel_token),

@@ -566,6 +566,7 @@ impl TaskTool {
             agent: "subagent".into(),
             cancel: tokio_util::sync::CancellationToken::new(),
             lsp: None,
+            output_compression: crate::config::OutputCompressionConfig::default(),
         };
 
         for step in 0..MAX_SUBAGENT_STEPS {
@@ -710,6 +711,7 @@ async fn run_subagent_standalone(
         agent: "background".into(),
         cancel: tokio_util::sync::CancellationToken::new(),
         lsp: None,
+        output_compression: crate::config::OutputCompressionConfig::default(),
     };
 
     for step in 0..MAX_SUBAGENT_STEPS {
@@ -874,6 +876,7 @@ mod tests {
             agent: "lead".to_string(),
             cancel: tokio_util::sync::CancellationToken::new(),
             lsp: None,
+            output_compression: crate::config::OutputCompressionConfig::default(),
         }
     }
 

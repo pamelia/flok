@@ -5,6 +5,7 @@
 //! async execute method.
 
 mod bash;
+pub(crate) mod compression;
 mod edit;
 mod fast_apply;
 mod glob_tool;
@@ -294,6 +295,7 @@ pub struct ToolContext {
     /// Cancellation token — tools should check this periodically for long ops.
     pub cancel: tokio_util::sync::CancellationToken,
     pub lsp: Option<std::sync::Arc<LspManager>>,
+    pub output_compression: crate::config::OutputCompressionConfig,
 }
 
 impl ToolContext {
@@ -311,6 +313,7 @@ impl ToolContext {
             agent: "test-agent".into(),
             cancel: tokio_util::sync::CancellationToken::new(),
             lsp: None,
+            output_compression: crate::config::OutputCompressionConfig::default(),
         }
     }
 }

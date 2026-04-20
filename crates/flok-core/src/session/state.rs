@@ -119,6 +119,7 @@ impl AppState {
             agent: "primary".to_string(),
             cancel,
             lsp: Some(Arc::clone(&self.lsp)),
+            output_compression: self.config.output_compression.clone(),
         }
     }
 }

@@ -53,6 +53,48 @@ pub struct FlokConfig {
     pub permission: HashMap<String, PermissionToolConfig>,
     /// Runtime provider fallback behavior.
     pub runtime_fallback: RuntimeFallbackConfig,
+    /// Tool output compression configuration.
+    pub output_compression: OutputCompressionConfig,
+}
+
+/// Tool output compression configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct OutputCompressionConfig {
+    /// Whether output compression is enabled.
+    pub enabled: bool,
+    /// Skip compression entirely below this line count.
+    pub passthrough_threshold_lines: usize,
+    /// Maximum line budget before truncation fires.
+    pub max_lines: usize,
+    /// Number of lines preserved at the start during truncation.
+    pub head_lines: usize,
+    /// Number of lines preserved at the end during truncation.
+    pub tail_lines: usize,
+    /// Final hard character budget after all line-based stages.
+    pub max_chars: usize,
+    /// Minimum exact-repeat run length to group.
+    pub group_exact_min: usize,
+    /// Minimum normalized-repeat run length to group.
+    pub group_similar_min: usize,
+    /// Tool names that should use this pipeline.
+    pub apply_to_tools: Vec<String>,
+}
+
+impl Default for OutputCompressionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            passthrough_threshold_lines: 40,
+            max_lines: 200,
+            head_lines: 50,
+            tail_lines: 50,
+            max_chars: 20_000,
+            group_exact_min: 3,
+            group_similar_min: 5,
+            apply_to_tools: vec!["bash".to_string()],
+        }
+    }
 }
 
 /// Per-agent routing and system-prompt overrides.
@@ -324,6 +366,40 @@ fn merge_config(target: &mut FlokConfig, source: &FlokConfig) {
     if source.runtime_fallback != RuntimeFallbackConfig::default() {
         target.runtime_fallback = source.runtime_fallback.clone();
     }
+    let default_output_compression = OutputCompressionConfig::default();
+    if source.output_compression.enabled != default_output_compression.enabled {
+        target.output_compression.enabled = source.output_compression.enabled;
+    }
+    if source.output_compression.passthrough_threshold_lines
+        != default_output_compression.passthrough_threshold_lines
+    {
+        target.output_compression.passthrough_threshold_lines =
+            source.output_compression.passthrough_threshold_lines;
+    }
+    if source.output_compression.max_lines != default_output_compression.max_lines {
+        target.output_compression.max_lines = source.output_compression.max_lines;
+    }
+    if source.output_compression.head_lines != default_output_compression.head_lines {
+        target.output_compression.head_lines = source.output_compression.head_lines;
+    }
+    if source.output_compression.tail_lines != default_output_compression.tail_lines {
+        target.output_compression.tail_lines = source.output_compression.tail_lines;
+    }
+    if source.output_compression.max_chars != default_output_compression.max_chars {
+        target.output_compression.max_chars = source.output_compression.max_chars;
+    }
+    if source.output_compression.group_exact_min != default_output_compression.group_exact_min {
+        target.output_compression.group_exact_min = source.output_compression.group_exact_min;
+    }
+    if source.output_compression.group_similar_min != default_output_compression.group_similar_min {
+        target.output_compression.group_similar_min = source.output_compression.group_similar_min;
+    }
+    if source.output_compression.apply_to_tools != default_output_compression.apply_to_tools {
+        target
+            .output_compression
+            .apply_to_tools
+            .clone_from(&source.output_compression.apply_to_tools);
+    }
 }
 
 /// Ensure XDG-compliant directories exist.
@@ -359,6 +435,33 @@ mod tests {
         assert!(config.lsp.enabled);
         assert_eq!(config.lsp.rust.command, "rust-analyzer");
         assert_eq!(config.runtime_fallback, RuntimeFallbackConfig::default());
+        assert_eq!(config.output_compression, OutputCompressionConfig::default());
+    }
+
+    #[test]
+    fn parse_output_compression_config() {
+        let toml_str = r#"
+            [output_compression]
+            enabled = true
+            max_lines = 300
+            head_lines = 80
+            tail_lines = 80
+            apply_to_tools = ["bash", "grep"]
+        "#;
+
+        let config: FlokConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.output_compression.enabled);
+        assert_eq!(config.output_compression.max_lines, 300);
+        assert_eq!(config.output_compression.head_lines, 80);
+        assert_eq!(config.output_compression.tail_lines, 80);
+        assert_eq!(config.output_compression.apply_to_tools, vec!["bash", "grep"]);
+        assert_eq!(config.output_compression.max_chars, 20_000);
+    }
+
+    #[test]
+    fn output_compression_defaults_when_missing() {
+        let config: FlokConfig = toml::from_str("").unwrap();
+        assert_eq!(config.output_compression, OutputCompressionConfig::default());
     }
 
     #[test]
@@ -783,6 +886,35 @@ mod tests {
     fn runtime_fallback_defaults_when_missing() {
         let config: FlokConfig = toml::from_str("").unwrap();
         assert_eq!(config.runtime_fallback, RuntimeFallbackConfig::default());
+    }
+
+    #[test]
+    fn merge_output_compression_overlay() {
+        let mut base: FlokConfig = toml::from_str(
+            r#"
+            [output_compression]
+            enabled = false
+            max_lines = 123
+            apply_to_tools = ["bash", "grep"]
+            "#,
+        )
+        .unwrap();
+        let overlay: FlokConfig = toml::from_str(
+            r"
+            [output_compression]
+            max_lines = 300
+            head_lines = 80
+            tail_lines = 80
+            ",
+        )
+        .unwrap();
+
+        merge_config(&mut base, &overlay);
+
+        assert!(!base.output_compression.enabled);
+        assert_eq!(base.output_compression.max_lines, 300);
+        assert_eq!(base.output_compression.head_lines, 80);
+        assert_eq!(base.output_compression.tail_lines, 80);
     }
 
     #[test]

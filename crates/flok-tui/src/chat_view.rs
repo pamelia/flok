@@ -1,9 +1,6 @@
-use ratatui::{buffer::Buffer, layout::Rect, text::Line, widgets::Widget};
+use ratatui::{layout::Rect, text::Line};
 
-use crate::{
-    history::{ActiveItem, HistoryItem, Role},
-    theme::Theme,
-};
+use crate::{history::ActiveItem, theme::Theme};
 
 pub(crate) struct ChatView {
     /// Lines from the bottom of the transcript. `0` = pinned to newest line.
@@ -14,41 +11,6 @@ pub(crate) struct ChatView {
 impl ChatView {
     pub(crate) fn new() -> Self {
         Self { scroll_offset: 0, follow_bottom: true }
-    }
-
-    pub(crate) fn render(
-        &self,
-        history: &[HistoryItem],
-        active: Option<&ActiveItem>,
-        theme: &Theme,
-        area: Rect,
-        buf: &mut Buffer,
-    ) {
-        if area.width == 0 || area.height == 0 {
-            return;
-        }
-
-        for (i, line) in self.visible_lines(history, active, theme, area).iter().enumerate() {
-            let row_y = area.y.saturating_add(i as u16);
-            if row_y >= area.y.saturating_add(area.height) {
-                break;
-            }
-            let row = Rect { x: area.x, y: row_y, width: area.width, height: 1 };
-            line.clone().render(row, buf);
-        }
-    }
-
-    pub(crate) fn visible_rows(
-        &self,
-        history: &[HistoryItem],
-        active: Option<&ActiveItem>,
-        theme: &Theme,
-        area: Rect,
-    ) -> Vec<String> {
-        self.visible_lines(history, active, theme, area)
-            .into_iter()
-            .map(|line| line.spans.into_iter().map(|span| span.content.into_owned()).collect())
-            .collect()
     }
 
     /// Negative `delta` scrolls up (toward older lines); positive scrolls down.
@@ -71,24 +33,47 @@ impl ChatView {
         let _ = self;
     }
 
-    fn visible_lines(
+    pub(crate) fn visible_lines_and_rows(
         &self,
-        history: &[HistoryItem],
+        history: &[crate::history::HistoryItem],
         active: Option<&ActiveItem>,
         theme: &Theme,
         area: Rect,
-    ) -> Vec<Line<'static>> {
+    ) -> (Vec<Line<'static>>, Vec<String>) {
+        self.visible_lines_and_rows_with_observer(history, active, theme, area, || {})
+    }
+
+    fn visible_lines_and_rows_with_observer<F>(
+        &self,
+        history: &[crate::history::HistoryItem],
+        active: Option<&ActiveItem>,
+        theme: &Theme,
+        area: Rect,
+        mut observe_history_item: F,
+    ) -> (Vec<Line<'static>>, Vec<String>)
+    where
+        F: FnMut(),
+    {
         if area.width == 0 || area.height == 0 {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
 
         let mut all_lines: Vec<Line<'static>> = Vec::new();
+        let mut all_rows: Vec<String> = Vec::new();
         for item in history {
-            all_lines.extend(crate::history::render::lines(item, area.width, theme));
+            observe_history_item();
+            extend_lines_and_rows(
+                &mut all_lines,
+                &mut all_rows,
+                crate::history::render::lines(item, area.width, theme),
+            );
         }
         if let Some(active) = active {
-            let synth = synthesize_active(active);
-            all_lines.extend(crate::history::render::lines(&synth, area.width, theme));
+            extend_lines_and_rows(
+                &mut all_lines,
+                &mut all_rows,
+                crate::history::render::active_lines(active, area.width, theme),
+            );
         }
 
         let viewport = area.height as usize;
@@ -99,22 +84,23 @@ impl ChatView {
         let end = total_lines.saturating_sub(scroll_offset);
 
         let mut visible = all_lines[start..end].to_vec();
+        let mut visible_rows = all_rows[start..end].to_vec();
         while visible.len() < viewport {
             visible.push(Line::default());
+            visible_rows.push(String::new());
         }
-        visible
+        (visible, visible_rows)
     }
 }
 
-fn synthesize_active(active: &ActiveItem) -> HistoryItem {
-    match active.role {
-        Role::ToolCall => HistoryItem::ToolCall {
-            name: active.tool_name.clone().unwrap_or_default(),
-            preview: active.streaming_text.clone(),
-            is_error: false,
-            duration_ms: None,
-        },
-        _ => HistoryItem::Assistant { text: active.streaming_text.clone(), markdown: true },
+fn extend_lines_and_rows(
+    all_lines: &mut Vec<Line<'static>>,
+    all_rows: &mut Vec<String>,
+    lines: Vec<Line<'static>>,
+) {
+    for line in lines {
+        all_rows.push(line.spans.iter().map(|span| span.content.as_ref()).collect());
+        all_lines.push(line);
     }
 }
 
@@ -124,6 +110,7 @@ mod tests {
     use ratatui::{
         buffer::Buffer,
         layout::{Position, Rect},
+        widgets::Widget,
     };
 
     #[test]
@@ -162,7 +149,13 @@ mod tests {
         let v = ChatView::new();
         let area = Rect::new(0, 0, 20, 5);
         let mut buf = Buffer::empty(area);
-        v.render(&[], None, &crate::theme::Theme::dark(), area, &mut buf);
+        let (lines, _) = v.visible_lines_and_rows(&[], None, &crate::theme::Theme::dark(), area);
+        for (index, line) in lines.iter().enumerate() {
+            line.clone().render(
+                Rect { x: area.x, y: area.y + index as u16, width: area.width, height: 1 },
+                &mut buf,
+            );
+        }
     }
 
     #[test]
@@ -170,11 +163,16 @@ mod tests {
         let v = ChatView::new();
         let area = Rect::new(0, 0, 20, 4);
         let theme = crate::theme::Theme::dark();
-        let history = vec![HistoryItem::user("hello world")];
+        let history = vec![crate::history::HistoryItem::user("hello world")];
         let mut buf = Buffer::empty(area);
 
-        v.render(&history, None, &theme, area, &mut buf);
-        let rows = v.visible_rows(&history, None, &theme, area);
+        let (lines, rows) = v.visible_lines_and_rows(&history, None, &theme, area);
+        for (index, line) in lines.iter().enumerate() {
+            line.clone().render(
+                Rect { x: area.x, y: area.y + index as u16, width: area.width, height: 1 },
+                &mut buf,
+            );
+        }
 
         assert_eq!(rows.len(), usize::from(area.height));
         for y in 0..area.height {
@@ -186,5 +184,27 @@ mod tests {
                 .to_string();
             assert_eq!(rows[usize::from(y)], rendered);
         }
+    }
+
+    #[test]
+    fn visible_lines_and_rows_single_walk() {
+        use std::cell::Cell;
+
+        let view = ChatView::new();
+        let area = Rect::new(0, 0, 20, 4);
+        let theme = crate::theme::Theme::dark();
+        let history = vec![
+            crate::history::HistoryItem::user("one"),
+            crate::history::HistoryItem::user("two"),
+        ];
+        let walks = Cell::new(0usize);
+
+        let (_lines, rows) =
+            view.visible_lines_and_rows_with_observer(&history, None, &theme, area, || {
+                walks.set(walks.get().saturating_add(1));
+            });
+
+        assert_eq!(walks.get(), history.len());
+        assert_eq!(rows.len(), usize::from(area.height));
     }
 }

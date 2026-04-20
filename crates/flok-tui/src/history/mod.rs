@@ -1,4 +1,8 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+
 pub(crate) mod render;
+
+static NEXT_ACTIVE_ITEM_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Role {
@@ -78,6 +82,7 @@ impl HistoryItem {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ActiveItem {
+    pub(crate) id: u64,
     pub(crate) role: Role,
     pub(crate) streaming_text: String,
     pub(crate) tool_name: Option<String>,
@@ -86,11 +91,18 @@ pub(crate) struct ActiveItem {
 
 impl ActiveItem {
     pub(crate) fn new_assistant() -> Self {
-        Self { role: Role::Assistant, streaming_text: String::new(), tool_name: None, revision: 0 }
+        Self {
+            id: next_active_item_id(),
+            role: Role::Assistant,
+            streaming_text: String::new(),
+            tool_name: None,
+            revision: 0,
+        }
     }
 
     pub(crate) fn new_tool(name: String) -> Self {
         Self {
+            id: next_active_item_id(),
             role: Role::ToolCall,
             streaming_text: String::new(),
             tool_name: Some(name),
@@ -122,6 +134,10 @@ impl ActiveItem {
             }
         }
     }
+}
+
+fn next_active_item_id() -> u64 {
+    NEXT_ACTIVE_ITEM_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 #[cfg(test)]

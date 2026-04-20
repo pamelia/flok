@@ -12,7 +12,7 @@ use ratatui::{
 use textwrap::Options;
 
 use crate::{
-    history::{HistoryItem, SystemLevel, TeamEventKind},
+    history::{ActiveItem, HistoryItem, Role, SystemLevel, TeamEventKind},
     theme::Theme,
 };
 
@@ -20,12 +20,24 @@ const CACHE_CAPACITY: usize = 256;
 const TOOL_BODY_VISIBLE_LINES: usize = 5;
 const INDENT: &str = "  ";
 
-type CacheKey = (u64, u16);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum CacheKey {
+    Static { fingerprint: u64, width: u16 },
+    Active { id: u64, revision: u64, width: u16 },
+}
+
 type CachedRender = (Vec<Line<'static>>, u16);
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CacheStats {
+    pub(crate) hits: u64,
+    pub(crate) misses: u64,
+}
 
 thread_local! {
     static CACHE: RefCell<HashMap<CacheKey, CachedRender>> = RefCell::new(HashMap::new());
     static CACHE_ORDER: RefCell<VecDeque<CacheKey>> = const { RefCell::new(VecDeque::new()) };
+    static CACHE_STATS: RefCell<CacheStats> = const { RefCell::new(CacheStats { hits: 0, misses: 0 }) };
 }
 
 pub(crate) fn lines(item: &HistoryItem, width: u16, theme: &Theme) -> Vec<Line<'static>> {
@@ -36,14 +48,63 @@ pub(crate) fn height(item: &HistoryItem, width: u16, theme: &Theme) -> u16 {
     cached_render(item, width, theme).1
 }
 
-fn cached_render(item: &HistoryItem, width: u16, theme: &Theme) -> (Vec<Line<'static>>, u16) {
-    let key = (fingerprint(item), width);
+pub(crate) fn active_lines(active: &ActiveItem, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+    cached_render_active(active, width, theme).0
+}
 
+pub(crate) fn active_height(active: &ActiveItem, width: u16, theme: &Theme) -> u16 {
+    cached_render_active(active, width, theme).1
+}
+
+pub(crate) fn cache_stats() -> CacheStats {
+    CACHE_STATS.with(|stats| *stats.borrow())
+}
+
+pub(crate) fn reset_cache_stats() {
+    CACHE_STATS.with(|stats| *stats.borrow_mut() = CacheStats::default());
+}
+
+pub(crate) fn reset_cache() {
+    CACHE.with(|cache| cache.borrow_mut().clear());
+    CACHE_ORDER.with(|order| order.borrow_mut().clear());
+    reset_cache_stats();
+}
+
+fn cached_render(item: &HistoryItem, width: u16, theme: &Theme) -> (Vec<Line<'static>>, u16) {
+    cached_render_by_key(CacheKey::Static { fingerprint: fingerprint(item), width }, || {
+        render_lines(item, width, theme)
+    })
+}
+
+fn cached_render_active(
+    active: &ActiveItem,
+    width: u16,
+    theme: &Theme,
+) -> (Vec<Line<'static>>, u16) {
+    cached_render_by_key(
+        CacheKey::Active { id: active.id, revision: active.revision, width },
+        || render_active_lines(active, width, theme),
+    )
+}
+
+fn cached_render_by_key<F>(key: CacheKey, render: F) -> (Vec<Line<'static>>, u16)
+where
+    F: FnOnce() -> Vec<Line<'static>>,
+{
     if let Some(cached) = CACHE.with(|cache| cache.borrow().get(&key).cloned()) {
+        CACHE_STATS.with(|stats| {
+            let mut stats = stats.borrow_mut();
+            stats.hits = stats.hits.saturating_add(1);
+        });
         return cached;
     }
 
-    let rendered = render_lines(item, width, theme);
+    CACHE_STATS.with(|stats| {
+        let mut stats = stats.borrow_mut();
+        stats.misses = stats.misses.saturating_add(1);
+    });
+
+    let rendered = render();
     let rendered_height = u16::try_from(rendered.len()).unwrap_or(u16::MAX);
 
     CACHE.with(|cache| {
@@ -83,6 +144,20 @@ fn render_lines(item: &HistoryItem, width: u16, theme: &Theme) -> Vec<Line<'stat
             render_provider_fallback(from, to, reason, width, theme)
         }
         HistoryItem::Divider => render_divider(width, theme),
+    }
+}
+
+fn render_active_lines(active: &ActiveItem, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+    match active.role {
+        Role::ToolCall => render_tool_call(
+            active.tool_name.as_deref().unwrap_or_default(),
+            &active.streaming_text,
+            false,
+            None,
+            width,
+            theme,
+        ),
+        _ => render_assistant_message(&active.streaming_text, true, width, theme),
     }
 }
 
@@ -299,8 +374,7 @@ fn ratatui_color(color: CrosstermColor) -> ratatui::style::Color {
 
 #[cfg(test)]
 fn clear_cache() {
-    CACHE.with(|cache| cache.borrow_mut().clear());
-    CACHE_ORDER.with(|order| order.borrow_mut().clear());
+    reset_cache();
 }
 
 #[cfg(test)]
@@ -470,5 +544,50 @@ mod tests {
         assert_eq!(cache_len(), 1);
         assert_eq!(line_text(&first[0]), line_text(&second[0]));
         assert_eq!(first[0].spans[0].style.fg, second[0].spans[0].style.fg);
+    }
+
+    #[test]
+    fn active_cache_hits_on_same_revision() {
+        clear_cache();
+        let mut active = ActiveItem::new_assistant();
+        active.append("hello");
+
+        let _first = active_lines(&active, 20, &theme());
+        let after_first = cache_stats();
+        let _second = active_lines(&active, 20, &theme());
+        let after_second = cache_stats();
+
+        assert_eq!(after_first.misses, 1);
+        assert_eq!(after_first.hits, 0);
+        assert_eq!(after_second.misses, 1);
+        assert_eq!(after_second.hits, 1);
+    }
+
+    #[test]
+    fn active_cache_misses_on_revision_bump() {
+        clear_cache();
+        let mut active = ActiveItem::new_assistant();
+        active.append("hello");
+
+        let _first = active_lines(&active, 20, &theme());
+        active.append(" world");
+        let _second = active_lines(&active, 20, &theme());
+        let stats = cache_stats();
+
+        assert_eq!(stats.hits, 0);
+        assert_eq!(stats.misses, 2);
+    }
+
+    #[test]
+    fn static_cache_unchanged() {
+        clear_cache();
+        let item = HistoryItem::assistant("stable", true);
+
+        let _first = lines(&item, 20, &theme());
+        let _second = lines(&item, 20, &theme());
+        let stats = cache_stats();
+
+        assert_eq!(stats.misses, 1);
+        assert_eq!(stats.hits, 1);
     }
 }

@@ -3,9 +3,9 @@ use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEven
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::Style,
-    widgets::{Block, Borders},
+    widgets::{Block, Borders, Widget},
 };
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use crate::app_event::AppEvent;
@@ -22,6 +22,8 @@ use crate::sidebar::SidebarState;
 use crate::tui::Tui;
 use crate::types::{TuiChannels, UiCommand};
 use unicode_width::UnicodeWidthStr;
+
+const COALESCE_WINDOW_MS: u64 = 50;
 
 #[expect(
     clippy::struct_field_names,
@@ -57,6 +59,8 @@ pub(crate) struct App {
     // Lifecycle
     running: bool,
     dirty: bool,
+    transcript_height_cache: Option<TranscriptHeightCache>,
+    render_count: u64,
 }
 
 impl App {
@@ -98,68 +102,157 @@ impl App {
             theme,
             running: true,
             dirty: true,
+            transcript_height_cache: None,
+            render_count: 0,
         }
     }
 
     pub(crate) async fn run(&mut self, tui: &mut Tui) -> Result<()> {
+        let mut renderer = TuiRenderer { tui };
+        self.run_with_renderer(&mut renderer).await
+    }
+
+    async fn run_with_renderer<R: AppRenderer>(&mut self, renderer: &mut R) -> Result<()> {
         let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        tick.tick().await;
+        let mut coalescer = RenderCoalescer::default();
 
-        tui.draw(|frame| self.render(frame))?;
-        self.dirty = false;
+        self.draw(renderer)?;
 
         while self.running {
-            tokio::select! {
-                biased;
+            let must_render_now = if let Some(deadline) = coalescer.deadline {
+                tokio::select! {
+                    biased;
 
-                Some(event) = self.app_event_rx.recv() => {
-                    self.handle_event(event);
-                }
+                    Some(event) = self.app_event_rx.recv() => {
+                        self.process_event(event, &mut coalescer)
+                    }
 
-                Some(ui_event) = self.channels.ui_rx.recv() => {
-                    self.handle_event(crate::adapter::from_ui_event(ui_event));
-                }
+                    Some(ui_event) = self.channels.ui_rx.recv() => {
+                        self.process_event(
+                            crate::adapter::from_ui_event(ui_event),
+                            &mut coalescer,
+                        )
+                    }
 
-                result = self.channels.bus_rx.recv() => {
-                    match result {
-                        Ok(bus_event) => {
-                            if let Some(event) = crate::adapter::from_bus_event(bus_event) {
-                                self.handle_event(event);
-                            }
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            tracing::warn!("bus broadcast lagged, skipped {n} events");
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                            self.running = false;
-                        }
+                    result = self.channels.bus_rx.recv() => {
+                        self.process_bus_result(result, &mut coalescer)
+                    }
+
+                    Some(req) = self.channels.perm_rx.recv() => {
+                        self.process_event(
+                            crate::adapter::from_permission_request(req),
+                            &mut coalescer,
+                        )
+                    }
+
+                    Some(req) = self.channels.question_rx.recv() => {
+                        self.process_event(
+                            crate::adapter::from_question_request(req),
+                            &mut coalescer,
+                        )
+                    }
+
+                    _ = tick.tick() => {
+                        self.process_event(AppEvent::Tick, &mut coalescer)
+                    }
+
+                    () = tokio::time::sleep_until(deadline) => {
+                        coalescer.on_timeout(self.dirty)
                     }
                 }
+            } else {
+                tokio::select! {
+                    biased;
 
-                Some(req) = self.channels.perm_rx.recv() => {
-                    self.handle_event(crate::adapter::from_permission_request(req));
+                    Some(event) = self.app_event_rx.recv() => {
+                        self.process_event(event, &mut coalescer)
+                    }
+
+                    Some(ui_event) = self.channels.ui_rx.recv() => {
+                        self.process_event(
+                            crate::adapter::from_ui_event(ui_event),
+                            &mut coalescer,
+                        )
+                    }
+
+                    result = self.channels.bus_rx.recv() => {
+                        self.process_bus_result(result, &mut coalescer)
+                    }
+
+                    Some(req) = self.channels.perm_rx.recv() => {
+                        self.process_event(
+                            crate::adapter::from_permission_request(req),
+                            &mut coalescer,
+                        )
+                    }
+
+                    Some(req) = self.channels.question_rx.recv() => {
+                        self.process_event(
+                            crate::adapter::from_question_request(req),
+                            &mut coalescer,
+                        )
+                    }
+
+                    _ = tick.tick() => {
+                        self.process_event(AppEvent::Tick, &mut coalescer)
+                    }
                 }
+            };
 
-                Some(req) = self.channels.question_rx.recv() => {
-                    self.handle_event(crate::adapter::from_question_request(req));
-                }
-
-                _ = tick.tick() => {
-                    self.handle_event(AppEvent::Tick);
-                }
-            }
-
-            while let Ok(event) = self.app_event_rx.try_recv() {
-                self.handle_event(event);
-            }
-
-            if self.dirty {
-                tui.draw(|frame| self.render(frame))?;
-                self.dirty = false;
+            if must_render_now {
+                self.draw(renderer)?;
             }
         }
 
         Ok(())
+    }
+
+    fn draw<R: AppRenderer>(&mut self, renderer: &mut R) -> Result<()> {
+        renderer.draw(self)?;
+        self.dirty = false;
+        self.render_count = self.render_count.saturating_add(1);
+        Ok(())
+    }
+
+    fn process_event(&mut self, event: AppEvent, coalescer: &mut RenderCoalescer) -> bool {
+        let coalescible = Self::is_coalescible_event(&event);
+        self.handle_event(event);
+        coalescer.after_event(coalescible, self.dirty)
+    }
+
+    fn process_bus_result(
+        &mut self,
+        result: std::result::Result<
+            flok_core::bus::BusEvent,
+            tokio::sync::broadcast::error::RecvError,
+        >,
+        coalescer: &mut RenderCoalescer,
+    ) -> bool {
+        match result {
+            Ok(bus_event) => crate::adapter::from_bus_event(bus_event)
+                .is_some_and(|event| self.process_event(event, coalescer)),
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                tracing::warn!("bus broadcast lagged, skipped {n} events");
+                false
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                self.running = false;
+                coalescer.after_event(false, self.dirty)
+            }
+        }
+    }
+
+    fn is_coalescible_event(event: &AppEvent) -> bool {
+        matches!(
+            event,
+            AppEvent::UiEvent(crate::types::UiEvent::TextDelta(_))
+                | AppEvent::BusEvent(
+                    flok_core::bus::BusEvent::TextDelta { .. }
+                        | flok_core::bus::BusEvent::ReasoningDelta { .. }
+                )
+        )
     }
 
     fn handle_event(&mut self, event: AppEvent) {
@@ -582,22 +675,26 @@ impl App {
             .title(format!(" flok — {} ", self.footer.model));
         frame.render_widget(chat_block, layout.chat);
 
-        self.chat_view.render(
+        let (chat_lines, chat_rows) = self.chat_view.visible_lines_and_rows(
             &self.history,
             self.active.as_ref(),
             &self.theme,
             layout.chat_inner,
-            frame.buffer_mut(),
         );
-        self.panel_buffers.push(PanelBuffer {
-            rect: layout.chat_inner,
-            rows: self.chat_view.visible_rows(
-                &self.history,
-                self.active.as_ref(),
-                &self.theme,
-                layout.chat_inner,
-            ),
-        });
+        for (index, line) in chat_lines.iter().enumerate() {
+            let row_y = layout.chat_inner.y.saturating_add(index as u16);
+            if row_y >= layout.chat_inner.y.saturating_add(layout.chat_inner.height) {
+                break;
+            }
+            let row = Rect {
+                x: layout.chat_inner.x,
+                y: row_y,
+                width: layout.chat_inner.width,
+                height: 1,
+            };
+            line.clone().render(row, frame.buffer_mut());
+        }
+        self.panel_buffers.push(PanelBuffer { rect: layout.chat_inner, rows: chat_rows });
         self.bottom_pane.render(layout.bottom, frame.buffer_mut(), &self.theme);
         self.panel_buffers.push(PanelBuffer {
             rect: layout.bottom,
@@ -732,30 +829,44 @@ impl App {
     fn scroll_chat(&mut self, delta: i32) {
         let layout =
             self.compute_layout(Rect::new(0, 0, self.terminal_size.0, self.terminal_size.1));
-        self.chat_view.handle_scroll(delta, layout.chat_inner.height, self.transcript_height());
+        let transcript_height = self.transcript_height();
+        self.chat_view.handle_scroll(delta, layout.chat_inner.height, transcript_height);
     }
 
-    fn transcript_height(&self) -> usize {
+    fn transcript_height(&mut self) -> usize {
         let layout =
             self.compute_layout(Rect::new(0, 0, self.terminal_size.0, self.terminal_size.1));
         let width = layout.chat_inner.width.max(1);
+        let active_id = self.active.as_ref().map(|active| active.id);
+        let active_revision = self.active.as_ref().map_or(0, |active| active.revision);
+
+        if let Some(cache) = self.transcript_height_cache {
+            if cache.history_len == self.history.len()
+                && cache.active_id == active_id
+                && cache.active_revision == active_revision
+                && cache.width == width
+            {
+                return cache.height;
+            }
+        }
+
         let mut total = self
             .history
             .iter()
             .map(|item| usize::from(crate::history::render::height(item, width, &self.theme)))
             .sum::<usize>();
         if let Some(active) = &self.active {
-            let synthetic = match active.role {
-                Role::ToolCall => HistoryItem::ToolCall {
-                    name: active.tool_name.clone().unwrap_or_default(),
-                    preview: active.streaming_text.clone(),
-                    is_error: false,
-                    duration_ms: None,
-                },
-                _ => HistoryItem::assistant(active.streaming_text.clone(), true),
-            };
-            total += usize::from(crate::history::render::height(&synthetic, width, &self.theme));
+            total += usize::from(crate::history::render::active_height(active, width, &self.theme));
         }
+
+        self.transcript_height_cache = Some(TranscriptHeightCache {
+            history_len: self.history.len(),
+            active_id,
+            active_revision,
+            width,
+            height: total,
+        });
+
         total
     }
 
@@ -1024,6 +1135,17 @@ impl App {
     pub(crate) fn test_chat_scroll_offset(&self) -> usize {
         self.chat_view.scroll_offset
     }
+
+    pub(crate) fn test_render_count(&self) -> u64 {
+        self.render_count
+    }
+
+    pub(crate) async fn test_run_with_renderer<R: AppRenderer>(
+        &mut self,
+        renderer: &mut R,
+    ) -> Result<()> {
+        self.run_with_renderer(renderer).await
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1039,6 +1161,54 @@ struct AppLayout {
 struct ChatDragLock {
     transcript_height: usize,
     scroll_offset: usize,
+}
+
+#[derive(Clone, Copy)]
+struct TranscriptHeightCache {
+    history_len: usize,
+    active_id: Option<u64>,
+    active_revision: u64,
+    width: u16,
+    height: usize,
+}
+
+#[derive(Default)]
+struct RenderCoalescer {
+    deadline: Option<tokio::time::Instant>,
+}
+
+impl RenderCoalescer {
+    fn after_event(&mut self, coalescible: bool, dirty: bool) -> bool {
+        if coalescible {
+            if dirty && self.deadline.is_none() {
+                self.deadline =
+                    Some(tokio::time::Instant::now() + Duration::from_millis(COALESCE_WINDOW_MS));
+            }
+            false
+        } else {
+            self.deadline = None;
+            dirty
+        }
+    }
+
+    fn on_timeout(&mut self, dirty: bool) -> bool {
+        self.deadline = None;
+        dirty
+    }
+}
+
+pub(crate) trait AppRenderer {
+    fn draw(&mut self, app: &mut App) -> Result<()>;
+}
+
+struct TuiRenderer<'a> {
+    tui: &'a mut Tui,
+}
+
+impl AppRenderer for TuiRenderer<'_> {
+    fn draw(&mut self, app: &mut App) -> Result<()> {
+        self.tui.draw(|frame| app.render(frame))
+    }
 }
 
 fn ratatui_color(color: crossterm::style::Color) -> ratatui::style::Color {
@@ -1075,10 +1245,25 @@ fn ratatui_color(color: crossterm::style::Color) -> ratatui::style::Color {
 mod tests {
     use super::*;
     use crossterm::event::KeyEvent;
+    use std::sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    };
     use tokio::sync::{broadcast, mpsc};
 
     use flok_core::session::PlanMode;
     use flok_core::tool::{PermissionRequest, QuestionRequest, TodoList};
+    #[derive(Clone, Default)]
+    struct CountingRenderer {
+        draws: Arc<AtomicU64>,
+    }
+
+    impl AppRenderer for CountingRenderer {
+        fn draw(&mut self, _app: &mut App) -> Result<()> {
+            self.draws.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
 
     fn make_channels() -> (TuiChannels, mpsc::UnboundedReceiver<UiCommand>) {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
@@ -1124,6 +1309,40 @@ mod tests {
         selection.finish_drag();
         app.selection = Some(selection);
         app
+    }
+
+    async fn spawn_counting_app(
+    ) -> (mpsc::UnboundedSender<AppEvent>, Arc<AtomicU64>, tokio::task::JoinHandle<Result<()>>)
+    {
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        let (ui_tx, ui_rx) = mpsc::unbounded_channel();
+        let (bus_tx, bus_rx) = broadcast::channel::<flok_core::bus::BusEvent>(16);
+        let (perm_tx, perm_rx) = mpsc::unbounded_channel::<PermissionRequest>();
+        let (question_tx, question_rx) = mpsc::unbounded_channel::<QuestionRequest>();
+        let channels = TuiChannels {
+            cmd_tx,
+            ui_rx,
+            bus_rx,
+            perm_rx,
+            question_rx,
+            todo_list: TodoList::new(),
+            plan_mode: PlanMode::new(),
+            model_name: String::from("test-model"),
+        };
+        let (tx, rx) = mpsc::unbounded_channel::<AppEvent>();
+        let mut app = App::new(channels, tx.clone(), rx);
+        let renderer = CountingRenderer::default();
+        let draws = renderer.draws.clone();
+        let join = tokio::spawn(async move {
+            let _keepalive = (ui_tx, bus_tx, perm_tx, question_tx);
+            let mut renderer = renderer;
+            app.test_run_with_renderer(&mut renderer).await
+        });
+
+        while draws.load(Ordering::Relaxed) == 0 {
+            tokio::task::yield_now().await;
+        }
+        (tx, draws, join)
     }
 
     #[tokio::test]
@@ -1196,5 +1415,73 @@ mod tests {
         app.handle_event(AppEvent::Key(ctrl('d')));
 
         assert!(!app.running);
+    }
+
+    #[tokio::test]
+    async fn coalescing_batches_deltas_within_window() {
+        let (tx, draws, join) = spawn_counting_app().await;
+
+        for index in 0..10 {
+            let sent =
+                tx.send(AppEvent::UiEvent(crate::types::UiEvent::TextDelta(index.to_string())));
+            assert!(sent.is_ok());
+        }
+        tokio::task::yield_now().await;
+        assert_eq!(draws.load(Ordering::Relaxed), 1);
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(draws.load(Ordering::Relaxed), 1);
+
+        tokio::time::sleep(Duration::from_millis(COALESCE_WINDOW_MS + 20)).await;
+        assert_eq!(draws.load(Ordering::Relaxed), 2);
+
+        let sent = tx.send(AppEvent::Quit);
+        assert!(sent.is_ok());
+        tokio::task::yield_now().await;
+        assert!(matches!(join.await, Ok(Ok(()))));
+    }
+
+    #[tokio::test]
+    async fn coalescing_flushes_on_mouse_event() {
+        let (tx, draws, join) = spawn_counting_app().await;
+
+        let delta_sent = tx.send(AppEvent::UiEvent(crate::types::UiEvent::TextDelta("hi".into())));
+        assert!(delta_sent.is_ok());
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let mouse_sent = tx.send(AppEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert!(mouse_sent.is_ok());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        assert_eq!(draws.load(Ordering::Relaxed), 2);
+
+        let quit_sent = tx.send(AppEvent::Quit);
+        assert!(quit_sent.is_ok());
+        tokio::task::yield_now().await;
+        assert!(matches!(join.await, Ok(Ok(()))));
+    }
+
+    #[tokio::test]
+    async fn coalescing_expires_after_window() {
+        let (tx, draws, join) = spawn_counting_app().await;
+
+        let delta_sent = tx.send(AppEvent::UiEvent(crate::types::UiEvent::TextDelta("hi".into())));
+        assert!(delta_sent.is_ok());
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(draws.load(Ordering::Relaxed), 1);
+
+        tokio::time::sleep(Duration::from_millis(COALESCE_WINDOW_MS + 20)).await;
+        assert_eq!(draws.load(Ordering::Relaxed), 2);
+
+        let quit_sent = tx.send(AppEvent::Quit);
+        assert!(quit_sent.is_ok());
+        tokio::task::yield_now().await;
+        assert!(matches!(join.await, Ok(Ok(()))));
     }
 }

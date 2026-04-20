@@ -119,6 +119,18 @@ mod tests {
     }
 
     #[test]
+    fn revision_increments_on_delta() {
+        let mut active = Some(ActiveItem::new_assistant());
+
+        for _ in 0..5 {
+            assert!(ingest_assistant_delta(&mut active, "x"));
+        }
+
+        let item = active.expect("active item present after deltas");
+        assert_eq!(item.revision, 5);
+    }
+
+    #[test]
     fn ingest_empty_delta_returns_false() {
         let mut active: Option<ActiveItem> = None;
         assert!(!ingest_assistant_delta(&mut active, ""));

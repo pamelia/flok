@@ -104,11 +104,13 @@ fn ctrl_c_with_selection_copies_and_does_not_quit() -> Result<()> {
 }
 
 #[test]
-fn ctrl_c_without_selection_quits() -> Result<()> {
+fn ctrl_c_without_selection_is_noop() -> Result<()> {
     let mut harness = TestAppHarness::new(80, 24)?;
     harness.ctrl_key('c')?;
 
-    assert!(!harness.is_running());
+    // Ctrl+C never quits — only copies on active selection. Without a
+    // selection it's a no-op; the app stays running. Ctrl+D quits.
+    assert!(harness.is_running());
     Ok(())
 }
 

@@ -1,6 +1,6 @@
 # Spec 016 — Panel-Scoped Text Selection
 
-**Status:** Draft
+**Status**: Accepted (2026-04-19 — feature shipped; spec retroactively locked to match built reality.)
 **Priority:** P1 — Major UX issue
 **Depends on:** 007 (TUI)
 

@@ -2,7 +2,7 @@
 
 **Feature Branch**: `018-tree-sessions`
 **Created**: 2026-04-01
-**Status**: Draft
+**Status**: Accepted (2026-04-19 — feature shipped; spec retroactively locked to match built reality.)
 
 ## Motivation
 

@@ -1,6 +1,8 @@
+> **WARNING SUPERSEDED**: This spec describes a framework direction that was later reversed. flok-tui now uses ratatui. Retained for historical record only. Do not implement.
+
 # Spec 017 — iocraft TUI Migration
 
-**Status:** In Progress
+**Status**: Superseded (2026-04-19 — iocraft→ratatui migration was reversed in commit 2d54dea. flok-tui is now ratatui-based. See spec 007 for current TUI architecture.)
 **Priority:** P0 — Architecture improvement
 **Depends on:** 007 (TUI)
 

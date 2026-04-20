@@ -2,7 +2,8 @@
 
 **Feature Branch**: `007-tui`
 **Created**: 2026-03-28
-**Status**: Draft
+**Status**: Accepted (2026-04-19 — current ratatui implementation retroactively locked. iocraft references replaced.)
+**Framework**: ratatui + crossterm (ratatui components with immediate-mode rendering). The original iocraft-based design from spec 017 was superseded; this spec reflects the current ratatui architecture.
 
 ## User Scenarios & Testing
 
@@ -46,7 +47,7 @@
 
 ### Functional Requirements
 
-- **FR-001**: Flok MUST use `iocraft` as the TUI framework (declarative React-like component model with flexbox layout via taffy).
+- **FR-001**: Flok MUST use `ratatui` as the TUI framework (declarative React-like component model with flexbox layout via taffy).
 - **FR-002**: The TUI MUST have the following layout areas:
   - **Header**: Model name, session title, token count, cost
   - **Main area**: Scrollable message history with markdown rendering
@@ -133,7 +134,8 @@ pub struct Theme {
 
 ### Overview
 
-The TUI is built on `iocraft`, a declarative React-like component framework for terminals with flexbox layout (via taffy). Components use hooks (`use_state`, `use_future`, `use_terminal_events`) for state management and async channel polling. State flows from the event bus through `use_future` hooks that update `State<T>` variables, triggering automatic re-renders. The design prioritizes: (1) sub-frame rendering latency for streaming, (2) canvas-diffing for minimal redraws, and (3) clean component boundaries (messages, sidebar, input are separate components).
+The TUI is built on `ratatui`, a declarative React-like component framework for terminals with flexbox layout (via taffy). Components use hooks (`use_state`, `use_future`, `use_terminal_events`) for state management and async channel polling. State flows from the event bus through `use_future` hooks that update `State<T>` variables, triggering automatic re-renders. The design prioritizes: (1) sub-frame rendering latency for streaming, (2) canvas-diffing for minimal redraws, and (3) clean component boundaries (messages, sidebar, input are separate components).
+// see crates/flok-tui/src/ for current ratatui translation
 
 ### Detailed Design
 
@@ -207,12 +209,13 @@ fn handle_bus_event(tui: &mut TuiState, event: BusEvent) {
 
 #### Markdown Rendering
 
-Messages are rendered with rich formatting using a custom markdown-to-iocraft component tree converter:
+Messages are rendered with rich formatting using a custom markdown-to-ratatui component tree converter:
 
 ```rust
 pub fn render_markdown(text: &str, width: u16, theme: &Theme) -> Vec<Line<'_>> {
     // Parse markdown with pulldown-cmark
-    // Convert to iocraft elements with:
+    // Convert to ratatui elements with:
+    // see crates/flok-tui/src/ for current ratatui translation
     //   - Bold: Style::new().bold()
     //   - Italic: Style::new().italic()
     //   - Code inline: Style::new().bg(theme.code_bg)
@@ -345,9 +348,10 @@ For the initial implementation, the TUI and server run in the same process. The 
 
 ### Alternatives Considered
 
-1. **Ink (React for terminals) via wasm**: Rejected. Adds runtime dependency. `iocraft` provides a similar React-like model natively in Rust.
+1. **Ink (React for terminals) via wasm**: Rejected. Adds runtime dependency. `ratatui` provides a similar React-like model natively in Rust.
 2. **TUI communicates directly with session engine (no HTTP)**: Considered but rejected. The HTTP API layer enables future UIs (web, desktop) without refactoring. The in-process HTTP overhead is negligible.
-3. **Use iocraft `TextInput` for input**: Adopted. iocraft provides a built-in `TextInput` component with cursor, multiline, and scroll support.
+3. **Use ratatui `TextInput` for input**: Adopted. ratatui provides a built-in `TextInput` component with cursor, multiline, and scroll support.
+// see crates/flok-tui/src/ for current ratatui translation
 4. **Image preview**: Deferred. Image support (for vision model responses) can be added later.
 
 ## Success Criteria

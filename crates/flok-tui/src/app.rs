@@ -189,17 +189,13 @@ impl App {
                 if matches!(key.code, KeyCode::Tab) {
                     self.handle_event(AppEvent::TogglePlanMode);
                 } else if key.modifiers.contains(KeyModifiers::CONTROL)
-                    && matches!(key.code, KeyCode::Char('b'))
-                {
-                    self.sidebar.visible = !self.sidebar.visible;
-                } else if key.modifiers.contains(KeyModifiers::CONTROL)
                     && matches!(key.code, KeyCode::Char('c'))
                 {
+                    // Ctrl+C only copies when there is an active text selection.
+                    // It does NOT quit — use Ctrl+D to exit. Ctrl+B is unbound.
                     if self.selection.as_ref().is_some_and(SelectionState::has_extent) {
                         self.copy_active_selection();
                         self.selection = None;
-                    } else {
-                        self.running = false;
                     }
                 } else if key.modifiers.contains(KeyModifiers::CONTROL)
                     && matches!(key.code, KeyCode::Char('d'))
@@ -1181,14 +1177,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ctrl_c_without_selection_quits() {
+    async fn ctrl_c_without_selection_is_noop() {
         let (channels, _cmd_rx) = make_channels();
         let (tx, rx) = mpsc::unbounded_channel::<AppEvent>();
         let mut app = App::new(channels, tx, rx);
 
         app.handle_event(AppEvent::Key(ctrl('c')));
 
-        assert!(!app.running);
+        // Ctrl+C must NEVER quit — only copy-on-selection. Without a
+        // selection it's a no-op; the app stays running. Ctrl+D quits.
+        assert!(app.running);
     }
 
     #[tokio::test]

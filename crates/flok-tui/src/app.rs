@@ -1159,6 +1159,16 @@ impl App {
         self.layout_rects
     }
 
+    pub(crate) fn test_seed_click_tracker(&mut self, count: u8, column: u16, row: u16) {
+        self.click_tracker.history.clear();
+        let now = Instant::now();
+        for offset_ms in (0..count).rev() {
+            let seen_at =
+                now.checked_sub(Duration::from_millis(u64::from(offset_ms + 1))).unwrap_or(now);
+            self.click_tracker.history.push_back((seen_at, column, row));
+        }
+    }
+
     pub(crate) fn test_copied_text(&self) -> Option<&str> {
         self.clipboard.last_copied_text.as_deref()
     }

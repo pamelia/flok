@@ -972,11 +972,9 @@ impl App {
                     if selection.has_extent() {
                         let text = extract_selection_text(&self.panel_buffers, selection);
                         let _copied = self.clipboard.copy(&text);
-                        selection.finish_drag();
-                    } else {
-                        selection.clear();
-                        self.selection = None;
                     }
+                    selection.clear();
+                    self.selection = None;
                 }
                 self.release_chat_drag_lock();
                 self.dirty = true;
@@ -1347,7 +1345,6 @@ mod tests {
         let mut selection =
             SelectionState::start(SelectionPoint { panel: PanelKind::Chat, row: 0, col: 0 });
         selection.extend(SelectionPoint { panel: PanelKind::Chat, row: 0, col: 4 });
-        selection.finish_drag();
         app.selection = Some(selection);
         app
     }

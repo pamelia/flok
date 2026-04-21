@@ -123,10 +123,6 @@ impl SelectionState {
         self.dragging
     }
 
-    pub(crate) fn finish_drag(&mut self) {
-        self.dragging = false;
-    }
-
     pub(crate) fn normalized(&self) -> (SelectionPoint, SelectionPoint) {
         let anchor = self.anchor.unwrap_or_else(default_point);
         let head = self.head.unwrap_or(anchor);

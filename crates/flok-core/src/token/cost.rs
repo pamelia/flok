@@ -13,7 +13,8 @@ pub struct CostTracker {
     output_tokens: AtomicU64,
     cache_read_tokens: AtomicU64,
     cache_creation_tokens: AtomicU64,
-    model_id: String,
+    estimated_cost_microusd: AtomicU64,
+    default_model_id: String,
 }
 
 impl CostTracker {
@@ -24,7 +25,8 @@ impl CostTracker {
             output_tokens: AtomicU64::new(0),
             cache_read_tokens: AtomicU64::new(0),
             cache_creation_tokens: AtomicU64::new(0),
-            model_id: model_id.to_string(),
+            estimated_cost_microusd: AtomicU64::new(0),
+            default_model_id: model_id.to_string(),
         }
     }
 
@@ -36,10 +38,38 @@ impl CostTracker {
         cache_read_tokens: u64,
         cache_creation_tokens: u64,
     ) {
+        self.record_with_model(
+            &self.default_model_id,
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+            cache_creation_tokens,
+        );
+    }
+
+    /// Record token usage against a specific model.
+    pub fn record_with_model(
+        &self,
+        model_id: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_read_tokens: u64,
+        cache_creation_tokens: u64,
+    ) {
         self.input_tokens.fetch_add(input_tokens, Ordering::Relaxed);
         self.output_tokens.fetch_add(output_tokens, Ordering::Relaxed);
         self.cache_read_tokens.fetch_add(cache_read_tokens, Ordering::Relaxed);
         self.cache_creation_tokens.fetch_add(cache_creation_tokens, Ordering::Relaxed);
+        self.estimated_cost_microusd.fetch_add(
+            estimate_cost_microusd(
+                model_id,
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_creation_tokens,
+            ),
+            Ordering::Relaxed,
+        );
     }
 
     /// Get the total input tokens.
@@ -69,26 +99,7 @@ impl CostTracker {
     /// - Cache creation tokens cost 125% of normal input price
     /// - Non-cached input tokens cost full input price
     pub fn estimated_cost_usd(&self) -> f64 {
-        let registry = ModelRegistry::builtin();
-        let Some(model) = registry.get(&self.model_id) else {
-            return 0.0;
-        };
-
-        let input = self.total_input_tokens();
-        let output = self.total_output_tokens();
-        let cache_read = self.total_cache_read_tokens();
-        let cache_creation = self.total_cache_creation_tokens();
-
-        // Non-cached input = total input - cache read - cache creation
-        let uncached_input = input.saturating_sub(cache_read).saturating_sub(cache_creation);
-
-        let input_cost = (uncached_input as f64 / 1_000_000.0) * model.input_cost_per_m;
-        let output_cost = (output as f64 / 1_000_000.0) * model.output_cost_per_m;
-        let cache_read_cost = (cache_read as f64 / 1_000_000.0) * model.input_cost_per_m * 0.1;
-        let cache_create_cost =
-            (cache_creation as f64 / 1_000_000.0) * model.input_cost_per_m * 1.25;
-
-        input_cost + output_cost + cache_read_cost + cache_create_cost
+        self.estimated_cost_microusd.load(Ordering::Relaxed) as f64 / 1_000_000.0
     }
 
     /// Format cost as a human-readable string.
@@ -100,6 +111,29 @@ impl CostTracker {
             format!("${cost:.2}")
         }
     }
+}
+
+fn estimate_cost_microusd(
+    model_id: &str,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_tokens: u64,
+    cache_creation_tokens: u64,
+) -> u64 {
+    let registry = ModelRegistry::builtin();
+    let Some(model) = registry.get(model_id) else {
+        return 0;
+    };
+
+    let uncached_input =
+        input_tokens.saturating_sub(cache_read_tokens).saturating_sub(cache_creation_tokens);
+    let input_cost = (uncached_input as f64 / 1_000_000.0) * model.input_cost_per_m;
+    let output_cost = (output_tokens as f64 / 1_000_000.0) * model.output_cost_per_m;
+    let cache_read_cost = (cache_read_tokens as f64 / 1_000_000.0) * model.input_cost_per_m * 0.1;
+    let cache_create_cost =
+        (cache_creation_tokens as f64 / 1_000_000.0) * model.input_cost_per_m * 1.25;
+
+    ((input_cost + output_cost + cache_read_cost + cache_create_cost) * 1_000_000.0).round() as u64
 }
 
 #[cfg(test)]
@@ -151,6 +185,16 @@ mod tests {
         let tracker = CostTracker::new("unknown/model");
         tracker.record(100_000, 10_000, 0, 0);
         assert!(tracker.estimated_cost_usd().abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn record_with_model_uses_call_specific_pricing() {
+        let tracker = CostTracker::new("openai/gpt-5.4-nano");
+        tracker.record_with_model("openai/gpt-5.4", 100_000, 10_000, 0, 0);
+
+        let cost = tracker.estimated_cost_usd();
+        assert!(cost > 0.39);
+        assert!(cost < 0.41);
     }
 
     #[test]

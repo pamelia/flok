@@ -453,6 +453,24 @@ impl App {
                 flok_core::bus::BusEvent::CompressionStats { t1_pruned, l2_compressed, .. } => {
                     tracing::debug!(t1_pruned, l2_compressed, "compression stats updated");
                 }
+                flok_core::bus::BusEvent::VerificationStarted { command, .. } => {
+                    self.history
+                        .push(HistoryItem::system_info(format!("Verification running: {command}")));
+                    self.chat_view.on_new_content();
+                    self.maintain_chat_drag_lock();
+                    self.dirty = true;
+                }
+                flok_core::bus::BusEvent::VerificationCompleted { success, summary, .. } => {
+                    let item = if success {
+                        HistoryItem::system_info(summary)
+                    } else {
+                        HistoryItem::system_error(summary)
+                    };
+                    self.history.push(item);
+                    self.chat_view.on_new_content();
+                    self.maintain_chat_drag_lock();
+                    self.dirty = true;
+                }
                 flok_core::bus::BusEvent::TeamCreated { team_name, .. } => {
                     self.history.push(HistoryItem::TeamEvent {
                         kind: TeamEventKind::Created,
@@ -494,6 +512,14 @@ impl App {
                         to_provider,
                         reason,
                     ));
+                    self.chat_view.on_new_content();
+                    self.maintain_chat_drag_lock();
+                    self.dirty = true;
+                }
+                flok_core::bus::BusEvent::ModelRouted { from_model, to_model, reason, .. } => {
+                    self.history.push(HistoryItem::system_info(format!(
+                        "Model routed: {from_model} -> {to_model} ({reason})"
+                    )));
                     self.chat_view.on_new_content();
                     self.maintain_chat_drag_lock();
                     self.dirty = true;
@@ -547,6 +573,21 @@ impl App {
                                 let _ = self.channels.cmd_tx.send(UiCommand::SetLabel(rest));
                             }
                         }
+                        "plans" => {
+                            let _ = self.channels.cmd_tx.send(UiCommand::ListPlans);
+                        }
+                        "show-plan" => {
+                            let plan_id = (!rest.is_empty()).then_some(rest);
+                            let _ = self.channels.cmd_tx.send(UiCommand::ShowPlan(plan_id));
+                        }
+                        "approve" => {
+                            let plan_id = (!rest.is_empty()).then_some(rest);
+                            let _ = self.channels.cmd_tx.send(UiCommand::ApprovePlan(plan_id));
+                        }
+                        "execute-plan" => {
+                            let plan_id = (!rest.is_empty()).then_some(rest);
+                            let _ = self.channels.cmd_tx.send(UiCommand::ExecutePlan(plan_id));
+                        }
                         "plan" => {
                             self.channels.plan_mode.set(true);
                             self.footer.plan_mode = true;
@@ -565,7 +606,7 @@ impl App {
                         }
                         "help" => {
                             self.history.push(HistoryItem::system_info(
-                                "Slash: /new /clear /undo /redo /tree /branch /label /plan /build /sidebar /sessions /help /quit",
+                                "Slash: /new /clear /undo /redo /tree /branch /label /plans /show-plan /approve /execute-plan /plan /build /sidebar /sessions /help /quit",
                             ));
                             self.chat_view.on_new_content();
                             self.maintain_chat_drag_lock();
@@ -931,11 +972,9 @@ impl App {
                     if selection.has_extent() {
                         let text = extract_selection_text(&self.panel_buffers, selection);
                         let _copied = self.clipboard.copy(&text);
-                        selection.finish_drag();
-                    } else {
-                        selection.clear();
-                        self.selection = None;
                     }
+                    selection.clear();
+                    self.selection = None;
                 }
                 self.release_chat_drag_lock();
                 self.dirty = true;
@@ -1118,6 +1157,16 @@ impl App {
 
     pub(crate) fn test_layout_rects(&self) -> LayoutRects {
         self.layout_rects
+    }
+
+    pub(crate) fn test_seed_click_tracker(&mut self, count: u8, column: u16, row: u16) {
+        self.click_tracker.history.clear();
+        let now = Instant::now();
+        for offset_ms in (0..count).rev() {
+            let seen_at =
+                now.checked_sub(Duration::from_millis(u64::from(offset_ms + 1))).unwrap_or(now);
+            self.click_tracker.history.push_back((seen_at, column, row));
+        }
     }
 
     pub(crate) fn test_copied_text(&self) -> Option<&str> {
@@ -1306,7 +1355,6 @@ mod tests {
         let mut selection =
             SelectionState::start(SelectionPoint { panel: PanelKind::Chat, row: 0, col: 0 });
         selection.extend(SelectionPoint { panel: PanelKind::Chat, row: 0, col: 4 });
-        selection.finish_drag();
         app.selection = Some(selection);
         app
     }
@@ -1382,6 +1430,50 @@ mod tests {
 
         let command = cmd_rx.try_recv().expect("cancel command should be queued");
         assert!(matches!(command, UiCommand::Cancel));
+    }
+
+    #[tokio::test]
+    async fn submit_plans_sends_list_plans_command() {
+        let (channels, mut cmd_rx) = make_channels();
+        let (tx, rx) = mpsc::unbounded_channel::<AppEvent>();
+        let mut app = App::new(channels, tx, rx);
+
+        app.handle_event(AppEvent::Submit("/plans".to_string()));
+
+        let command = cmd_rx.try_recv().expect("list plans command should be queued");
+        assert!(matches!(command, UiCommand::ListPlans));
+    }
+
+    #[tokio::test]
+    async fn submit_execute_plan_with_id_sends_execute_command() {
+        let (channels, mut cmd_rx) = make_channels();
+        let (tx, rx) = mpsc::unbounded_channel::<AppEvent>();
+        let mut app = App::new(channels, tx, rx);
+
+        app.handle_event(AppEvent::Submit("/execute-plan plan-123".to_string()));
+
+        let command = cmd_rx.try_recv().expect("execute plan command should be queued");
+        assert!(matches!(command, UiCommand::ExecutePlan(Some(plan_id)) if plan_id == "plan-123"));
+    }
+
+    #[tokio::test]
+    async fn model_routed_bus_event_adds_system_history_item() {
+        let (channels, _cmd_rx) = make_channels();
+        let (tx, rx) = mpsc::unbounded_channel::<AppEvent>();
+        let mut app = App::new(channels, tx, rx);
+
+        app.handle_event(AppEvent::BusEvent(flok_core::bus::BusEvent::ModelRouted {
+            session_id: "session-1".to_string(),
+            from_model: "openai/gpt-5.4-mini".to_string(),
+            to_model: "openai/gpt-5.4".to_string(),
+            reason: "complexity score 4 (architecture or planning request)".to_string(),
+        }));
+
+        assert!(app.history.iter().any(|item| matches!(
+            item,
+            HistoryItem::System { text, .. }
+                if text.contains("Model routed: openai/gpt-5.4-mini -> openai/gpt-5.4")
+        )));
     }
 
     #[tokio::test]

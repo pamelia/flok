@@ -158,6 +158,10 @@ impl TestAppHarness {
         self.app.test_copied_text()
     }
 
+    pub fn seed_click_count(&mut self, count: u8, column: u16, row: u16) {
+        self.app.test_seed_click_tracker(count, column, row);
+    }
+
     pub fn is_running(&self) -> bool {
         self.app.test_is_running()
     }

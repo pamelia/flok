@@ -39,6 +39,12 @@ pub static BUILTIN_SKILLS: &[BuiltinSkill] = &[
         content: include_str!("handle-pr-feedback.md"),
         description: "Reads PR review comments, applies fixes, replies to each comment",
     },
+    BuiltinSkill {
+        name: "source-driven-development",
+        content: include_str!("source-driven-development.md"),
+        description:
+            "Grounds framework-specific code decisions in official documentation with cited sources",
+    },
 ];
 
 /// Look up a built-in skill by name.

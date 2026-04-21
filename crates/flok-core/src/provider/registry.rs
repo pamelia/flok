@@ -128,6 +128,14 @@ impl ProviderRegistry {
         self.default_model(name).map(display_model)
     }
 
+    /// List all configured provider default models.
+    pub fn configured_default_models(&self) -> Vec<String> {
+        let mut models = self.default_models.values().cloned().collect::<Vec<_>>();
+        models.sort();
+        models.dedup();
+        models
+    }
+
     /// Get the concurrency semaphore for a provider.
     #[must_use]
     pub fn semaphore(&self, name: &str) -> Option<Arc<Semaphore>> {

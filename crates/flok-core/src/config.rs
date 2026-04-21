@@ -53,6 +53,8 @@ pub struct FlokConfig {
     pub permission: HashMap<String, PermissionToolConfig>,
     /// Runtime provider fallback behavior.
     pub runtime_fallback: RuntimeFallbackConfig,
+    /// Request-time model routing behavior.
+    pub intelligent_routing: IntelligentRoutingConfig,
     /// Tool output compression configuration.
     pub output_compression: OutputCompressionConfig,
 }
@@ -134,6 +136,22 @@ impl Default for RuntimeFallbackConfig {
             cooldown_seconds: 120,
             notify_on_fallback: true,
         }
+    }
+}
+
+/// Request-time model routing behavior.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct IntelligentRoutingConfig {
+    /// Whether request-time model routing is enabled.
+    pub enabled: bool,
+    /// Minimum complexity score required before upgrading the request model.
+    pub complexity_threshold: u32,
+}
+
+impl Default for IntelligentRoutingConfig {
+    fn default() -> Self {
+        Self { enabled: true, complexity_threshold: 4 }
     }
 }
 
@@ -366,6 +384,9 @@ fn merge_config(target: &mut FlokConfig, source: &FlokConfig) {
     if source.runtime_fallback != RuntimeFallbackConfig::default() {
         target.runtime_fallback = source.runtime_fallback.clone();
     }
+    if source.intelligent_routing != IntelligentRoutingConfig::default() {
+        target.intelligent_routing = source.intelligent_routing.clone();
+    }
     let default_output_compression = OutputCompressionConfig::default();
     if source.output_compression.enabled != default_output_compression.enabled {
         target.output_compression.enabled = source.output_compression.enabled;
@@ -435,6 +456,7 @@ mod tests {
         assert!(config.lsp.enabled);
         assert_eq!(config.lsp.rust.command, "rust-analyzer");
         assert_eq!(config.runtime_fallback, RuntimeFallbackConfig::default());
+        assert_eq!(config.intelligent_routing, IntelligentRoutingConfig::default());
         assert_eq!(config.output_compression, OutputCompressionConfig::default());
     }
 
@@ -886,6 +908,25 @@ mod tests {
     fn runtime_fallback_defaults_when_missing() {
         let config: FlokConfig = toml::from_str("").unwrap();
         assert_eq!(config.runtime_fallback, RuntimeFallbackConfig::default());
+    }
+
+    #[test]
+    fn parse_intelligent_routing_config() {
+        let toml_str = "
+            [intelligent_routing]
+            enabled = false
+            complexity_threshold = 6
+        ";
+
+        let config: FlokConfig = toml::from_str(toml_str).unwrap();
+        assert!(!config.intelligent_routing.enabled);
+        assert_eq!(config.intelligent_routing.complexity_threshold, 6);
+    }
+
+    #[test]
+    fn intelligent_routing_defaults_when_missing() {
+        let config: FlokConfig = toml::from_str("").unwrap();
+        assert_eq!(config.intelligent_routing, IntelligentRoutingConfig::default());
     }
 
     #[test]

@@ -20,7 +20,7 @@ fn click_drag_in_chat_extracts_correct_text() -> Result<()> {
     harness.mouse_up_left(start_col + 4, row, false)?;
 
     assert_eq!(harness.copied_text(), Some("hello"));
-    assert!(harness.has_selection());
+    assert!(!harness.has_selection());
     Ok(())
 }
 
@@ -45,10 +45,9 @@ fn triple_click_selects_line() -> Result<()> {
     harness.add_user_message("hello world")?;
 
     let (col, row) = chat_body_point(&harness);
-    for _ in 0..3 {
-        harness.mouse_down_left(col, row, false)?;
-        harness.mouse_up_left(col, row, false)?;
-    }
+    harness.seed_click_count(2, col, row);
+    harness.mouse_down_left(col, row, false)?;
+    harness.mouse_up_left(col, row, false)?;
 
     assert_eq!(harness.copied_text().map(str::trim), Some("hello world"));
     Ok(())

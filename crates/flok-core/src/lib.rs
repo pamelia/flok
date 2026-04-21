@@ -15,6 +15,7 @@ pub mod permission;
 pub mod plan;
 pub mod provider;
 pub mod review;
+pub mod routing;
 pub mod session;
 pub mod skills;
 pub mod snapshot;

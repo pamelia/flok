@@ -21,6 +21,7 @@ use crate::plan::{
     StepStatus,
 };
 use crate::provider::{CompletionRequest, Message, MessageContent, ModelRegistry, StreamEvent};
+use crate::routing::route_model;
 use crate::session::state::AppState;
 use crate::token::TokenCounter;
 use crate::verification::{
@@ -1090,9 +1091,6 @@ impl SessionEngine {
         let mut verification_failure_summary: Option<VerificationFailureSummary> = None;
         let mut verification_preference: Option<VerificationPreference> = None;
         let mut call_history: HashMap<String, usize> = HashMap::new();
-        let token_counter = TokenCounter::for_model(&self.model_id);
-        let context_window =
-            ModelRegistry::builtin().get(&self.model_id).map_or(200_000, |m| m.context_window);
 
         loop {
             rounds += 1;
@@ -1108,6 +1106,25 @@ impl SessionEngine {
             }
 
             let mut messages = self.assemble_messages()?;
+            let routing = route_model(
+                &self.model_id,
+                &messages,
+                &self.state.provider_registry,
+                &self.state.config.intelligent_routing,
+            );
+            let active_model_id = routing.model_id.clone();
+            let token_counter = TokenCounter::for_model(&active_model_id);
+            let context_window = ModelRegistry::builtin()
+                .get(&active_model_id)
+                .map_or(200_000, |m| m.context_window);
+            if active_model_id != self.model_id {
+                self.state.bus.send(BusEvent::ModelRouted {
+                    session_id: self.session_id.clone(),
+                    from_model: self.model_id.clone(),
+                    to_model: active_model_id.clone(),
+                    reason: routing.reason.unwrap_or_else(|| "complex request".to_string()),
+                });
+            }
             let system =
                 build_system_prompt(&self.state.project_root, &self.state.provider_registry);
 
@@ -1211,7 +1228,7 @@ impl SessionEngine {
             };
 
             let request = CompletionRequest {
-                model: self.model_id.clone(),
+                model: active_model_id,
                 system,
                 messages,
                 tools,
@@ -1790,6 +1807,7 @@ impl SessionEngine {
         let bus = self.state.bus.clone();
         let session_id = self.session_id.clone();
         let cost_tracker = &self.state.cost_tracker;
+        let usage_model_id = request.model.clone();
 
         let result = self
             .state
@@ -1836,7 +1854,8 @@ impl SessionEngine {
                             cache_read_tokens,
                             "token usage"
                         );
-                        cost_tracker.record(
+                        cost_tracker.record_with_model(
+                            &usage_model_id,
                             *input_tokens,
                             *output_tokens,
                             *cache_read_tokens,
@@ -2764,6 +2783,24 @@ mod tests {
         provider: &Arc<MockProvider>,
         tools: ToolRegistry,
     ) -> SessionEngine {
+        test_engine_with_provider_model(
+            temp_dir,
+            provider,
+            tools,
+            "mock",
+            "mock/test-model",
+            "mock/test-model",
+        )
+    }
+
+    fn test_engine_with_provider_model(
+        temp_dir: &TempDir,
+        provider: &Arc<MockProvider>,
+        tools: ToolRegistry,
+        provider_name: &str,
+        provider_default_model: &str,
+        session_model: &str,
+    ) -> SessionEngine {
         let project_root = std::fs::canonicalize(temp_dir.path()).expect("canonical project root");
         let db = Db::open_in_memory().expect("in-memory db");
         let project_id = "test-project";
@@ -2776,9 +2813,9 @@ mod tests {
         let provider_dyn: Arc<dyn crate::provider::Provider> = provider_concrete;
         let mut provider_registry = ProviderRegistry::new();
         provider_registry.insert(
-            "mock",
+            provider_name.to_string(),
             Arc::clone(&provider_dyn),
-            Some("mock/test-model".into()),
+            Some(provider_default_model.to_string()),
             3,
         );
         let provider_registry = Arc::new(provider_registry);
@@ -2790,7 +2827,7 @@ mod tests {
             tools,
             Bus::new(64),
             PermissionManager::auto_approve(),
-            CostTracker::new("test-model"),
+            CostTracker::new(session_model),
             PlanMode::new(),
             project_root,
             project_id.to_string(),
@@ -2798,7 +2835,7 @@ mod tests {
             lsp,
         );
 
-        SessionEngine::new(state, "mock/test-model".to_string()).expect("create session engine")
+        SessionEngine::new(state, session_model.to_string()).expect("create session engine")
     }
 
     fn write_rust_fixture(temp_dir: &TempDir) {
@@ -2982,6 +3019,39 @@ edition = "2021"
             }
         }
         assert!(saw_success, "expected verification success event");
+    }
+
+    #[tokio::test]
+    async fn complex_turn_emits_model_routed_event() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let provider = Arc::new(MockProvider::new());
+        provider.push_turn(MockTurn::Text("done".into()));
+
+        let mut engine = test_engine_with_provider_model(
+            &temp_dir,
+            &provider,
+            ToolRegistry::new(),
+            "openai",
+            "openai/gpt-5.4",
+            "openai/gpt-5.4-mini",
+        );
+        let mut bus_rx = engine.state.bus.subscribe();
+        let complex_prompt =
+            "Review this architecture plan and migration spec for a multi-agent router refactor. "
+                .repeat(90);
+        let result = engine.send_message(&complex_prompt).await.expect("send message succeeds");
+
+        assert!(matches!(result, SendMessageResult::Complete(ref text) if text == "done"));
+
+        let mut saw_route = false;
+        while let Ok(event) = bus_rx.try_recv() {
+            if let BusEvent::ModelRouted { from_model, to_model, reason, .. } = event {
+                saw_route = from_model == "openai/gpt-5.4-mini"
+                    && to_model == "openai/gpt-5.4"
+                    && reason.contains("complexity score");
+            }
+        }
+        assert!(saw_route, "expected model routing event");
     }
 
     #[tokio::test]

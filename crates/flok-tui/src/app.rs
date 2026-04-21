@@ -516,6 +516,14 @@ impl App {
                     self.maintain_chat_drag_lock();
                     self.dirty = true;
                 }
+                flok_core::bus::BusEvent::ModelRouted { from_model, to_model, reason, .. } => {
+                    self.history.push(HistoryItem::system_info(format!(
+                        "Model routed: {from_model} -> {to_model} ({reason})"
+                    )));
+                    self.chat_view.on_new_content();
+                    self.maintain_chat_drag_lock();
+                    self.dirty = true;
+                }
                 other => {
                     tracing::debug!(event = ?other, "ignoring unsupported bus event in MVP");
                 }
@@ -1439,6 +1447,26 @@ mod tests {
 
         let command = cmd_rx.try_recv().expect("execute plan command should be queued");
         assert!(matches!(command, UiCommand::ExecutePlan(Some(plan_id)) if plan_id == "plan-123"));
+    }
+
+    #[tokio::test]
+    async fn model_routed_bus_event_adds_system_history_item() {
+        let (channels, _cmd_rx) = make_channels();
+        let (tx, rx) = mpsc::unbounded_channel::<AppEvent>();
+        let mut app = App::new(channels, tx, rx);
+
+        app.handle_event(AppEvent::BusEvent(flok_core::bus::BusEvent::ModelRouted {
+            session_id: "session-1".to_string(),
+            from_model: "openai/gpt-5.4-mini".to_string(),
+            to_model: "openai/gpt-5.4".to_string(),
+            reason: "complexity score 4 (architecture or planning request)".to_string(),
+        }));
+
+        assert!(app.history.iter().any(|item| matches!(
+            item,
+            HistoryItem::System { text, .. }
+                if text.contains("Model routed: openai/gpt-5.4-mini -> openai/gpt-5.4")
+        )));
     }
 
     #[tokio::test]

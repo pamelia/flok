@@ -234,7 +234,7 @@ impl PlanStore {
             }
         }
 
-        plans.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+        plans.sort_by_key(|plan| std::cmp::Reverse(plan.updated_at));
         Ok(plans)
     }
 

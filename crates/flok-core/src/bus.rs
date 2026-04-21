@@ -109,6 +109,9 @@ pub enum BusEvent {
         reason: String,
     },
 
+    /// Request-time model router upgraded the turn to a stronger model.
+    ModelRouted { session_id: String, from_model: String, to_model: String, reason: String },
+
     /// A session was branched (new session created from a branch point).
     SessionBranched { parent_session_id: String, new_session_id: String, from_message_id: String },
 

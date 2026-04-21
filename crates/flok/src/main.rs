@@ -23,9 +23,10 @@ use flok_core::snapshot::SnapshotManager;
 use flok_core::team::TeamRegistry;
 use flok_core::tool::{
     AgentMemoryTool, BashTool, CodeReviewTool, EditTool, FastApplyTool, GlobTool, GrepTool,
-    LspDiagnosticsTool, LspFindReferencesTool, LspGotoDefinitionTool, LspSymbolsTool, PlanTool,
-    QuestionTool, ReadTool, SendMessageTool, SkillTool, TaskTool, TeamCreateTool, TeamDeleteTool,
-    TeamTaskTool, TodoList, TodoWriteTool, ToolRegistry, WebfetchTool, WriteTool,
+    LspDiagnosticsTool, LspFindReferencesTool, LspGotoDefinitionTool, LspSymbolsTool,
+    PlanCreateTool, PlanTool, PlanUpdateTool, QuestionTool, ReadTool, SendMessageTool, SkillTool,
+    TaskTool, TeamCreateTool, TeamDeleteTool, TeamTaskTool, TodoList, TodoWriteTool, ToolRegistry,
+    WebfetchTool, WriteTool,
 };
 use flok_core::worktree::WorktreeManager;
 use tokio::sync::mpsc;
@@ -152,6 +153,8 @@ async fn run(args: cli::Args) -> Result<()> {
     tools.register(Arc::new(SkillTool));
     tools.register(Arc::new(AgentMemoryTool));
     tools.register(Arc::new(PlanTool));
+    tools.register(Arc::new(PlanCreateTool));
+    tools.register(Arc::new(PlanUpdateTool));
     tools.register(Arc::new(CodeReviewTool::new(Arc::clone(&provider))));
 
     // Create bus (needs to be before team/task tools which use it)
@@ -423,6 +426,73 @@ async fn run_interactive(
                         }
                         Err(e) => {
                             let _ = ui_tx.send(flok_tui::UiEvent::Error(e.to_string()));
+                        }
+                    }
+                }
+                flok_tui::UiCommand::ListPlans => match engine.list_plans_text() {
+                    Ok(text) => {
+                        let _ = ui_tx.send(flok_tui::UiEvent::Error(text));
+                    }
+                    Err(e) => {
+                        let _ = ui_tx
+                            .send(flok_tui::UiEvent::Error(format!("Failed to list plans: {e}")));
+                    }
+                },
+                flok_tui::UiCommand::ShowPlan(plan_id) => match engine
+                    .show_plan_text(plan_id.as_deref())
+                {
+                    Ok(text) => {
+                        let _ = ui_tx.send(flok_tui::UiEvent::Error(text));
+                    }
+                    Err(e) => {
+                        let _ = ui_tx
+                            .send(flok_tui::UiEvent::Error(format!("Failed to show plan: {e}")));
+                    }
+                },
+                flok_tui::UiCommand::ApprovePlan(plan_id) => {
+                    match engine.approve_plan(plan_id.as_deref()) {
+                        Ok(text) => {
+                            let _ = ui_tx.send(flok_tui::UiEvent::Error(text));
+                        }
+                        Err(e) => {
+                            let _ = ui_tx.send(flok_tui::UiEvent::Error(format!(
+                                "Failed to approve plan: {e}"
+                            )));
+                        }
+                    }
+                }
+                flok_tui::UiCommand::ExecutePlan(plan_id) => {
+                    engine.reset_cancel();
+                    let cancel = engine.cancel_token();
+
+                    let mut execute_fut = std::pin::pin!(engine.execute_plan(plan_id.as_deref()));
+                    let result = loop {
+                        tokio::select! {
+                            biased;
+                            result = &mut execute_fut => break result,
+                            Some(inner_cmd) = cmd_rx.recv() => {
+                                match inner_cmd {
+                                    flok_tui::UiCommand::Cancel => {
+                                        cancel.cancel();
+                                    }
+                                    flok_tui::UiCommand::Quit => {
+                                        cancel.cancel();
+                                        return;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    };
+
+                    match result {
+                        Ok(text) => {
+                            let _ = ui_tx.send(flok_tui::UiEvent::Error(text));
+                        }
+                        Err(e) => {
+                            let _ = ui_tx.send(flok_tui::UiEvent::Error(format!(
+                                "Plan execution failed: {e}"
+                            )));
                         }
                     }
                 }

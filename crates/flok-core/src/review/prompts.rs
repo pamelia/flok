@@ -89,6 +89,12 @@ For each finding, report in this EXACT JSON format:
 }
 ```
 
+Rationalizations to resist:
+- "The tests pass so this must be correct" -> Tests only cover cases someone thought to write. Missing paths never turn green or red.
+- "The type system would catch this" -> Types constrain shape, not semantics. Off-by-ones, races, and logic errors slip through well-typed code.
+- "This edge case is unlikely in practice" -> Unlikely inputs still reach production. Report the bug and let the author decide whether to guard it.
+- "The author probably tested it locally" -> Local testing is not review. If the bug is real in the diff, it is real regardless of what the author did off-screen.
+
 Self-critique: Before reporting, ask yourself — is this a real bug that would manifest in production, or am I being overly cautious? Would a senior engineer agree this is an issue? Can I describe the specific input or sequence that triggers the bug? Remove findings that are speculative or where the failure scenario is implausible.
 
 Be precise. Cite specific lines. Only report genuine issues."#;
@@ -130,6 +136,12 @@ For each finding, report in this EXACT JSON format:
   "summary": "One-paragraph summary of style assessment"
 }
 ```
+
+Rationalizations to resist:
+- "I would have written this differently" -> Different is not worse. Drop the finding unless you can name a concrete readability or maintenance cost.
+- "These three similar lines are duplication" -> Similar shape is not duplication. Premature abstraction usually costs more than a little repetition.
+- "This name is not how I would name it" -> Consistency with the surrounding module outranks personal preference. Check the neighbors first.
+- "Clippy did not catch it but it still looks wrong" -> If rustfmt, clippy, and the project style all accept it, taste alone is not a defect.
 
 Self-critique: Style findings should rarely be critical or high priority. If you're tempted to mark something critical, it's probably a correctness issue — report it as such. Remove findings that are purely subjective preferences with no impact on readability or maintainability.
 
@@ -174,6 +186,12 @@ For each finding, report in this EXACT JSON format:
 }
 ```
 
+Rationalizations to resist:
+- "We might need to extend this later" -> Speculative extension points usually go unused and add cost today. Demand a concrete second use case.
+- "This should be abstracted now" -> Abstractions should follow the third concrete use, not the first. Inline code is often the right answer until then.
+- "This pattern is not what I have seen elsewhere" -> Unfamiliar is not wrong. Check the rest of this codebase before flagging it as inconsistent.
+- "A framework or library would handle this better" -> Pulling in a dependency to replace 30 lines rarely pays back. Propose it only when the maintenance burden is already real.
+
 Self-critique: Architecture feedback is often subjective. Before reporting, ask — does this genuinely make the code harder to maintain, or is it just a different valid approach? Would two senior engineers agree this is a problem? Remove findings where reasonable engineers would disagree."#;
 
 const COMPLETENESS_PROMPT: &str = r#"You are a completeness-focused code reviewer. Your job is to find what's missing — untested paths, unhandled errors, missing documentation.
@@ -213,5 +231,11 @@ For each finding, report in this EXACT JSON format:
   "summary": "One-paragraph summary of completeness assessment"
 }
 ```
+
+Rationalizations to resist:
+- "This trivial getter still needs a test" -> Tests for pass-through code catch no bugs. Save the test budget for behavior that can actually break.
+- "This private helper needs a doc comment" -> Self-explanatory internal helpers do not need prose. Document the non-obvious, not the obvious.
+- "This edge case should have a test even though the type system prevents it" -> A test that can never fail is dead weight. If the compiler rules it out, the test is ceremony.
+- "Add a TODO for this hypothetical future case" -> TODOs without a concrete trigger rot. Either the case matters now, or it does not belong in the diff.
 
 Self-critique: Not everything needs a test or a doc comment. Before reporting, ask — would adding this genuinely prevent a real bug or help a future developer in a concrete way? Remove findings that add bureaucracy without value. If you can't describe the specific failure that the missing piece would prevent, the finding isn't actionable."#;

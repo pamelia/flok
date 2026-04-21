@@ -10,8 +10,23 @@ use ratatui::{
 use crate::theme::Theme;
 
 pub(crate) const SLASH_COMMANDS: &[&str] = &[
-    "new", "clear", "undo", "redo", "tree", "branch", "label", "plan", "build", "sidebar",
-    "sessions", "help", "quit",
+    "new",
+    "clear",
+    "undo",
+    "redo",
+    "tree",
+    "branch",
+    "label",
+    "plans",
+    "show-plan",
+    "approve",
+    "execute-plan",
+    "plan",
+    "build",
+    "sidebar",
+    "sessions",
+    "help",
+    "quit",
 ];
 
 const MAX_VISIBLE: usize = 8;
@@ -207,6 +222,16 @@ mod tests {
         assert!(popup.filtered.contains(&"plan"));
         assert!(popup.filtered.contains(&"branch"));
         assert!(!popup.filtered.contains(&"new"));
+    }
+
+    #[test]
+    fn filter_show_matches_plan_commands() {
+        let mut popup = SlashPopup::new();
+        popup.update_filter("/plan");
+        assert!(popup.filtered.contains(&"plan"));
+        assert!(popup.filtered.contains(&"plans"));
+        assert!(popup.filtered.contains(&"show-plan"));
+        assert!(popup.filtered.contains(&"execute-plan"));
     }
 
     #[test]

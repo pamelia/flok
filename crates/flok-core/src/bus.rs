@@ -72,6 +72,12 @@ pub enum BusEvent {
         files_changed: usize,
     },
 
+    /// Automatic verification started after file changes.
+    VerificationStarted { session_id: String, command: String },
+
+    /// Automatic verification finished.
+    VerificationCompleted { session_id: String, command: String, success: bool, summary: String },
+
     /// The current operation was cancelled by the user.
     Cancelled { session_id: String },
 

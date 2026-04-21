@@ -7,24 +7,40 @@
 //! 4. If tool calls: execute them, append results, go to step 1
 //! 5. If text only: done — return the assistant's response
 
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write;
 use std::sync::Arc;
 
+use chrono::Utc;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
-use std::collections::HashMap;
-
 use crate::bus::BusEvent;
+use crate::plan::{
+    summarize_plan, Checkpoint, CheckpointData, ExecutionPlan, PlanPatch, PlanStatus, PlanStore,
+    StepStatus,
+};
 use crate::provider::{CompletionRequest, Message, MessageContent, ModelRegistry, StreamEvent};
 use crate::session::state::AppState;
 use crate::token::TokenCounter;
+use crate::verification::{
+    detect_command_with_preference as detect_verification_command,
+    run_command as run_verification_command, RetryChangeRelevance, VerificationFailureSummary,
+    VerificationPreference,
+};
 
 /// Maximum number of tool-call rounds before we stop (doom loop protection).
 const MAX_TOOL_ROUNDS: usize = 25;
 
 /// Maximum identical tool calls before pausing (doom loop by repetition).
 const MAX_IDENTICAL_CALLS: usize = 3;
+
+/// Maximum automatic self-fix rounds after verification failure.
+const MAX_VERIFICATION_RETRIES: usize = 1;
+
+/// Additional automatic self-fix rounds granted when a relevant retry exposes
+/// a different verification failure instead of churning on the same one.
+const MAX_VERIFICATION_BONUS_RETRIES: usize = 1;
 
 /// Build the system prompt with project context.
 ///
@@ -476,6 +492,200 @@ impl SessionEngine {
         Ok(text)
     }
 
+    /// List saved execution plans for this session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if plan files cannot be read.
+    pub fn list_plans_text(&self) -> anyhow::Result<String> {
+        let plans = self.session_plans()?;
+        if plans.is_empty() {
+            return Ok("No saved plans found for this session.".to_string());
+        }
+
+        let mut text = String::from("Saved plans:\n\n");
+        for (index, plan) in plans.iter().enumerate() {
+            let completed_steps = plan
+                .steps
+                .iter()
+                .filter(|step| matches!(step.status, StepStatus::Completed))
+                .count();
+            let _ = writeln!(
+                text,
+                "{}. {} [{}] steps {}/{}  [{:.8}]",
+                index + 1,
+                plan.title,
+                plan_status_label(&plan.status),
+                completed_steps,
+                plan.steps.len(),
+                plan.id,
+            );
+        }
+        let _ = write!(text, "\nUse /show-plan [ID], /approve [ID], or /execute-plan [ID].");
+        Ok(text)
+    }
+
+    /// Show a persisted execution plan for this session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the requested plan cannot be loaded.
+    pub fn show_plan_text(&self, plan_id: Option<&str>) -> anyhow::Result<String> {
+        let plan = self.resolve_plan(plan_id)?;
+        let store = self.plan_store();
+        Ok(format_plan_details(&plan, &store))
+    }
+
+    /// Approve a persisted execution plan so it can be executed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the requested plan cannot be loaded or updated.
+    pub fn approve_plan(&self, plan_id: Option<&str>) -> anyhow::Result<String> {
+        let plan = self.resolve_plan(plan_id)?;
+        if matches!(plan.status, PlanStatus::Executing) {
+            anyhow::bail!("cannot approve a plan while it is executing");
+        }
+
+        let updated = self.plan_store().apply_patch(
+            &plan.id,
+            PlanPatch { plan_status: Some(PlanStatus::Approved), ..PlanPatch::default() },
+        )?;
+
+        Ok(format!("Plan approved.\n\n{}", format_plan_details(&updated, &self.plan_store())))
+    }
+
+    /// Execute an approved plan step-by-step by sending each step as a prompt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if execution fails, is cancelled, or the plan is invalid.
+    pub async fn execute_plan(&mut self, plan_id: Option<&str>) -> anyhow::Result<String> {
+        if self.state.plan_mode.is_plan() {
+            anyhow::bail!("cannot execute a plan in PLAN mode; switch to BUILD mode first");
+        }
+
+        let store = self.plan_store();
+        let mut plan = self.resolve_plan(plan_id)?;
+        if matches!(plan.status, PlanStatus::Draft) {
+            anyhow::bail!("plan '{}' is still a draft; approve it before execution", plan.id);
+        }
+        if matches!(plan.status, PlanStatus::Completed) {
+            return Ok(format!(
+                "Plan already completed.\n\n{}",
+                format_plan_details(&plan, &store)
+            ));
+        }
+
+        plan.status = PlanStatus::Executing;
+        plan.updated_at = Utc::now();
+        store.save_plan(&plan)?;
+
+        loop {
+            if self.cancel_token.is_cancelled() {
+                plan.status = PlanStatus::Cancelled;
+                plan.updated_at = Utc::now();
+                store.save_plan(&plan)?;
+                anyhow::bail!("plan execution cancelled");
+            }
+
+            if let Some(step_index) = next_ready_step_index(&plan) {
+                let step_id = plan.steps[step_index].id.clone();
+                let checkpoint = match self.state.snapshot.track().await {
+                    Ok(Some(hash)) => Some(Checkpoint {
+                        step_id: step_id.clone(),
+                        snapshot: CheckpointData::WorkspaceSnapshot { hash },
+                        created_at: Utc::now(),
+                    }),
+                    Ok(None) => None,
+                    Err(error) => {
+                        tracing::warn!(%error, step_id, "failed to capture plan checkpoint");
+                        None
+                    }
+                };
+
+                plan = store.apply_patch(
+                    &plan.id,
+                    PlanPatch {
+                        plan_status: Some(PlanStatus::Executing),
+                        step_id: Some(step_id.clone()),
+                        step_status: Some(StepStatus::Running),
+                        checkpoint,
+                    },
+                )?;
+
+                let step = plan
+                    .steps
+                    .iter()
+                    .find(|candidate| candidate.id == step_id)
+                    .cloned()
+                    .expect("running step must exist in plan");
+                let prompt = build_plan_step_prompt(&plan, &step);
+
+                match self.send_message(&prompt).await {
+                    Ok(SendMessageResult::Complete(_)) => {
+                        plan = store.apply_patch(
+                            &plan.id,
+                            PlanPatch {
+                                step_id: Some(step_id),
+                                step_status: Some(StepStatus::Completed),
+                                ..PlanPatch::default()
+                            },
+                        )?;
+                    }
+                    Ok(SendMessageResult::Cancelled { .. }) => {
+                        let detail =
+                            rollback_plan_step(&self.state.snapshot, &step).await.unwrap_or_else(
+                                |error| format!("cancellation rollback failed: {error}"),
+                            );
+                        mark_cancelled_plan(&store, &plan, &step.id, &detail)?;
+                        anyhow::bail!("plan execution cancelled during step '{}'", step.title);
+                    }
+                    Err(error) => {
+                        let rollback_detail = rollback_plan_step(&self.state.snapshot, &step)
+                            .await
+                            .unwrap_or_else(|rollback_error| {
+                                format!("rollback failed after step error: {rollback_error}")
+                            });
+                        mark_failed_plan(
+                            &store,
+                            &plan,
+                            &step.id,
+                            &error.to_string(),
+                            &rollback_detail,
+                        )?;
+                        return Err(anyhow::anyhow!(
+                            "plan execution failed at step '{}': {error}",
+                            step.title
+                        ));
+                    }
+                }
+                continue;
+            }
+
+            if plan.steps.iter().all(|step| matches!(step.status, StepStatus::Completed)) {
+                plan.status = PlanStatus::Completed;
+                plan.updated_at = Utc::now();
+                store.save_plan(&plan)?;
+                return Ok(format!(
+                    "Plan executed successfully.\n\n{}",
+                    format_plan_details(&plan, &store)
+                ));
+            }
+
+            if plan.steps.iter().any(|step| matches!(step.status, StepStatus::Failed(_))) {
+                anyhow::bail!("plan '{}' has failed steps and cannot continue", plan.id);
+            }
+
+            let blocked_steps =
+                plan.steps.iter().filter(|step| matches!(step.status, StepStatus::Pending)).count();
+            anyhow::bail!(
+                "plan '{}' is blocked; {blocked_steps} pending step(s) have unsatisfied dependencies",
+                plan.id
+            );
+        }
+    }
+
     /// Create a branch from the current session at the given message ID.
     ///
     /// Captures the current workspace snapshot, creates a new session with
@@ -642,6 +852,33 @@ impl SessionEngine {
 
         // Load display messages for the new session
         self.load_display_messages()
+    }
+
+    fn plan_store(&self) -> PlanStore {
+        PlanStore::new(self.state.project_root.clone())
+    }
+
+    fn session_plans(&self) -> anyhow::Result<Vec<ExecutionPlan>> {
+        let mut plans = self.plan_store().list_plans()?;
+        plans.retain(|plan| plan.session_id == self.session_id);
+        Ok(plans)
+    }
+
+    fn resolve_plan(&self, plan_id: Option<&str>) -> anyhow::Result<ExecutionPlan> {
+        match plan_id {
+            Some(id) => {
+                let plan = self.plan_store().load_plan(id)?;
+                if plan.session_id != self.session_id {
+                    anyhow::bail!("plan '{id}' does not belong to the current session");
+                }
+                Ok(plan)
+            }
+            None => self
+                .session_plans()?
+                .into_iter()
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("no saved plans found for this session")),
+        }
     }
 
     /// Undo the last user message: restore workspace files and remove
@@ -847,6 +1084,11 @@ impl SessionEngine {
 
         // Run the prompt loop
         let mut rounds = 0;
+        let mut verification_retries = 0usize;
+        let mut verification_bonus_retry_granted = false;
+        let mut verification_skipped_rounds_since_failure = 0usize;
+        let mut verification_failure_summary: Option<VerificationFailureSummary> = None;
+        let mut verification_preference: Option<VerificationPreference> = None;
         let mut call_history: HashMap<String, usize> = HashMap::new();
         let token_counter = TokenCounter::for_model(&self.model_id);
         let context_window =
@@ -944,6 +1186,7 @@ impl SessionEngine {
                                 | "question"
                                 | "todowrite"
                                 | "plan"
+                                | "plan_create"
                                 | "skill"
                                 | "agent_memory"
                         )
@@ -1125,6 +1368,7 @@ impl SessionEngine {
 
             // Execute tool calls and store results
             let tool_results = self.execute_tool_calls(&tool_calls).await;
+            let mut changed_files = Vec::new();
 
             // Persist any new "Always Allow" permission rules to the database
             for rule in self.state.permissions.drain_new_rules() {
@@ -1169,6 +1413,7 @@ impl SessionEngine {
                                     snapshot_hash: pre_hash.clone(),
                                     files_changed: patch.files.len(),
                                 });
+                                changed_files = patch.files;
                             }
                             Ok(_) => {} // No files changed
                             Err(e) => tracing::warn!("snapshot patch failed: {e}"),
@@ -1178,19 +1423,133 @@ impl SessionEngine {
                     Err(e) => tracing::warn!("post-tool snapshot failed: {e}"),
                 }
             }
+            let verification_scope_files = effective_verification_scope_files(
+                &self.state.project_root,
+                &changed_files,
+                &tool_calls,
+                &tool_results,
+            );
 
-            let result_parts: Vec<MessageContent> = tool_results
-                .into_iter()
+            let mut result_parts: Vec<MessageContent> = tool_results
+                .iter()
                 .map(|r| MessageContent::ToolResult {
-                    tool_use_id: r.tool_call_id,
-                    content: r.content,
+                    tool_use_id: r.tool_call_id.clone(),
+                    content: r.content.clone(),
                     is_error: r.is_error,
                 })
                 .collect();
 
+            if let Some(error) = verification_retry_scope_stop_error(
+                &self.state.project_root,
+                verification_preference.as_ref(),
+                &verification_scope_files,
+            ) {
+                result_parts.push(MessageContent::Text { text: error.clone() });
+                let result_msg_id = Ulid::new().to_string();
+                let result_json = serde_json::to_string(&result_parts)?;
+                self.state.db.insert_message(
+                    &result_msg_id,
+                    &self.session_id,
+                    "user",
+                    &result_json,
+                )?;
+                return Err(anyhow::anyhow!(error));
+            }
+
+            let verification_outcome = maybe_run_automatic_verification(
+                &self.state.project_root,
+                &self.state.bus,
+                &self.session_id,
+                &tool_calls,
+                &tool_results,
+                &verification_scope_files,
+                verification_preference.as_ref(),
+            )
+            .await?;
+            let mut verification_retry_limit =
+                MAX_VERIFICATION_RETRIES + usize::from(verification_bonus_retry_granted);
+
+            match &verification_outcome {
+                AutomaticVerificationOutcome::Failed(report) => {
+                    let previous_failure_summary = verification_failure_summary.clone();
+                    let previous_verification_preference = verification_preference.clone();
+                    verification_retries += 1;
+                    verification_preference =
+                        Some(report.retry_preference(&verification_scope_files));
+                    let current_failure_summary = report.failure_summary();
+                    let retry_scope_relevance = verification_retry_scope_relevance(
+                        &self.state.project_root,
+                        previous_verification_preference.as_ref(),
+                        &verification_scope_files,
+                    );
+                    result_parts.push(MessageContent::Text {
+                        text: build_verification_feedback(
+                            report,
+                            &verification_scope_files,
+                            previous_failure_summary.as_ref(),
+                            verification_skipped_rounds_since_failure,
+                            retry_scope_relevance,
+                            previous_verification_preference.as_ref(),
+                        ),
+                    });
+                    verification_failure_summary = current_failure_summary;
+                    verification_skipped_rounds_since_failure = 0;
+
+                    if let Some(error) = verification_retry_stop_error(
+                        previous_failure_summary.as_ref(),
+                        verification_failure_summary.as_ref(),
+                    ) {
+                        let result_msg_id = Ulid::new().to_string();
+                        let result_json = serde_json::to_string(&result_parts)?;
+                        self.state.db.insert_message(
+                            &result_msg_id,
+                            &self.session_id,
+                            "user",
+                            &result_json,
+                        )?;
+                        return Err(anyhow::anyhow!(error));
+                    }
+
+                    let retry_budget = verification_retry_budget(
+                        previous_failure_summary.as_ref(),
+                        verification_failure_summary.as_ref(),
+                        retry_scope_relevance,
+                        verification_bonus_retry_granted,
+                    );
+                    verification_bonus_retry_granted = retry_budget.bonus_retry_granted;
+                    verification_retry_limit = retry_budget.retry_limit;
+                }
+                AutomaticVerificationOutcome::Passed => {
+                    verification_retries = 0;
+                    verification_bonus_retry_granted = false;
+                    verification_skipped_rounds_since_failure = 0;
+                    verification_failure_summary = None;
+                    verification_preference = None;
+                }
+                AutomaticVerificationOutcome::Skipped => {
+                    if let Some(note) = verification_context_preserved_note(
+                        verification_failure_summary.as_ref(),
+                        verification_preference.as_ref(),
+                        verification_skipped_rounds_since_failure,
+                    ) {
+                        result_parts.push(MessageContent::Text { text: note });
+                        verification_skipped_rounds_since_failure += 1;
+                    }
+                }
+            }
+
             let result_msg_id = Ulid::new().to_string();
             let result_json = serde_json::to_string(&result_parts)?;
             self.state.db.insert_message(&result_msg_id, &self.session_id, "user", &result_json)?;
+
+            if matches!(verification_outcome, AutomaticVerificationOutcome::Failed(_)) {
+                if verification_retries > verification_retry_limit {
+                    return Err(anyhow::anyhow!(
+                        "Automatic verification failed after {verification_retry_limit} retry attempt(s)."
+                    ));
+                }
+                continue;
+            }
 
             // Wait for background agents: if tool calls spawned background team
             // agents, pause and collect their results before the next LLM call.
@@ -1738,6 +2097,173 @@ impl SessionEngine {
     }
 }
 
+fn plan_status_label(status: &PlanStatus) -> &'static str {
+    match status {
+        PlanStatus::Draft => "draft",
+        PlanStatus::Approved => "approved",
+        PlanStatus::Executing => "executing",
+        PlanStatus::Completed => "completed",
+        PlanStatus::Failed => "failed",
+        PlanStatus::Cancelled => "cancelled",
+    }
+}
+
+fn format_plan_details(plan: &ExecutionPlan, store: &PlanStore) -> String {
+    let mut text = summarize_plan(plan);
+    let _ = writeln!(text, "\nPlan file: {}", store.plan_path(&plan.id).display());
+    if !plan.dependencies.is_empty() {
+        let _ = writeln!(text, "\nDependencies:");
+        for dependency in &plan.dependencies {
+            let _ = writeln!(text, "- {} -> {}", dependency.prerequisite, dependency.dependent);
+        }
+    }
+    text.trim_end().to_string()
+}
+
+fn next_ready_step_index(plan: &ExecutionPlan) -> Option<usize> {
+    plan.steps.iter().enumerate().find_map(|(index, step)| {
+        if !matches!(step.status, StepStatus::Pending) {
+            return None;
+        }
+
+        let ready =
+            plan.dependencies.iter().filter(|dependency| dependency.dependent == step.id).all(
+                |dependency| {
+                    plan.steps
+                        .iter()
+                        .find(|candidate| candidate.id == dependency.prerequisite)
+                        .is_some_and(|candidate| matches!(candidate.status, StepStatus::Completed))
+                },
+            );
+
+        ready.then_some(index)
+    })
+}
+
+fn build_plan_step_prompt(plan: &ExecutionPlan, step: &crate::plan::PlanStep) -> String {
+    let affected_files = if step.affected_files.is_empty() {
+        "none specified".to_string()
+    } else {
+        step.affected_files
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let prerequisites = plan
+        .dependencies
+        .iter()
+        .filter(|dependency| dependency.dependent == step.id)
+        .map(|dependency| dependency.prerequisite.clone())
+        .collect::<Vec<_>>();
+    let prerequisite_text =
+        if prerequisites.is_empty() { "none".to_string() } else { prerequisites.join(", ") };
+
+    format!(
+        "Execute approved plan '{title}' ({plan_id}), step '{step_title}' ({step_id}).\n\
+         Focus only on this step.\n\
+         Do not start later plan steps.\n\
+         Description: {description}\n\
+         Prerequisites already completed: {prerequisites}\n\
+         Affected files: {files}\n\
+         When finished, stop after reporting what you changed for this step.",
+        title = plan.title,
+        plan_id = plan.id,
+        step_title = step.title,
+        step_id = step.id,
+        description = if step.description.trim().is_empty() {
+            "(no additional description)"
+        } else {
+            &step.description
+        },
+        prerequisites = prerequisite_text,
+        files = affected_files,
+    )
+}
+
+async fn rollback_plan_step(
+    snapshot: &crate::snapshot::SnapshotManager,
+    step: &crate::plan::PlanStep,
+) -> anyhow::Result<String> {
+    let Some(checkpoint) = &step.checkpoint else {
+        return Ok("no checkpoint captured; workspace left as-is".to_string());
+    };
+
+    match &checkpoint.snapshot {
+        CheckpointData::WorkspaceSnapshot { hash } => {
+            snapshot.restore(hash).await?;
+            Ok(format!("workspace restored to checkpoint {hash}"))
+        }
+        CheckpointData::FileSnapshots(_) => {
+            Ok("file-snapshot rollback not implemented yet; workspace left as-is".to_string())
+        }
+    }
+}
+
+fn mark_failed_plan(
+    store: &PlanStore,
+    current: &ExecutionPlan,
+    failed_step_id: &str,
+    error: &str,
+    rollback_detail: &str,
+) -> Result<ExecutionPlan, crate::plan::PlanError> {
+    let failure_reason = format!("{error}; {rollback_detail}");
+    let mut updated = store.apply_patch(
+        &current.id,
+        PlanPatch {
+            plan_status: Some(PlanStatus::Failed),
+            step_id: Some(failed_step_id.to_string()),
+            step_status: Some(StepStatus::Failed(failure_reason)),
+            ..PlanPatch::default()
+        },
+    )?;
+
+    let blocked = blocked_dependents(&updated, failed_step_id);
+    if !blocked.is_empty() {
+        for step in &mut updated.steps {
+            if blocked.contains(&step.id) && matches!(step.status, StepStatus::Pending) {
+                step.status = StepStatus::Skipped;
+            }
+        }
+        updated.updated_at = Utc::now();
+        store.save_plan(&updated)?;
+    }
+
+    Ok(updated)
+}
+
+fn mark_cancelled_plan(
+    store: &PlanStore,
+    current: &ExecutionPlan,
+    cancelled_step_id: &str,
+    rollback_detail: &str,
+) -> Result<ExecutionPlan, crate::plan::PlanError> {
+    store.apply_patch(
+        &current.id,
+        PlanPatch {
+            plan_status: Some(PlanStatus::Cancelled),
+            step_id: Some(cancelled_step_id.to_string()),
+            step_status: Some(StepStatus::Failed(format!("step cancelled; {rollback_detail}"))),
+            ..PlanPatch::default()
+        },
+    )
+}
+
+fn blocked_dependents(plan: &ExecutionPlan, failed_step_id: &str) -> HashSet<String> {
+    let mut blocked = HashSet::new();
+    let mut queue = VecDeque::from([failed_step_id.to_string()]);
+
+    while let Some(step_id) = queue.pop_front() {
+        for dependency in plan.dependencies.iter().filter(|dep| dep.prerequisite == step_id) {
+            if blocked.insert(dependency.dependent.clone()) {
+                queue.push_back(dependency.dependent.clone());
+            }
+        }
+    }
+
+    blocked
+}
+
 async fn execute_safe_batch(
     safe_batch: &mut Vec<(usize, Arc<dyn crate::tool::Tool>, serde_json::Value)>,
     tool_calls: &[ToolCall],
@@ -1826,6 +2352,266 @@ async fn execute_single_tool(
             is_error: true,
         },
     }
+}
+
+async fn maybe_run_automatic_verification(
+    project_root: &std::path::Path,
+    bus: &crate::bus::Bus,
+    session_id: &str,
+    tool_calls: &[ToolCall],
+    tool_results: &[ToolResult],
+    changed_files: &[String],
+    preference: Option<&VerificationPreference>,
+) -> anyhow::Result<AutomaticVerificationOutcome> {
+    if !should_run_automatic_verification(tool_calls, tool_results, changed_files) {
+        return Ok(AutomaticVerificationOutcome::Skipped);
+    }
+
+    let Some(command) = detect_verification_command(project_root, changed_files, preference) else {
+        return Ok(AutomaticVerificationOutcome::Skipped);
+    };
+
+    let command_text = command.display();
+    bus.send(BusEvent::VerificationStarted {
+        session_id: session_id.to_string(),
+        command: command_text.clone(),
+    });
+
+    let report = run_verification_command(project_root, &command).await?;
+    let summary = report.summary();
+    bus.send(BusEvent::VerificationCompleted {
+        session_id: session_id.to_string(),
+        command: report.command.clone(),
+        success: report.success,
+        summary: summary.clone(),
+    });
+
+    if report.success {
+        Ok(AutomaticVerificationOutcome::Passed)
+    } else {
+        Ok(AutomaticVerificationOutcome::Failed(report))
+    }
+}
+
+fn should_run_automatic_verification(
+    tool_calls: &[ToolCall],
+    tool_results: &[ToolResult],
+    changed_files: &[String],
+) -> bool {
+    if !changed_files.is_empty() {
+        return true;
+    }
+
+    tool_calls.iter().zip(tool_results.iter()).any(|(tool_call, result)| {
+        !result.is_error && matches!(tool_call.name.as_str(), "write" | "edit" | "fast_apply")
+    })
+}
+
+enum AutomaticVerificationOutcome {
+    Skipped,
+    Passed,
+    Failed(crate::verification::VerificationReport),
+}
+
+fn verification_retry_stop_error(
+    previous_failure: Option<&VerificationFailureSummary>,
+    current_failure: Option<&VerificationFailureSummary>,
+) -> Option<String> {
+    let (Some(previous), Some(current)) = (previous_failure, current_failure) else {
+        return None;
+    };
+
+    if current.same_family_as(previous) {
+        return Some(format!(
+            "Automatic verification retry did not change the failure signature: {}.",
+            current.kind.description()
+        ));
+    }
+
+    None
+}
+
+fn verification_retry_scope_stop_error(
+    project_root: &std::path::Path,
+    preference: Option<&VerificationPreference>,
+    changed_files: &[String],
+) -> Option<String> {
+    let preference = preference?;
+    match verification_retry_scope_relevance(project_root, Some(preference), changed_files)? {
+        RetryChangeRelevance::Relevant | RetryChangeRelevance::Unknown => None,
+        RetryChangeRelevance::Irrelevant => Some(format!(
+            "Automatic verification retry did not touch files relevant to the failing verification scope: {}.",
+            preference.scope_summary()
+        )),
+    }
+}
+
+fn verification_retry_scope_relevance(
+    project_root: &std::path::Path,
+    preference: Option<&VerificationPreference>,
+    changed_files: &[String],
+) -> Option<RetryChangeRelevance> {
+    Some(preference?.retry_change_relevance(project_root, changed_files))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VerificationRetryBudget {
+    retry_limit: usize,
+    bonus_retry_granted: bool,
+}
+
+fn verification_retry_budget(
+    previous_failure: Option<&VerificationFailureSummary>,
+    current_failure: Option<&VerificationFailureSummary>,
+    retry_scope_relevance: Option<RetryChangeRelevance>,
+    bonus_retry_granted: bool,
+) -> VerificationRetryBudget {
+    let earned_bonus_retry = !bonus_retry_granted
+        && matches!(retry_scope_relevance, Some(RetryChangeRelevance::Relevant))
+        && matches!(
+            (previous_failure, current_failure),
+            (Some(previous), Some(current)) if !current.same_family_as(previous)
+        );
+    let bonus_retry_granted = bonus_retry_granted || earned_bonus_retry;
+
+    VerificationRetryBudget {
+        retry_limit: MAX_VERIFICATION_RETRIES
+            + usize::from(bonus_retry_granted) * MAX_VERIFICATION_BONUS_RETRIES,
+        bonus_retry_granted,
+    }
+}
+
+fn effective_verification_scope_files(
+    project_root: &std::path::Path,
+    changed_files: &[String],
+    tool_calls: &[ToolCall],
+    tool_results: &[ToolResult],
+) -> Vec<String> {
+    let mut scope_files = Vec::new();
+    let mut seen = HashSet::new();
+
+    for path in changed_files.iter().cloned().chain(infer_scope_files_from_tool_calls(
+        project_root,
+        tool_calls,
+        tool_results,
+    )) {
+        if seen.insert(path.clone()) {
+            scope_files.push(path);
+        }
+    }
+
+    scope_files
+}
+
+fn infer_scope_files_from_tool_calls<'a>(
+    project_root: &'a std::path::Path,
+    tool_calls: &'a [ToolCall],
+    tool_results: &'a [ToolResult],
+) -> impl Iterator<Item = String> + 'a {
+    tool_calls.iter().zip(tool_results.iter()).filter_map(move |(tool_call, result)| {
+        if result.is_error || !matches!(tool_call.name.as_str(), "write" | "edit" | "fast_apply") {
+            return None;
+        }
+
+        let args: serde_json::Value = serde_json::from_str(&tool_call.arguments).ok()?;
+        let file_path = args.get("file_path")?.as_str()?;
+        let path = std::path::Path::new(file_path);
+
+        path.strip_prefix(project_root).map_or_else(
+            |_| {
+                Some(if path.is_absolute() {
+                    file_path.to_string()
+                } else {
+                    project_root.join(path).display().to_string()
+                })
+            },
+            |relative| Some(relative.to_string_lossy().replace('\\', "/")),
+        )
+    })
+}
+
+fn build_verification_feedback(
+    report: &crate::verification::VerificationReport,
+    changed_files: &[String],
+    previous_failure: Option<&VerificationFailureSummary>,
+    skipped_rounds_since_previous_failure: usize,
+    retry_scope_relevance: Option<RetryChangeRelevance>,
+    retry_scope: Option<&VerificationPreference>,
+) -> String {
+    let scope = if changed_files.is_empty() {
+        "Verification scope: unknown.".to_string()
+    } else {
+        format!("Verification scope: {}.", changed_files.join(", "))
+    };
+    let retry_status = match (report.failure_summary(), previous_failure) {
+        (Some(current), Some(previous)) if current.same_family_as(previous) => {
+            format!("Retry status: the same {} is still failing.", current.kind.description())
+        }
+        (Some(current), Some(previous)) if current.kind == previous.kind => format!(
+            "Retry status: verification is still failing, but the {} signature changed.",
+            current.kind.description()
+        ),
+        (Some(current), Some(_)) => format!(
+            "Retry status: verification uncovered a different failure: {}.",
+            current.kind.description()
+        ),
+        (Some(current), None) => format!("Failure classification: {}.", current.kind.description()),
+        (None, _) => String::new(),
+    };
+    let retry_scope_status = match (retry_scope_relevance, retry_scope) {
+        (Some(RetryChangeRelevance::Relevant), Some(scope)) => format!(
+            "Retry scope assessment: the latest edits touched the failing verification scope: {}.",
+            scope.scope_summary()
+        ),
+        (Some(RetryChangeRelevance::Irrelevant), Some(scope)) => format!(
+            "Retry scope assessment: the latest edits did not touch the failing verification scope: {}.",
+            scope.scope_summary()
+        ),
+        (Some(RetryChangeRelevance::Unknown), Some(scope)) => format!(
+            "Retry scope assessment: unknown because no changed-file snapshot was available. Failing verification scope: {}.",
+            scope.scope_summary()
+        ),
+        _ => String::new(),
+    };
+    let continuity_status = if skipped_rounds_since_previous_failure == 0 {
+        String::new()
+    } else {
+        format!(
+            "Retry continuity: {skipped_rounds_since_previous_failure} intermediate tool round(s) did not run verification, so this is continuing the previous failing verification thread."
+        )
+    };
+
+    format!(
+        "Automatic verification failed after the tool changes.\n\n\
+         Failed command: {}\n\
+         {}\n\n\
+         {}\n\n\
+         {}\n\n\
+         {}\n\n\
+         {}\n\n\
+         Fix the verification failure with the minimum necessary changes, then stop so verification can rerun.",
+        report.command,
+        scope,
+        retry_status,
+        retry_scope_status,
+        continuity_status,
+        report.summary()
+    )
+}
+
+fn verification_context_preserved_note(
+    previous_failure: Option<&VerificationFailureSummary>,
+    retry_scope: Option<&VerificationPreference>,
+    skipped_rounds_since_failure: usize,
+) -> Option<String> {
+    let previous_failure = previous_failure?;
+    let retry_scope = retry_scope?;
+    Some(format!(
+        "Automatic verification did not run after this tool round. Previous failing verification context remains active: {} in scope {}. Skipped verification rounds since that failure: {}.",
+        previous_failure.kind.description(),
+        retry_scope.scope_summary(),
+        skipped_rounds_since_failure + 1,
+    ))
 }
 
 /// Truncate very large tool outputs to keep context manageable.
@@ -1925,13 +2711,15 @@ mod tests {
     use crate::bus::Bus;
     use crate::config::FlokConfig;
     use crate::lsp::LspManager;
+    use crate::plan::{Dependency, NewExecutionPlan, NewPlanStep, PlanStatus, StepStatus};
     use crate::provider::mock::{MockProvider, MockToolCall, MockTurn};
     use crate::provider::ProviderRegistry;
     use crate::session::PlanMode;
     use crate::snapshot::SnapshotManager;
     use crate::token::CostTracker;
     use crate::tool::{
-        PermissionLevel, PermissionManager, Tool, ToolContext, ToolOutput, ToolRegistry,
+        PermissionLevel, PermissionManager, ReadTool, Tool, ToolContext, ToolOutput, ToolRegistry,
+        WriteTool,
     };
 
     struct RecordingTool {
@@ -2000,7 +2788,7 @@ mod tests {
             provider_dyn,
             provider_registry,
             tools,
-            Bus::new(16),
+            Bus::new(64),
             PermissionManager::auto_approve(),
             CostTracker::new("test-model"),
             PlanMode::new(),
@@ -2011,6 +2799,46 @@ mod tests {
         );
 
         SessionEngine::new(state, "mock/test-model".to_string()).expect("create session engine")
+    }
+
+    fn write_rust_fixture(temp_dir: &TempDir) {
+        std::fs::create_dir_all(temp_dir.path().join("src")).expect("create src");
+        std::fs::write(
+            temp_dir.path().join("Cargo.toml"),
+            r#"[package]
+name = "verify_fixture"
+version = "0.1.0"
+edition = "2021"
+"#,
+        )
+        .expect("write cargo toml");
+        std::fs::write(temp_dir.path().join("src/lib.rs"), "pub fn value() -> usize {\n    1\n}\n")
+            .expect("write lib.rs");
+    }
+
+    fn write_rust_workspace_fixture(temp_dir: &TempDir) {
+        std::fs::create_dir_all(temp_dir.path().join("crates/app/src")).expect("create src");
+        std::fs::write(
+            temp_dir.path().join("Cargo.toml"),
+            r#"[workspace]
+members = ["crates/app"]
+"#,
+        )
+        .expect("write workspace cargo toml");
+        std::fs::write(
+            temp_dir.path().join("crates/app/Cargo.toml"),
+            r#"[package]
+name = "verify_fixture"
+version = "0.1.0"
+edition = "2021"
+"#,
+        )
+        .expect("write crate cargo toml");
+        std::fs::write(
+            temp_dir.path().join("crates/app/src/lib.rs"),
+            "pub fn value() -> usize {\n    1\n}\n",
+        )
+        .expect("write crate lib.rs");
     }
 
     #[tokio::test]
@@ -2042,6 +2870,725 @@ mod tests {
 
         assert!(matches!(result, SendMessageResult::Complete(ref text) if text == "done"));
         assert_eq!(log.lock().await.as_slice(), ["write_like", "safe_like"]);
+    }
+
+    #[tokio::test]
+    async fn approve_plan_marks_latest_plan_approved() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let provider = Arc::new(MockProvider::new());
+        let engine = test_engine_with_tools(&temp_dir, &provider, ToolRegistry::new());
+        let store = engine.plan_store();
+
+        let created = store
+            .create_plan(NewExecutionPlan {
+                session_id: engine.session_id().to_string(),
+                title: "Ship plan approvals".to_string(),
+                description: String::new(),
+                steps: vec![NewPlanStep {
+                    id: Some("step-1".to_string()),
+                    title: "Add runtime command".to_string(),
+                    description: String::new(),
+                    affected_files: Vec::new(),
+                    agent_type: "build".to_string(),
+                    estimated_tokens: None,
+                }],
+                dependencies: Vec::new(),
+            })
+            .expect("create plan");
+
+        let text = engine.approve_plan(None).expect("approve plan");
+        let loaded = store.load_plan(&created.id).expect("load approved plan");
+
+        assert!(text.contains("Plan approved."));
+        assert!(matches!(loaded.status, PlanStatus::Approved));
+    }
+
+    #[tokio::test]
+    async fn execute_plan_runs_steps_and_marks_completed() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let provider = Arc::new(MockProvider::new());
+        provider.push_turn(MockTurn::Text("implemented step 1".into()));
+        provider.push_turn(MockTurn::Text("implemented step 2".into()));
+
+        let mut engine = test_engine_with_tools(&temp_dir, &provider, ToolRegistry::new());
+        let store = engine.plan_store();
+        let created = store
+            .create_plan(NewExecutionPlan {
+                session_id: engine.session_id().to_string(),
+                title: "Execute plan".to_string(),
+                description: "Run two sequential steps".to_string(),
+                steps: vec![
+                    NewPlanStep {
+                        id: Some("step-1".to_string()),
+                        title: "First".to_string(),
+                        description: "Do the first thing".to_string(),
+                        affected_files: Vec::new(),
+                        agent_type: "build".to_string(),
+                        estimated_tokens: None,
+                    },
+                    NewPlanStep {
+                        id: Some("step-2".to_string()),
+                        title: "Second".to_string(),
+                        description: "Do the second thing".to_string(),
+                        affected_files: Vec::new(),
+                        agent_type: "build".to_string(),
+                        estimated_tokens: None,
+                    },
+                ],
+                dependencies: vec![Dependency {
+                    prerequisite: "step-1".to_string(),
+                    dependent: "step-2".to_string(),
+                }],
+            })
+            .expect("create plan");
+
+        engine.approve_plan(Some(&created.id)).expect("approve");
+        let result = engine.execute_plan(Some(&created.id)).await.expect("execute");
+        let loaded = store.load_plan(&created.id).expect("reload");
+
+        assert!(result.contains("Plan executed successfully."));
+        assert!(matches!(loaded.status, PlanStatus::Completed));
+        assert!(loaded.steps.iter().all(|step| matches!(step.status, StepStatus::Completed)));
+    }
+
+    #[tokio::test]
+    async fn automatic_verification_runs_after_write_tool_success() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        write_rust_fixture(&temp_dir);
+
+        let provider = Arc::new(MockProvider::new());
+        provider.push_turn(MockTurn::ToolCalls(vec![MockToolCall {
+            name: "write".into(),
+            arguments: serde_json::json!({
+                "file_path": "src/lib.rs",
+                "content": "pub fn value() -> usize {\n    2\n}\n"
+            }),
+        }]));
+        provider.push_turn(MockTurn::Text("done".into()));
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(WriteTool));
+
+        let mut engine = test_engine_with_tools(&temp_dir, &provider, tools);
+        let mut bus_rx = engine.state.bus.subscribe();
+        let result = engine.send_message("update value").await.expect("send message succeeds");
+
+        assert!(matches!(result, SendMessageResult::Complete(ref text) if text == "done"));
+
+        let mut saw_success = false;
+        while let Ok(event) = bus_rx.try_recv() {
+            if let BusEvent::VerificationCompleted { success, summary, .. } = event {
+                saw_success = success && summary.contains("Automatic verification passed.");
+            }
+        }
+        assert!(saw_success, "expected verification success event");
+    }
+
+    #[tokio::test]
+    async fn automatic_verification_feedback_allows_single_self_fix_round() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        write_rust_fixture(&temp_dir);
+
+        let provider = Arc::new(MockProvider::new());
+        provider.push_turn(MockTurn::ToolCalls(vec![MockToolCall {
+            name: "write".into(),
+            arguments: serde_json::json!({
+                "file_path": "src/lib.rs",
+                "content": "pub fn value() -> usize {\n    let broken = ;\n    2\n}\n"
+            }),
+        }]));
+        provider.push_turn(MockTurn::ToolCalls(vec![MockToolCall {
+            name: "write".into(),
+            arguments: serde_json::json!({
+                "file_path": "src/lib.rs",
+                "content": "pub fn value() -> usize {\n    2\n}\n"
+            }),
+        }]));
+        provider.push_turn(MockTurn::Text("done".into()));
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(WriteTool));
+
+        let mut engine = test_engine_with_tools(&temp_dir, &provider, tools);
+        let result = engine
+            .send_message("repair after verification failure")
+            .await
+            .expect("self-fix succeeds");
+
+        assert!(matches!(result, SendMessageResult::Complete(ref text) if text == "done"));
+        assert_eq!(
+            std::fs::read_to_string(temp_dir.path().join("src/lib.rs")).expect("read final file"),
+            "pub fn value() -> usize {\n    2\n}\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn automatic_verification_allows_bonus_retry_for_relevant_different_failure() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        write_rust_fixture(&temp_dir);
+
+        let provider = Arc::new(MockProvider::new());
+        provider.push_turn(MockTurn::ToolCalls(vec![MockToolCall {
+            name: "write".into(),
+            arguments: serde_json::json!({
+                "file_path": "src/lib.rs",
+                "content": "pub fn value() -> usize {\n    let broken = ;\n    2\n}\n"
+            }),
+        }]));
+        provider.push_turn(MockTurn::ToolCalls(vec![MockToolCall {
+            name: "write".into(),
+            arguments: serde_json::json!({
+                "file_path": "src/lib.rs",
+                "content": "pub fn value() -> usize {\n    let still_broken: usize = \"oops\";\n    still_broken\n}\n"
+            }),
+        }]));
+        provider.push_turn(MockTurn::ToolCalls(vec![MockToolCall {
+            name: "write".into(),
+            arguments: serde_json::json!({
+                "file_path": "src/lib.rs",
+                "content": "pub fn value() -> usize {\n    2\n}\n"
+            }),
+        }]));
+        provider.push_turn(MockTurn::Text("done".into()));
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(WriteTool));
+
+        let mut engine = test_engine_with_tools(&temp_dir, &provider, tools);
+        let result = engine
+            .send_message("fix a changed verification failure")
+            .await
+            .expect("bonus retry should allow a second repair round");
+
+        assert!(matches!(result, SendMessageResult::Complete(ref text) if text == "done"));
+        assert_eq!(
+            std::fs::read_to_string(temp_dir.path().join("src/lib.rs")).expect("read final file"),
+            "pub fn value() -> usize {\n    2\n}\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn automatic_verification_stops_after_bonus_retry_limit() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        write_rust_fixture(&temp_dir);
+
+        let provider = Arc::new(MockProvider::new());
+        provider.push_turn(MockTurn::ToolCalls(vec![MockToolCall {
+            name: "write".into(),
+            arguments: serde_json::json!({
+                "file_path": "src/lib.rs",
+                "content": "pub fn value() -> usize {\n    let broken = ;\n    2\n}\n"
+            }),
+        }]));
+        provider.push_turn(MockTurn::ToolCalls(vec![MockToolCall {
+            name: "write".into(),
+            arguments: serde_json::json!({
+                "file_path": "src/lib.rs",
+                "content": "pub fn value() -> usize {\n    let still_broken: usize = \"oops\";\n    still_broken\n}\n"
+            }),
+        }]));
+        provider.push_turn(MockTurn::ToolCalls(vec![MockToolCall {
+            name: "write".into(),
+            arguments: serde_json::json!({
+                "file_path": "src/lib.rs",
+                "content": "pub fn value() -> usize {\n    missing_value\n}\n"
+            }),
+        }]));
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(WriteTool));
+
+        let mut engine = test_engine_with_tools(&temp_dir, &provider, tools);
+        let error = engine
+            .send_message("keep failing verification after the bonus retry")
+            .await
+            .expect_err("verification should stop after the bonus retry budget");
+
+        assert!(error.to_string().contains("Automatic verification failed after 2 retry attempt"));
+    }
+
+    #[tokio::test]
+    async fn automatic_verification_stops_early_on_unchanged_failure_signature() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        write_rust_fixture(&temp_dir);
+
+        let provider = Arc::new(MockProvider::new());
+        provider.push_turn(MockTurn::ToolCalls(vec![MockToolCall {
+            name: "write".into(),
+            arguments: serde_json::json!({
+                "file_path": "src/lib.rs",
+                "content": "pub fn value() -> usize {\n    let broken = ;\n    2\n}\n"
+            }),
+        }]));
+        provider.push_turn(MockTurn::ToolCalls(vec![MockToolCall {
+            name: "write".into(),
+            arguments: serde_json::json!({
+                "file_path": "src/lib.rs",
+                "content": "pub fn value() -> usize {\n    let still_broken = ;\n    3\n}\n"
+            }),
+        }]));
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(WriteTool));
+
+        let mut engine = test_engine_with_tools(&temp_dir, &provider, tools);
+        let error = engine
+            .send_message("keep hitting the same verification failure")
+            .await
+            .expect_err("verification churn should stop early");
+
+        assert!(error
+            .to_string()
+            .contains("Automatic verification retry did not change the failure signature"));
+    }
+
+    #[tokio::test]
+    async fn automatic_verification_skipped_round_preserves_failure_state() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        write_rust_fixture(&temp_dir);
+
+        let provider = Arc::new(MockProvider::new());
+        provider.push_turn(MockTurn::ToolCalls(vec![MockToolCall {
+            name: "write".into(),
+            arguments: serde_json::json!({
+                "file_path": "src/lib.rs",
+                "content": "pub fn value() -> usize {\n    let broken = ;\n    2\n}\n"
+            }),
+        }]));
+        provider.push_turn(MockTurn::ToolCalls(vec![MockToolCall {
+            name: "read".into(),
+            arguments: serde_json::json!({
+                "file_path": "src/lib.rs"
+            }),
+        }]));
+        provider.push_turn(MockTurn::ToolCalls(vec![MockToolCall {
+            name: "write".into(),
+            arguments: serde_json::json!({
+                "file_path": "src/lib.rs",
+                "content": "pub fn value() -> usize {\n    let still_broken = ;\n    3\n}\n"
+            }),
+        }]));
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(WriteTool));
+        tools.register(Arc::new(ReadTool));
+
+        let mut engine = test_engine_with_tools(&temp_dir, &provider, tools);
+        let error = engine
+            .send_message("inspect before retrying verification")
+            .await
+            .expect_err("a read-only detour should not clear verification failure state");
+
+        assert!(error
+            .to_string()
+            .contains("Automatic verification retry did not change the failure signature"));
+        let messages = engine
+            .state
+            .db
+            .list_messages(engine.session_id())
+            .expect("list messages after skipped verification round");
+        assert!(messages.iter().any(|message| {
+            message.parts.contains(
+                "Automatic verification did not run after this tool round. Previous failing verification context remains active"
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn automatic_verification_pass_resets_failure_state() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        write_rust_fixture(&temp_dir);
+
+        let provider = Arc::new(MockProvider::new());
+        provider.push_turn(MockTurn::ToolCalls(vec![MockToolCall {
+            name: "write".into(),
+            arguments: serde_json::json!({
+                "file_path": "src/lib.rs",
+                "content": "pub fn value() -> usize {\n    let broken = ;\n    2\n}\n"
+            }),
+        }]));
+        provider.push_turn(MockTurn::ToolCalls(vec![MockToolCall {
+            name: "write".into(),
+            arguments: serde_json::json!({
+                "file_path": "src/lib.rs",
+                "content": "pub fn value() -> usize {\n    2\n}\n"
+            }),
+        }]));
+        provider.push_turn(MockTurn::ToolCalls(vec![MockToolCall {
+            name: "write".into(),
+            arguments: serde_json::json!({
+                "file_path": "src/lib.rs",
+                "content": "pub fn value() -> usize {\n    let broken = ;\n    2\n}\n"
+            }),
+        }]));
+        provider.push_turn(MockTurn::ToolCalls(vec![MockToolCall {
+            name: "write".into(),
+            arguments: serde_json::json!({
+                "file_path": "src/lib.rs",
+                "content": "pub fn value() -> usize {\n    2\n}\n"
+            }),
+        }]));
+        provider.push_turn(MockTurn::Text("done".into()));
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(WriteTool));
+
+        let mut engine = test_engine_with_tools(&temp_dir, &provider, tools);
+        let result = engine
+            .send_message("fail, pass, then fail again")
+            .await
+            .expect("a passing verification should reset retry state");
+
+        assert!(matches!(result, SendMessageResult::Complete(ref text) if text == "done"));
+    }
+
+    #[test]
+    fn verification_retry_scope_stop_error_detects_unrelated_retry_changes() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        write_rust_workspace_fixture(&temp_dir);
+        let report = crate::verification::VerificationReport {
+            executed_command: crate::verification::detect_command(
+                temp_dir.path(),
+                &[temp_dir.path().join("crates/app/src/lib.rs").display().to_string()],
+            )
+            .expect("verification command"),
+            command: "cargo check --manifest-path crates/app/Cargo.toml".to_string(),
+            success: false,
+            exit_code: Some(101),
+            output: "error: expected expression".to_string(),
+        };
+        let preference = report.retry_preference(&[temp_dir
+            .path()
+            .join("crates/app/src/lib.rs")
+            .display()
+            .to_string()]);
+
+        let error = verification_retry_scope_stop_error(
+            temp_dir.path(),
+            Some(&preference),
+            &[temp_dir.path().join("README.md").display().to_string()],
+        )
+        .expect("unrelated retry changes should stop");
+
+        assert!(error.contains(
+            "Automatic verification retry did not touch files relevant to the failing verification scope"
+        ));
+    }
+
+    #[tokio::test]
+    async fn automatic_verification_retry_reuses_previous_rust_scope() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        write_rust_workspace_fixture(&temp_dir);
+        std::fs::write(
+            temp_dir.path().join("crates/app/src/lib.rs"),
+            "pub fn value() -> usize {\n    let broken = ;\n    2\n}\n",
+        )
+        .expect("write broken file");
+
+        let bus = Bus::new(8);
+        let mut bus_rx = bus.subscribe();
+        let tool_calls = vec![ToolCall {
+            id: "tool-1".to_string(),
+            name: "write".to_string(),
+            arguments: "{}".to_string(),
+        }];
+        let tool_results = vec![ToolResult {
+            tool_call_id: "tool-1".to_string(),
+            content: "updated".to_string(),
+            is_error: false,
+        }];
+
+        let first_scope = vec![temp_dir.path().join("crates/app/src/lib.rs").display().to_string()];
+        let first = maybe_run_automatic_verification(
+            temp_dir.path(),
+            &bus,
+            "session-1",
+            &tool_calls,
+            &tool_results,
+            &first_scope,
+            None,
+        )
+        .await
+        .expect("first verification");
+
+        let AutomaticVerificationOutcome::Failed(first_report) = first else {
+            panic!("expected failed targeted verification");
+        };
+
+        std::fs::write(
+            temp_dir.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/app\"]\n# retry touched root manifest\n",
+        )
+        .expect("touch root manifest");
+
+        let second_scope = vec![temp_dir.path().join("Cargo.toml").display().to_string()];
+        let second = maybe_run_automatic_verification(
+            temp_dir.path(),
+            &bus,
+            "session-1",
+            &tool_calls,
+            &tool_results,
+            &second_scope,
+            Some(&first_report.retry_preference(&first_scope)),
+        )
+        .await
+        .expect("second verification");
+
+        assert!(matches!(second, AutomaticVerificationOutcome::Failed(_)));
+
+        let mut commands = Vec::new();
+        while let Ok(event) = bus_rx.try_recv() {
+            if let BusEvent::VerificationStarted { command, .. } = event {
+                commands.push(command);
+            }
+        }
+
+        assert_eq!(
+            commands,
+            vec![
+                "cargo check --manifest-path crates/app/Cargo.toml".to_string(),
+                "cargo check --manifest-path crates/app/Cargo.toml".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn verification_feedback_includes_command_and_scope() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        write_rust_workspace_fixture(&temp_dir);
+        let report = crate::verification::VerificationReport {
+            executed_command: crate::verification::detect_command(
+                temp_dir.path(),
+                &[temp_dir.path().join("crates/app/src/lib.rs").display().to_string()],
+            )
+            .expect("verification command"),
+            command: "cargo check --manifest-path crates/app/Cargo.toml".to_string(),
+            success: false,
+            exit_code: Some(101),
+            output: "error: expected expression".to_string(),
+        };
+
+        let feedback = build_verification_feedback(
+            &report,
+            &["crates/app/src/lib.rs".to_string(), "crates/app/src/api.rs".to_string()],
+            None,
+            0,
+            None,
+            None,
+        );
+
+        assert!(
+            feedback.contains("Failed command: cargo check --manifest-path crates/app/Cargo.toml")
+        );
+        assert!(
+            feedback.contains("Verification scope: crates/app/src/lib.rs, crates/app/src/api.rs.")
+        );
+        assert!(feedback.contains("Failure classification: build or typecheck failure."));
+        assert!(feedback.contains("error: expected expression"));
+    }
+
+    #[test]
+    fn verification_feedback_mentions_same_failure_family_on_retry() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        write_rust_workspace_fixture(&temp_dir);
+        let report = crate::verification::VerificationReport {
+            executed_command: crate::verification::detect_command(
+                temp_dir.path(),
+                &[temp_dir.path().join("crates/app/src/lib.rs").display().to_string()],
+            )
+            .expect("verification command"),
+            command: "cargo check --manifest-path crates/app/Cargo.toml".to_string(),
+            success: false,
+            exit_code: Some(101),
+            output: "error[E0308]: mismatched types\n  --> src/lib.rs:44:5".to_string(),
+        };
+        let previous = crate::verification::VerificationFailureSummary::new(
+            crate::verification::VerificationFailureKind::Build,
+            Some("error[E0308]: mismatched types".to_string()),
+        );
+        let preference = report.retry_preference(&["crates/app/src/lib.rs".to_string()]);
+
+        let feedback = build_verification_feedback(
+            &report,
+            &["crates/app/src/lib.rs".to_string()],
+            Some(&previous),
+            0,
+            Some(RetryChangeRelevance::Relevant),
+            Some(&preference),
+        );
+
+        assert!(feedback
+            .contains("Retry status: the same build or typecheck failure is still failing."));
+        assert!(feedback.contains(
+            "Retry scope assessment: the latest edits touched the failing verification scope: crates/app/src/lib.rs."
+        ));
+    }
+
+    #[test]
+    fn verification_feedback_mentions_different_failure_on_retry() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        write_rust_workspace_fixture(&temp_dir);
+        let report = crate::verification::VerificationReport {
+            executed_command: crate::verification::detect_command(
+                temp_dir.path(),
+                &[temp_dir.path().join("crates/app/src/lib.rs").display().to_string()],
+            )
+            .expect("verification command"),
+            command: "cargo check --manifest-path crates/app/Cargo.toml".to_string(),
+            success: false,
+            exit_code: Some(101),
+            output: "error[E0425]: cannot find value `missing` in this scope".to_string(),
+        };
+        let previous = crate::verification::VerificationFailureSummary::new(
+            crate::verification::VerificationFailureKind::Test,
+            Some("--- FAIL: TestClient".to_string()),
+        );
+        let preference = report.retry_preference(&["crates/app/src/lib.rs".to_string()]);
+
+        let feedback = build_verification_feedback(
+            &report,
+            &["crates/app/src/lib.rs".to_string()],
+            Some(&previous),
+            0,
+            Some(RetryChangeRelevance::Irrelevant),
+            Some(&preference),
+        );
+
+        assert!(feedback.contains(
+            "Retry status: verification uncovered a different failure: build or typecheck failure."
+        ));
+        assert!(feedback.contains(
+            "Retry scope assessment: the latest edits did not touch the failing verification scope: crates/app/src/lib.rs."
+        ));
+    }
+
+    #[test]
+    fn verification_feedback_mentions_unknown_scope_on_retry() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        write_rust_workspace_fixture(&temp_dir);
+        let report = crate::verification::VerificationReport {
+            executed_command: crate::verification::detect_command(
+                temp_dir.path(),
+                &[temp_dir.path().join("crates/app/src/lib.rs").display().to_string()],
+            )
+            .expect("verification command"),
+            command: "cargo check --manifest-path crates/app/Cargo.toml".to_string(),
+            success: false,
+            exit_code: Some(101),
+            output: "error[E0425]: cannot find value `missing` in this scope".to_string(),
+        };
+        let previous = crate::verification::VerificationFailureSummary::new(
+            crate::verification::VerificationFailureKind::Build,
+            Some("error[E0308]: mismatched types".to_string()),
+        );
+        let preference = report.retry_preference(&["crates/app/src/lib.rs".to_string()]);
+
+        let feedback = build_verification_feedback(
+            &report,
+            &[],
+            Some(&previous),
+            0,
+            Some(RetryChangeRelevance::Unknown),
+            Some(&preference),
+        );
+
+        assert!(feedback.contains(
+            "Retry scope assessment: unknown because no changed-file snapshot was available. Failing verification scope: crates/app/src/lib.rs."
+        ));
+    }
+
+    #[test]
+    fn verification_retry_stop_error_detects_same_failure_family() {
+        let previous = crate::verification::VerificationFailureSummary::new(
+            crate::verification::VerificationFailureKind::Build,
+            Some("error[E0308]: mismatched types".to_string()),
+        );
+        let current = crate::verification::VerificationFailureSummary::new(
+            crate::verification::VerificationFailureKind::Build,
+            Some("error[E0308]: mismatched types".to_string()),
+        );
+
+        let error = verification_retry_stop_error(Some(&previous), Some(&current))
+            .expect("same failure family should stop");
+        assert!(error.contains("Automatic verification retry did not change the failure signature"));
+    }
+
+    #[test]
+    fn verification_feedback_mentions_skipped_round_continuity() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        write_rust_workspace_fixture(&temp_dir);
+        let report = crate::verification::VerificationReport {
+            executed_command: crate::verification::detect_command(
+                temp_dir.path(),
+                &[temp_dir.path().join("crates/app/src/lib.rs").display().to_string()],
+            )
+            .expect("verification command"),
+            command: "cargo check --manifest-path crates/app/Cargo.toml".to_string(),
+            success: false,
+            exit_code: Some(101),
+            output: "error[E0425]: cannot find value `missing` in this scope".to_string(),
+        };
+        let previous = crate::verification::VerificationFailureSummary::new(
+            crate::verification::VerificationFailureKind::Build,
+            Some("error[E0308]: mismatched types".to_string()),
+        );
+        let preference = report.retry_preference(&["crates/app/src/lib.rs".to_string()]);
+
+        let feedback = build_verification_feedback(
+            &report,
+            &["crates/app/src/lib.rs".to_string()],
+            Some(&previous),
+            2,
+            Some(RetryChangeRelevance::Relevant),
+            Some(&preference),
+        );
+
+        assert!(feedback.contains(
+            "Retry continuity: 2 intermediate tool round(s) did not run verification, so this is continuing the previous failing verification thread."
+        ));
+    }
+
+    #[test]
+    fn verification_retry_budget_grants_bonus_for_relevant_different_failure() {
+        let previous = crate::verification::VerificationFailureSummary::new(
+            crate::verification::VerificationFailureKind::Build,
+            Some("error: expected expression".to_string()),
+        );
+        let current = crate::verification::VerificationFailureSummary::new(
+            crate::verification::VerificationFailureKind::Build,
+            Some("error[E0308]: mismatched types".to_string()),
+        );
+
+        let budget = verification_retry_budget(
+            Some(&previous),
+            Some(&current),
+            Some(RetryChangeRelevance::Relevant),
+            false,
+        );
+
+        assert_eq!(budget, VerificationRetryBudget { retry_limit: 2, bonus_retry_granted: true });
+    }
+
+    #[test]
+    fn effective_verification_scope_files_falls_back_to_write_tool_paths() {
+        let scope_files = effective_verification_scope_files(
+            std::path::Path::new("/tmp/project"),
+            &[],
+            &[ToolCall {
+                id: "tool-1".to_string(),
+                name: "write".to_string(),
+                arguments:
+                    r#"{"file_path":"src/lib.rs","content":"pub fn value() -> usize { 2 }"}"#
+                        .to_string(),
+            }],
+            &[ToolResult {
+                tool_call_id: "tool-1".to_string(),
+                content: "updated".to_string(),
+                is_error: false,
+            }],
+        );
+
+        assert_eq!(scope_files, vec!["/tmp/project/src/lib.rs".to_string()]);
     }
 
     #[test]

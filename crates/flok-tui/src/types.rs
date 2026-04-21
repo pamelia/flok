@@ -7,6 +7,14 @@ use tokio::sync::{mpsc, oneshot};
 pub enum UiCommand {
     /// User submitted a prompt.
     SendMessage(String),
+    /// List saved execution plans.
+    ListPlans,
+    /// Show a saved execution plan. `None` means "latest".
+    ShowPlan(Option<String>),
+    /// Approve a saved execution plan. `None` means "latest".
+    ApprovePlan(Option<String>),
+    /// Execute a saved execution plan. `None` means "latest".
+    ExecutePlan(Option<String>),
     /// User wants to list sessions.
     ListSessions,
     /// User selected a model from the picker. Value is the full model ID.

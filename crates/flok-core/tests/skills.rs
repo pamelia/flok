@@ -69,6 +69,22 @@ async fn skill_tool_loads_handle_pr_feedback() {
 }
 
 #[tokio::test]
+async fn skill_tool_loads_source_driven_development() {
+    let mut h = TestHarness::new();
+
+    h.push_turn(MockTurn::ToolCalls(vec![MockToolCall {
+        name: "skill".into(),
+        arguments: serde_json::json!({
+            "name": "source-driven-development",
+        }),
+    }]));
+    h.push_turn(MockTurn::Text("Loaded.".into()));
+
+    let result = h.send_message("load sdd skill").await.unwrap();
+    assert!(matches!(result, SendMessageResult::Complete(_)));
+}
+
+#[tokio::test]
 async fn skill_tool_rejects_path_traversal() {
     let mut h = TestHarness::new();
 

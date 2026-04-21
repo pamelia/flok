@@ -453,6 +453,24 @@ impl App {
                 flok_core::bus::BusEvent::CompressionStats { t1_pruned, l2_compressed, .. } => {
                     tracing::debug!(t1_pruned, l2_compressed, "compression stats updated");
                 }
+                flok_core::bus::BusEvent::VerificationStarted { command, .. } => {
+                    self.history
+                        .push(HistoryItem::system_info(format!("Verification running: {command}")));
+                    self.chat_view.on_new_content();
+                    self.maintain_chat_drag_lock();
+                    self.dirty = true;
+                }
+                flok_core::bus::BusEvent::VerificationCompleted { success, summary, .. } => {
+                    let item = if success {
+                        HistoryItem::system_info(summary)
+                    } else {
+                        HistoryItem::system_error(summary)
+                    };
+                    self.history.push(item);
+                    self.chat_view.on_new_content();
+                    self.maintain_chat_drag_lock();
+                    self.dirty = true;
+                }
                 flok_core::bus::BusEvent::TeamCreated { team_name, .. } => {
                     self.history.push(HistoryItem::TeamEvent {
                         kind: TeamEventKind::Created,
@@ -547,6 +565,21 @@ impl App {
                                 let _ = self.channels.cmd_tx.send(UiCommand::SetLabel(rest));
                             }
                         }
+                        "plans" => {
+                            let _ = self.channels.cmd_tx.send(UiCommand::ListPlans);
+                        }
+                        "show-plan" => {
+                            let plan_id = (!rest.is_empty()).then_some(rest);
+                            let _ = self.channels.cmd_tx.send(UiCommand::ShowPlan(plan_id));
+                        }
+                        "approve" => {
+                            let plan_id = (!rest.is_empty()).then_some(rest);
+                            let _ = self.channels.cmd_tx.send(UiCommand::ApprovePlan(plan_id));
+                        }
+                        "execute-plan" => {
+                            let plan_id = (!rest.is_empty()).then_some(rest);
+                            let _ = self.channels.cmd_tx.send(UiCommand::ExecutePlan(plan_id));
+                        }
                         "plan" => {
                             self.channels.plan_mode.set(true);
                             self.footer.plan_mode = true;
@@ -565,7 +598,7 @@ impl App {
                         }
                         "help" => {
                             self.history.push(HistoryItem::system_info(
-                                "Slash: /new /clear /undo /redo /tree /branch /label /plan /build /sidebar /sessions /help /quit",
+                                "Slash: /new /clear /undo /redo /tree /branch /label /plans /show-plan /approve /execute-plan /plan /build /sidebar /sessions /help /quit",
                             ));
                             self.chat_view.on_new_content();
                             self.maintain_chat_drag_lock();
@@ -1382,6 +1415,30 @@ mod tests {
 
         let command = cmd_rx.try_recv().expect("cancel command should be queued");
         assert!(matches!(command, UiCommand::Cancel));
+    }
+
+    #[tokio::test]
+    async fn submit_plans_sends_list_plans_command() {
+        let (channels, mut cmd_rx) = make_channels();
+        let (tx, rx) = mpsc::unbounded_channel::<AppEvent>();
+        let mut app = App::new(channels, tx, rx);
+
+        app.handle_event(AppEvent::Submit("/plans".to_string()));
+
+        let command = cmd_rx.try_recv().expect("list plans command should be queued");
+        assert!(matches!(command, UiCommand::ListPlans));
+    }
+
+    #[tokio::test]
+    async fn submit_execute_plan_with_id_sends_execute_command() {
+        let (channels, mut cmd_rx) = make_channels();
+        let (tx, rx) = mpsc::unbounded_channel::<AppEvent>();
+        let mut app = App::new(channels, tx, rx);
+
+        app.handle_event(AppEvent::Submit("/execute-plan plan-123".to_string()));
+
+        let command = cmd_rx.try_recv().expect("execute plan command should be queued");
+        assert!(matches!(command, UiCommand::ExecutePlan(Some(plan_id)) if plan_id == "plan-123"));
     }
 
     #[tokio::test]

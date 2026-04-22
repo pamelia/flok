@@ -75,7 +75,7 @@ AI-assisted coding workflows. Single binary, no runtime dependencies.
 ### Build & Run
 
 ```bash
-git clone https://github.com/opencode-dev/flok.git
+git clone https://github.com/pamelia/flok.git
 cd flok
 cargo build --release
 

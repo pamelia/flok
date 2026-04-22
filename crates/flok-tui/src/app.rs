@@ -24,6 +24,7 @@ use crate::types::{McpAddCommand, TuiChannels, UiCommand};
 use unicode_width::UnicodeWidthStr;
 
 const COALESCE_WINDOW_MS: u64 = 50;
+const UI_TICK_INTERVAL_MS: u64 = 100;
 
 #[expect(
     clippy::struct_field_names,
@@ -72,8 +73,9 @@ impl App {
         let model_name = channels.model_name.clone();
         let plan_mode = channels.plan_mode.is_plan();
         let theme = crate::theme::Theme::dark();
-        let footer =
-            FooterState { plan_mode, model: model_name.clone(), context_pct: 0.0, waiting: false };
+        let mut footer = FooterState::default();
+        footer.plan_mode = plan_mode;
+        footer.model.clone_from(&model_name);
         let sidebar = SidebarState {
             session_title: String::from("flok"),
             model: model_name,
@@ -113,7 +115,7 @@ impl App {
     }
 
     async fn run_with_renderer<R: AppRenderer>(&mut self, renderer: &mut R) -> Result<()> {
-        let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
+        let mut tick = tokio::time::interval(Duration::from_millis(UI_TICK_INTERVAL_MS));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         tick.tick().await;
         let mut coalescer = RenderCoalescer::default();
@@ -266,6 +268,9 @@ impl App {
                 self.dirty = true;
             }
             AppEvent::Tick => {
+                if self.footer.tick_waiting(Duration::from_millis(UI_TICK_INTERVAL_MS)) {
+                    self.dirty = true;
+                }
                 let todos = self
                     .channels
                     .todo_list
@@ -349,9 +354,7 @@ impl App {
                 crate::types::UiEvent::SessionSwitched { messages } => {
                     self.history.clear();
                     self.active = None;
-                    self.waiting_for_response = false;
-                    self.footer.waiting = false;
-                    self.bottom_pane.set_waiting(false);
+                    self.stop_waiting();
                     for (role, content) in messages {
                         let item = match role.as_str() {
                             "user" => HistoryItem::user(content),
@@ -445,9 +448,7 @@ impl App {
                     }
                 }
                 flok_core::bus::BusEvent::Cancelled { .. } => {
-                    self.waiting_for_response = false;
-                    self.footer.waiting = false;
-                    self.bottom_pane.set_waiting(false);
+                    self.stop_waiting();
                     self.dirty = true;
                 }
                 flok_core::bus::BusEvent::CompressionStats { t1_pruned, l2_compressed, .. } => {
@@ -592,9 +593,7 @@ impl App {
                         "clear" | "new" => {
                             self.history.clear();
                             self.active = None;
-                            self.waiting_for_response = false;
-                            self.footer.waiting = false;
-                            self.bottom_pane.set_waiting(false);
+                            self.stop_waiting();
                             tracing::debug!(
                                 "no NewSession UiCommand variant; cleared local transcript only"
                             );
@@ -686,9 +685,7 @@ impl App {
                     }
                 } else if !trimmed.is_empty() {
                     self.history.push(HistoryItem::user(text.clone()));
-                    self.waiting_for_response = true;
-                    self.footer.waiting = true;
-                    self.bottom_pane.set_waiting(true);
+                    self.start_waiting();
                     self.chat_view.on_new_content();
                     self.maintain_chat_drag_lock();
                     let _ = self.channels.cmd_tx.send(UiCommand::SendMessage(text));
@@ -726,9 +723,7 @@ impl App {
                     self.chat_view.on_new_content();
                     self.maintain_chat_drag_lock();
                 }
-                self.waiting_for_response = false;
-                self.footer.waiting = false;
-                self.bottom_pane.set_waiting(false);
+                self.stop_waiting();
                 self.dirty = true;
             }
             AppEvent::ToggleSidebar => {
@@ -845,9 +840,7 @@ impl App {
     fn finish_assistant(&mut self, fallback_text: String, cancelled: bool) {
         let item = crate::stream::finalize_assistant(self.active.take(), fallback_text, cancelled);
         self.push_history_if_not_duplicate(item);
-        self.waiting_for_response = false;
-        self.footer.waiting = false;
-        self.bottom_pane.set_waiting(false);
+        self.stop_waiting();
         self.chat_view.on_new_content();
         self.maintain_chat_drag_lock();
         self.dirty = true;
@@ -884,6 +877,18 @@ impl App {
         if !is_duplicate {
             self.history.push(item);
         }
+    }
+
+    fn start_waiting(&mut self) {
+        self.waiting_for_response = true;
+        self.footer.start_waiting();
+        self.bottom_pane.set_waiting(true);
+    }
+
+    fn stop_waiting(&mut self) {
+        self.waiting_for_response = false;
+        self.footer.stop_waiting();
+        self.bottom_pane.set_waiting(false);
     }
 
     fn handle_chat_scroll_key(&mut self, key: crossterm::event::KeyEvent) -> bool {
@@ -1807,6 +1812,26 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(COALESCE_WINDOW_MS + 20)).await;
         assert_eq!(draws.load(Ordering::Relaxed), 2);
+
+        let quit_sent = tx.send(AppEvent::Quit);
+        assert!(quit_sent.is_ok());
+        tokio::task::yield_now().await;
+        assert!(matches!(join.await, Ok(Ok(()))));
+    }
+
+    #[tokio::test]
+    async fn waiting_spinner_ticks_trigger_additional_renders() {
+        let (tx, draws, join) = spawn_counting_app().await;
+
+        let submit_sent = tx.send(AppEvent::Submit("List my GitHub repositories".to_string()));
+        assert!(submit_sent.is_ok());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let after_submit = draws.load(Ordering::Relaxed);
+        assert!(after_submit >= 2, "draws after submit: {after_submit}");
+
+        tokio::time::sleep(Duration::from_millis(UI_TICK_INTERVAL_MS + 40)).await;
+        let after_tick = draws.load(Ordering::Relaxed);
+        assert!(after_tick > after_submit, "after_submit={after_submit}, after_tick={after_tick}");
 
         let quit_sent = tx.send(AppEvent::Quit);
         assert!(quit_sent.is_ok());

@@ -5,16 +5,18 @@ use ratatui::{
     text::{Line, Span},
     widgets::Widget,
 };
+use std::time::Duration;
 use unicode_width::UnicodeWidthStr;
 
+use crate::spinner::WaitingSpinner;
 use crate::theme::Theme;
 
-#[derive(Debug, Default, Clone)]
 pub(crate) struct FooterState {
     pub(crate) plan_mode: bool,
     pub(crate) model: String,
     pub(crate) context_pct: f32,
     pub(crate) waiting: bool,
+    waiting_spinner: Option<WaitingSpinner>,
 }
 
 const PLAN_BADGE_TEXT: &str = " PLAN ";
@@ -23,6 +25,58 @@ const HINT_SEPARATOR: &str = "   ";
 /// Hint priority: kept first, dropped last. So `Esc cancel` is dropped first
 /// when width gets tight, and `Tab plan` is the final hint to remain.
 const HINTS: [&str; 2] = ["Tab plan", "Esc cancel"];
+
+impl Default for FooterState {
+    fn default() -> Self {
+        Self {
+            plan_mode: false,
+            model: String::new(),
+            context_pct: 0.0,
+            waiting: false,
+            waiting_spinner: None,
+        }
+    }
+}
+
+impl FooterState {
+    pub(crate) fn start_waiting(&mut self) {
+        self.waiting = true;
+        self.waiting_spinner = Some(WaitingSpinner::random());
+    }
+
+    pub(crate) fn stop_waiting(&mut self) {
+        self.waiting = false;
+        self.waiting_spinner = None;
+    }
+
+    pub(crate) fn tick_waiting(&mut self, delta: Duration) -> bool {
+        if !self.waiting {
+            return false;
+        }
+        if let Some(spinner) = &mut self.waiting_spinner {
+            spinner.advance(delta);
+            return true;
+        }
+        false
+    }
+
+    fn waiting_text(&self) -> Option<String> {
+        if !self.waiting {
+            return None;
+        }
+        Some(
+            self.waiting_spinner
+                .as_ref()
+                .map_or_else(|| "streaming...".to_string(), WaitingSpinner::text),
+        )
+    }
+
+    #[cfg(test)]
+    fn start_waiting_with_seed(&mut self, seed: u64) {
+        self.waiting = true;
+        self.waiting_spinner = Some(WaitingSpinner::from_seed(seed));
+    }
+}
 
 pub(crate) fn render(state: &FooterState, theme: &Theme, area: Rect, buf: &mut Buffer) {
     if area.width == 0 || area.height == 0 {
@@ -79,8 +133,8 @@ fn build_spans(
         return (left, Vec::new());
     }
 
-    if state.waiting {
-        left.push(Span::styled(" · streaming...".to_string(), assistant_style));
+    if let Some(waiting_text) = state.waiting_text() {
+        left.push(Span::styled(format!(" · {waiting_text}"), assistant_style));
     }
 
     let n_visible = if width >= 100 {
@@ -147,7 +201,17 @@ mod tests {
     }
 
     fn make_state(plan_mode: bool, ctx: f32, waiting: bool) -> FooterState {
-        FooterState { plan_mode, model: "sonnet".to_string(), context_pct: ctx, waiting }
+        let mut state = FooterState {
+            plan_mode,
+            model: "sonnet".to_string(),
+            context_pct: ctx,
+            waiting: false,
+            waiting_spinner: None,
+        };
+        if waiting {
+            state.start_waiting_with_seed(0);
+        }
+        state
     }
 
     #[test]
@@ -252,7 +316,8 @@ mod tests {
         render(&state, &theme, area, &mut buf);
 
         let row = buffer_text(&buf, 0);
-        assert!(row.contains("streaming..."), "row: {row:?}");
+        assert!(row.contains("streaming"), "row: {row:?}");
+        assert!(!row.contains("streaming..."), "row: {row:?}");
 
         let start = row.find("streaming").expect("streaming present");
         let cell = buf.cell(Position::new(start as u16, 0)).expect("cell in range");

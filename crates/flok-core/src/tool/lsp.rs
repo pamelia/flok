@@ -21,7 +21,7 @@ impl Tool for LspDiagnosticsTool {
     }
 
     fn description(&self) -> &'static str {
-        "Get LSP diagnostics for a Rust file or directory."
+        "Get native LSP diagnostics for a supported file or directory."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -31,7 +31,7 @@ impl Tool for LspDiagnosticsTool {
             "properties": {
                 "file_path": {
                     "type": "string",
-                    "description": "Rust file or directory to inspect"
+                    "description": "Supported file or directory to inspect"
                 },
                 "severity": {
                     "type": "string",
@@ -72,7 +72,7 @@ impl Tool for LspGotoDefinitionTool {
     }
 
     fn description(&self) -> &'static str {
-        "Find the definition location for a Rust symbol."
+        "Find the definition location for a symbol using native LSP."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -82,7 +82,7 @@ impl Tool for LspGotoDefinitionTool {
             "properties": {
                 "file_path": {
                     "type": "string",
-                    "description": "Rust file containing the symbol reference"
+                    "description": "Supported file containing the symbol reference"
                 },
                 "line": {
                     "type": "integer",
@@ -127,7 +127,7 @@ impl Tool for LspFindReferencesTool {
     }
 
     fn description(&self) -> &'static str {
-        "Find references to a Rust symbol."
+        "Find references to a symbol using native LSP."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -137,7 +137,7 @@ impl Tool for LspFindReferencesTool {
             "properties": {
                 "file_path": {
                     "type": "string",
-                    "description": "Rust file containing the symbol reference"
+                    "description": "Supported file containing the symbol reference"
                 },
                 "line": {
                     "type": "integer",
@@ -189,7 +189,7 @@ impl Tool for LspSymbolsTool {
     }
 
     fn description(&self) -> &'static str {
-        "List document symbols for a Rust file or search workspace symbols."
+        "List document symbols for a supported file or search workspace symbols."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {

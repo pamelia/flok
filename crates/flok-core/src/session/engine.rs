@@ -16,12 +16,15 @@ use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
 use crate::bus::BusEvent;
+use crate::compaction::CompactionStore;
 use crate::plan::{
     summarize_plan, Checkpoint, CheckpointData, ExecutionPlan, PlanPatch, PlanStatus, PlanStore,
     StepStatus,
 };
-use crate::provider::{CompletionRequest, Message, MessageContent, ModelRegistry, StreamEvent};
-use crate::routing::route_model;
+use crate::provider::{
+    CompletionRequest, Message, MessageContent, ModelRegistry, StepMetadata, StreamEvent,
+};
+use crate::routing::{route_model, RoutingContext};
 use crate::session::state::AppState;
 use crate::token::TokenCounter;
 use crate::verification::{
@@ -302,6 +305,8 @@ struct UndoEntry {
     user_message_id: String,
     /// The git tree hash captured before the user message was processed.
     snapshot_hash: String,
+    /// File-level before/after state for changes made by the message.
+    file_diffs: Vec<crate::snapshot::FileDiff>,
 }
 
 /// State captured when the user undoes a message, enabling redo.
@@ -311,6 +316,8 @@ struct RedoEntry {
     pre_undo_snapshot: String,
     /// The user message ID that was removed by undo.
     user_message_id: String,
+    /// File-level before/after state for changes made by the message.
+    file_diffs: Vec<crate::snapshot::FileDiff>,
     /// The user's original prompt text (preserved for potential future re-send).
     #[expect(dead_code, reason = "reserved for future redo-and-resend feature")]
     user_text: String,
@@ -353,6 +360,26 @@ pub struct SessionEngine {
 }
 
 impl SessionEngine {
+    fn backfill_undo_snapshot(&mut self, user_message_id: &str, snapshot_hash: &str) {
+        if snapshot_hash.is_empty() {
+            return;
+        }
+
+        if let Some(entry) = self.undo_stack.iter_mut().rev().find(|entry| {
+            entry.user_message_id == user_message_id && entry.snapshot_hash.is_empty()
+        }) {
+            entry.snapshot_hash = snapshot_hash.to_string();
+        }
+    }
+
+    fn replace_undo_diffs(&mut self, user_message_id: &str, diffs: Vec<crate::snapshot::FileDiff>) {
+        if let Some(entry) =
+            self.undo_stack.iter_mut().rev().find(|entry| entry.user_message_id == user_message_id)
+        {
+            entry.file_diffs = diffs;
+        }
+    }
+
     /// Create a new session engine.
     ///
     /// Creates the session in the database and returns the engine.
@@ -444,6 +471,30 @@ impl SessionEngine {
                             text.push('\n');
                         }
                         text.push_str(t);
+                    }
+                    MessageContent::Compaction { summary } => {
+                        if !text.is_empty() {
+                            text.push('\n');
+                        }
+                        text.push_str(&summary.render_for_prompt());
+                    }
+                    MessageContent::ProjectMemory { summary } => {
+                        if !text.is_empty() {
+                            text.push('\n');
+                        }
+                        text.push_str(&summary.render_for_prompt());
+                    }
+                    MessageContent::MemoryRecall { summary } => {
+                        if !text.is_empty() {
+                            text.push('\n');
+                        }
+                        text.push_str(&summary.render_for_prompt());
+                    }
+                    MessageContent::Step { step } => {
+                        if !text.is_empty() {
+                            text.push('\n');
+                        }
+                        text.push_str(&step.render_for_prompt());
                     }
                     MessageContent::Thinking { thinking } => {
                         if !text.is_empty() {
@@ -577,6 +628,8 @@ impl SessionEngine {
                 format_plan_details(&plan, &store)
             ));
         }
+        let (prepared_plan, resumed_steps) = prepare_plan_for_execution(&store, &plan)?;
+        plan = prepared_plan;
 
         plan.status = PlanStatus::Executing;
         plan.updated_at = Utc::now();
@@ -668,10 +721,12 @@ impl SessionEngine {
                 plan.status = PlanStatus::Completed;
                 plan.updated_at = Utc::now();
                 store.save_plan(&plan)?;
-                return Ok(format!(
-                    "Plan executed successfully.\n\n{}",
-                    format_plan_details(&plan, &store)
-                ));
+                let summary = if resumed_steps > 0 {
+                    "Plan resumed and executed successfully."
+                } else {
+                    "Plan executed successfully."
+                };
+                return Ok(format!("{summary}\n\n{}", format_plan_details(&plan, &store),));
             }
 
             if plan.steps.iter().any(|step| matches!(step.status, StepStatus::Failed(_))) {
@@ -859,6 +914,10 @@ impl SessionEngine {
         PlanStore::new(self.state.project_root.clone())
     }
 
+    fn compaction_store(&self) -> CompactionStore {
+        CompactionStore::new(self.state.project_root.clone())
+    }
+
     fn session_plans(&self) -> anyhow::Result<Vec<ExecutionPlan>> {
         let mut plans = self.plan_store().list_plans()?;
         plans.retain(|plan| plan.session_id == self.session_id);
@@ -926,7 +985,10 @@ impl SessionEngine {
         };
 
         // Restore workspace files to the pre-message snapshot
-        let files_changed = if entry.snapshot_hash.is_empty() {
+        let files_changed = if !entry.file_diffs.is_empty() {
+            apply_file_diffs_before(&self.state.project_root, &entry.file_diffs).await?;
+            entry.file_diffs.len()
+        } else if entry.snapshot_hash.is_empty() {
             0
         } else {
             // Get the patch (files changed) before restoring
@@ -956,10 +1018,11 @@ impl SessionEngine {
         );
 
         // Push redo entry
-        if !pre_undo_snapshot.is_empty() {
+        if !pre_undo_snapshot.is_empty() || !entry.file_diffs.is_empty() {
             self.redo_stack.push(RedoEntry {
                 pre_undo_snapshot,
                 user_message_id: entry.user_message_id,
+                file_diffs: entry.file_diffs.clone(),
                 user_text,
             });
         }
@@ -996,7 +1059,10 @@ impl SessionEngine {
         };
 
         // Restore workspace files to the state before undo
-        let files_changed = if entry.pre_undo_snapshot.is_empty() {
+        let files_changed = if !entry.file_diffs.is_empty() {
+            apply_file_diffs_after(&self.state.project_root, &entry.file_diffs).await?;
+            entry.file_diffs.len()
+        } else if entry.pre_undo_snapshot.is_empty() {
             0
         } else {
             let patch =
@@ -1016,10 +1082,11 @@ impl SessionEngine {
         };
 
         // Push an undo entry so the user can undo this redo
-        if !pre_redo_snapshot.is_empty() {
+        if !pre_redo_snapshot.is_empty() || !entry.file_diffs.is_empty() {
             self.undo_stack.push(UndoEntry {
                 user_message_id: entry.user_message_id,
                 snapshot_hash: pre_redo_snapshot,
+                file_diffs: entry.file_diffs,
             });
         }
 
@@ -1060,15 +1127,18 @@ impl SessionEngine {
             serde_json::to_string(&[MessageContent::Text { text: user_text.to_string() }])?;
         self.state.db.insert_message(&user_msg_id, &self.session_id, "user", &user_parts)?;
 
-        // Push undo entry if we got a snapshot
-        if let Some(hash) = pre_snapshot {
-            self.undo_stack
-                .push(UndoEntry { user_message_id: user_msg_id.clone(), snapshot_hash: hash });
-        }
+        // Always record an undo frame for the message. If the initial
+        // pre-message snapshot is unavailable, a later pre-tool snapshot can
+        // backfill the file-restore point while still allowing DB history undo.
+        self.undo_stack.push(UndoEntry {
+            user_message_id: user_msg_id.clone(),
+            snapshot_hash: pre_snapshot.unwrap_or_default(),
+            file_diffs: Vec::new(),
+        });
 
         self.state.bus.send(BusEvent::MessageCreated {
             session_id: self.session_id.clone(),
-            message_id: user_msg_id,
+            message_id: user_msg_id.clone(),
         });
 
         // Auto-generate session title from first user message
@@ -1090,6 +1160,7 @@ impl SessionEngine {
         let mut verification_skipped_rounds_since_failure = 0usize;
         let mut verification_failure_summary: Option<VerificationFailureSummary> = None;
         let mut verification_preference: Option<VerificationPreference> = None;
+        let mut consecutive_tool_error_rounds = 0usize;
         let mut call_history: HashMap<String, usize> = HashMap::new();
 
         loop {
@@ -1105,24 +1176,37 @@ impl SessionEngine {
                 ));
             }
 
-            let mut messages = self.assemble_messages()?;
+            let mut messages = self.assemble_messages_with_query(Some(user_text))?;
+            let config_snapshot = self.state.config.snapshot();
+            let max_repeated_tool_calls = call_history.values().copied().max().unwrap_or(0);
             let routing = route_model(
                 &self.model_id,
                 &messages,
+                RoutingContext {
+                    round: rounds,
+                    verification_retries,
+                    consecutive_tool_error_rounds,
+                    max_repeated_tool_calls,
+                },
                 &self.state.provider_registry,
-                &self.state.config.intelligent_routing,
+                &config_snapshot.config.intelligent_routing,
             );
             let active_model_id = routing.model_id.clone();
             let token_counter = TokenCounter::for_model(&active_model_id);
             let context_window = ModelRegistry::builtin()
                 .get(&active_model_id)
                 .map_or(200_000, |m| m.context_window);
+            let mut assistant_step_parts = Vec::new();
             if active_model_id != self.model_id {
+                let reason = routing.reason.unwrap_or_else(|| "complex request".to_string());
                 self.state.bus.send(BusEvent::ModelRouted {
                     session_id: self.session_id.clone(),
                     from_model: self.model_id.clone(),
                     to_model: active_model_id.clone(),
-                    reason: routing.reason.unwrap_or_else(|| "complex request".to_string()),
+                    reason: reason.clone(),
+                });
+                assistant_step_parts.push(MessageContent::Step {
+                    step: StepMetadata::routing(&self.model_id, &active_model_id, &reason),
                 });
             }
             let system =
@@ -1131,6 +1215,15 @@ impl SessionEngine {
             // Pre-flight token count: estimate context usage
             let estimated_tokens = estimate_message_tokens(&messages, &system, &token_counter);
             let usage_pct = estimated_tokens as f64 / context_window as f64;
+            if usage_pct > 0.80 {
+                assistant_step_parts.push(MessageContent::Step {
+                    step: StepMetadata::context_usage(
+                        estimated_tokens,
+                        context_window,
+                        usage_pct > 0.95,
+                    ),
+                });
+            }
 
             // Emit context usage to TUI sidebar
             self.state.bus.send(BusEvent::ContextUsage {
@@ -1229,6 +1322,7 @@ impl SessionEngine {
 
             let request = CompletionRequest {
                 model: active_model_id,
+                reasoning_effort: config_snapshot.config.reasoning_effort,
                 system,
                 messages,
                 tools,
@@ -1286,7 +1380,7 @@ impl SessionEngine {
 
             // Store the assistant message
             let assistant_msg_id = Ulid::new().to_string();
-            let mut parts: Vec<MessageContent> = Vec::new();
+            let mut parts: Vec<MessageContent> = assistant_step_parts;
 
             // Store reasoning/thinking first (if any)
             if !reasoning.is_empty() {
@@ -1342,6 +1436,7 @@ impl SessionEngine {
                         session_id: self.session_id.clone(),
                         snapshot_hash: hash.clone(),
                     });
+                    self.backfill_undo_snapshot(&user_msg_id, &hash);
                     Some(hash)
                 }
                 Ok(None) => None,
@@ -1384,7 +1479,15 @@ impl SessionEngine {
             }
 
             // Execute tool calls and store results
-            let tool_results = self.execute_tool_calls(&tool_calls).await;
+            let (tool_results, round_file_diffs) = self.execute_tool_calls(&tool_calls).await;
+            if !round_file_diffs.is_empty() {
+                self.replace_undo_diffs(&user_msg_id, round_file_diffs);
+            }
+            if tool_results.iter().any(|result| result.is_error) {
+                consecutive_tool_error_rounds += 1;
+            } else {
+                consecutive_tool_error_rounds = 0;
+            }
             let mut changed_files = Vec::new();
 
             // Persist any new "Always Allow" permission rules to the database
@@ -1415,7 +1518,7 @@ impl SessionEngine {
                     Ok(Some(post_hash)) => {
                         self.state.bus.send(BusEvent::SnapshotCreated {
                             session_id: self.session_id.clone(),
-                            snapshot_hash: post_hash,
+                            snapshot_hash: post_hash.clone(),
                         });
                         // Compute which files changed during tool execution
                         match self.state.snapshot.patch(pre_hash).await {
@@ -1494,6 +1597,14 @@ impl SessionEngine {
                     verification_preference =
                         Some(report.retry_preference(&verification_scope_files));
                     let current_failure_summary = report.failure_summary();
+                    result_parts.push(MessageContent::Step {
+                        step: StepMetadata::verification(
+                            &report.command,
+                            false,
+                            &report.summary(),
+                            verification_scope_files.len(),
+                        ),
+                    });
                     let retry_scope_relevance = verification_retry_scope_relevance(
                         &self.state.project_root,
                         previous_verification_preference.as_ref(),
@@ -1537,6 +1648,20 @@ impl SessionEngine {
                     verification_retry_limit = retry_budget.retry_limit;
                 }
                 AutomaticVerificationOutcome::Passed => {
+                    let command = detect_verification_command(
+                        &self.state.project_root,
+                        &verification_scope_files,
+                        verification_preference.as_ref(),
+                    )
+                    .map_or_else(|| "<unknown>".to_string(), |command| command.display());
+                    result_parts.push(MessageContent::Step {
+                        step: StepMetadata::verification(
+                            &command,
+                            true,
+                            "Automatic verification passed.",
+                            verification_scope_files.len(),
+                        ),
+                    });
                     verification_retries = 0;
                     verification_bonus_retry_granted = false;
                     verification_skipped_rounds_since_failure = 0;
@@ -1735,11 +1860,26 @@ impl SessionEngine {
     ///
     /// Runs T1 pruning (recency-based tool output clearing) before assembly
     /// to keep context within bounds.
-    fn assemble_messages(&self) -> anyhow::Result<Vec<Message>> {
+    fn assemble_messages_with_query(
+        &self,
+        recall_query: Option<&str>,
+    ) -> anyhow::Result<Vec<Message>> {
         let rows = self.state.db.list_messages(&self.session_id)?;
-        let mut all_parts: Vec<Vec<MessageContent>> = Vec::with_capacity(rows.len());
+        let compaction = self.compaction_store().refresh_session(&self.session_id, &rows)?;
+        let project_memory = self.compaction_store().refresh_project_memory(&self.session_id)?;
+        let memory_recall = match recall_query {
+            Some(query) => self.compaction_store().recall_memory(&self.session_id, query)?,
+            None => None,
+        };
+        let recent_rows = if let Some(summary) = &compaction {
+            &rows[summary.compaction.covered_message_count..]
+        } else {
+            rows.as_slice()
+        };
 
-        for row in &rows {
+        let mut all_parts: Vec<Vec<MessageContent>> = Vec::with_capacity(recent_rows.len());
+
+        for row in recent_rows {
             let content: Vec<MessageContent> = serde_json::from_str(&row.parts)?;
             all_parts.push(content);
         }
@@ -1782,11 +1922,51 @@ impl SessionEngine {
         }
 
         // Reassemble into messages
-        let messages: Vec<Message> = rows
-            .iter()
-            .zip(all_parts)
-            .map(|(row, content)| Message { role: row.role.clone(), content })
-            .collect();
+        let mut messages = Vec::with_capacity(
+            all_parts.len()
+                + usize::from(compaction.is_some())
+                + usize::from(project_memory.is_some())
+                + usize::from(memory_recall.is_some()),
+        );
+        if let Some(summary) = project_memory {
+            if summary.refreshed {
+                self.state.bus.send(BusEvent::ProjectMemoryUpdated {
+                    session_id: self.session_id.clone(),
+                    source_sessions: summary.summary.source_sessions,
+                    referenced_files: summary.summary.summary.referenced_files.len(),
+                });
+            }
+            messages.push(Message {
+                role: "assistant".into(),
+                content: vec![MessageContent::ProjectMemory { summary: summary.summary }],
+            });
+        }
+        if let Some(summary) = memory_recall {
+            messages.push(Message {
+                role: "assistant".into(),
+                content: vec![MessageContent::MemoryRecall { summary }],
+            });
+        }
+        if let Some(summary) = compaction {
+            if summary.refreshed {
+                self.state.bus.send(BusEvent::CompactionUpdated {
+                    session_id: self.session_id.clone(),
+                    covered_message_count: summary.compaction.covered_message_count,
+                    recent_message_count: recent_rows.len(),
+                    referenced_files: summary.compaction.summary.referenced_files.len(),
+                });
+            }
+            messages.push(Message {
+                role: "assistant".into(),
+                content: vec![MessageContent::Compaction { summary: summary.compaction.summary }],
+            });
+        }
+        messages.extend(
+            recent_rows
+                .iter()
+                .zip(all_parts)
+                .map(|(row, content)| Message { role: row.role.clone(), content }),
+        );
 
         Ok(messages)
     }
@@ -1922,19 +2102,26 @@ impl SessionEngine {
     /// involve user interaction.
     ///
     /// Checks the cancellation token before each execution phase.
-    async fn execute_tool_calls(&self, tool_calls: &[ToolCall]) -> Vec<ToolResult> {
+    async fn execute_tool_calls(
+        &self,
+        tool_calls: &[ToolCall],
+    ) -> (Vec<ToolResult>, Vec<crate::snapshot::FileDiff>) {
         if self.cancel_token.is_cancelled() {
-            return tool_calls
-                .iter()
-                .map(|tc| ToolResult {
-                    tool_call_id: tc.id.clone(),
-                    content: "Cancelled by user.".into(),
-                    is_error: true,
-                })
-                .collect();
+            return (
+                tool_calls
+                    .iter()
+                    .map(|tc| ToolResult {
+                        tool_call_id: tc.id.clone(),
+                        content: "Cancelled by user.".into(),
+                        is_error: true,
+                    })
+                    .collect(),
+                Vec::new(),
+            );
         }
 
         let ctx = self.state.tool_context(&self.session_id, self.cancel_token.clone());
+        let mut captured_diffs = Vec::new();
 
         // Phase 1: Pre-validate all tool calls (sequential — permission prompts).
         let mut pre_results: Vec<Option<ToolResult>> = vec![None; tool_calls.len()];
@@ -2073,13 +2260,15 @@ impl SessionEngine {
             }
 
             let tc = &tool_calls[i];
+            let before_state =
+                capture_tool_file_state(&self.state.project_root, &tc.name, &args).await;
             self.state.bus.send(BusEvent::ToolCallStarted {
                 session_id: self.session_id.clone(),
                 tool_name: tc.name.clone(),
                 tool_call_id: tc.id.clone(),
             });
 
-            let result = execute_single_tool(&*tool, args, &ctx, &tc.id, &tc.name).await;
+            let result = execute_single_tool(&*tool, args.clone(), &ctx, &tc.id, &tc.name).await;
 
             self.state.bus.send(BusEvent::ToolCallCompleted {
                 session_id: self.session_id.clone(),
@@ -2087,6 +2276,15 @@ impl SessionEngine {
                 tool_call_id: tc.id.clone(),
                 is_error: result.is_error,
             });
+
+            if !result.is_error {
+                if let Some(diff) =
+                    capture_tool_file_diff(&self.state.project_root, &tc.name, &args, before_state)
+                        .await
+                {
+                    captured_diffs.push(diff);
+                }
+            }
 
             pre_results[i] = Some(truncate_result(result));
         }
@@ -2102,17 +2300,20 @@ impl SessionEngine {
         )
         .await;
 
-        pre_results
-            .into_iter()
-            .enumerate()
-            .map(|(i, r)| {
-                r.unwrap_or_else(|| ToolResult {
-                    tool_call_id: tool_calls[i].id.clone(),
-                    content: "Internal error: tool result not populated".into(),
-                    is_error: true,
+        (
+            pre_results
+                .into_iter()
+                .enumerate()
+                .map(|(i, r)| {
+                    r.unwrap_or_else(|| ToolResult {
+                        tool_call_id: tool_calls[i].id.clone(),
+                        content: "Internal error: tool result not populated".into(),
+                        is_error: true,
+                    })
                 })
-            })
-            .collect()
+                .collect(),
+            captured_diffs,
+        )
     }
 }
 
@@ -2198,6 +2399,43 @@ fn build_plan_step_prompt(plan: &ExecutionPlan, step: &crate::plan::PlanStep) ->
         prerequisites = prerequisite_text,
         files = affected_files,
     )
+}
+
+fn prepare_plan_for_execution(
+    store: &PlanStore,
+    current: &ExecutionPlan,
+) -> Result<(ExecutionPlan, usize), crate::plan::PlanError> {
+    let mut updated = current.clone();
+    let mut resumed_steps = 0usize;
+    let mut changed = false;
+
+    if matches!(updated.status, PlanStatus::Failed | PlanStatus::Cancelled | PlanStatus::Executing)
+    {
+        updated.status = PlanStatus::Approved;
+        changed = true;
+    }
+
+    for step in &mut updated.steps {
+        if matches!(
+            step.status,
+            StepStatus::Running
+                | StepStatus::Failed(_)
+                | StepStatus::Skipped
+                | StepStatus::RolledBack
+        ) {
+            step.status = StepStatus::Pending;
+            step.checkpoint = None;
+            resumed_steps += 1;
+            changed = true;
+        }
+    }
+
+    if changed {
+        updated.updated_at = Utc::now();
+        store.save_plan(&updated)?;
+    }
+
+    Ok((updated, resumed_steps))
 }
 
 async fn rollback_plan_step(
@@ -2685,6 +2923,18 @@ fn estimate_message_tokens(messages: &[Message], system: &str, counter: &TokenCo
                 MessageContent::Text { text } => {
                     total += counter.count(text) as u64;
                 }
+                MessageContent::Compaction { summary } => {
+                    total += counter.count(&summary.render_for_prompt()) as u64;
+                }
+                MessageContent::ProjectMemory { summary } => {
+                    total += counter.count(&summary.render_for_prompt()) as u64;
+                }
+                MessageContent::MemoryRecall { summary } => {
+                    total += counter.count(&summary.render_for_prompt()) as u64;
+                }
+                MessageContent::Step { step } => {
+                    total += counter.count(&step.render_for_prompt()) as u64;
+                }
                 MessageContent::Thinking { thinking } => {
                     total += counter.count(thinking) as u64;
                 }
@@ -2700,6 +2950,128 @@ fn estimate_message_tokens(messages: &[Message], system: &str, counter: &TokenCo
     }
 
     total
+}
+
+async fn apply_file_diffs_before(
+    project_root: &std::path::Path,
+    diffs: &[crate::snapshot::FileDiff],
+) -> anyhow::Result<()> {
+    apply_file_diffs(project_root, diffs, true).await
+}
+
+async fn apply_file_diffs_after(
+    project_root: &std::path::Path,
+    diffs: &[crate::snapshot::FileDiff],
+) -> anyhow::Result<()> {
+    apply_file_diffs(project_root, diffs, false).await
+}
+
+async fn apply_file_diffs(
+    project_root: &std::path::Path,
+    diffs: &[crate::snapshot::FileDiff],
+    use_before: bool,
+) -> anyhow::Result<()> {
+    for diff in diffs {
+        let path = project_root.join(&diff.file);
+        let content = if use_before { &diff.before } else { &diff.after };
+        let status = if use_before { diff.status } else { redo_diff_status(diff.status) };
+
+        match status {
+            crate::snapshot::DiffStatus::Added => {
+                if let Err(error) = tokio::fs::remove_file(&path).await {
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        return Err(error.into());
+                    }
+                }
+            }
+            crate::snapshot::DiffStatus::Deleted | crate::snapshot::DiffStatus::Modified => {
+                if let Some(parent) = path.parent() {
+                    tokio::fs::create_dir_all(parent).await?;
+                }
+                tokio::fs::write(&path, content).await?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn capture_tool_file_diff(
+    project_root: &std::path::Path,
+    tool_name: &str,
+    args: &serde_json::Value,
+    before_state: Option<String>,
+) -> Option<crate::snapshot::FileDiff> {
+    let path = tool_target_path(project_root, tool_name, args)?;
+    let after_state = tokio::fs::read_to_string(&path).await.ok();
+
+    match (before_state, after_state) {
+        (None, None) => None,
+        (Some(before), Some(after)) if before == after => None,
+        (None, Some(after)) => Some(crate::snapshot::FileDiff {
+            file: relative_tool_path(project_root, &path),
+            before: String::new(),
+            after,
+            additions: 0,
+            deletions: 0,
+            status: crate::snapshot::DiffStatus::Added,
+        }),
+        (Some(before), None) => Some(crate::snapshot::FileDiff {
+            file: relative_tool_path(project_root, &path),
+            before,
+            after: String::new(),
+            additions: 0,
+            deletions: 0,
+            status: crate::snapshot::DiffStatus::Deleted,
+        }),
+        (Some(before), Some(after)) => Some(crate::snapshot::FileDiff {
+            file: relative_tool_path(project_root, &path),
+            before,
+            after,
+            additions: 0,
+            deletions: 0,
+            status: crate::snapshot::DiffStatus::Modified,
+        }),
+    }
+}
+
+async fn capture_tool_file_state(
+    project_root: &std::path::Path,
+    tool_name: &str,
+    args: &serde_json::Value,
+) -> Option<String> {
+    let path = tool_target_path(project_root, tool_name, args)?;
+    tokio::fs::read_to_string(path).await.ok()
+}
+
+fn tool_target_path(
+    project_root: &std::path::Path,
+    tool_name: &str,
+    args: &serde_json::Value,
+) -> Option<std::path::PathBuf> {
+    if !matches!(tool_name, "write" | "edit" | "fast_apply") {
+        return None;
+    }
+
+    let raw_path = args.get("file_path")?.as_str()?;
+    let path = std::path::PathBuf::from(raw_path);
+    if path.is_absolute() {
+        Some(path)
+    } else {
+        Some(project_root.join(path))
+    }
+}
+
+fn relative_tool_path(project_root: &std::path::Path, path: &std::path::Path) -> String {
+    path.strip_prefix(project_root).unwrap_or(path).to_string_lossy().replace('\\', "/")
+}
+
+fn redo_diff_status(status: crate::snapshot::DiffStatus) -> crate::snapshot::DiffStatus {
+    match status {
+        crate::snapshot::DiffStatus::Added => crate::snapshot::DiffStatus::Deleted,
+        crate::snapshot::DiffStatus::Deleted => crate::snapshot::DiffStatus::Added,
+        crate::snapshot::DiffStatus::Modified => crate::snapshot::DiffStatus::Modified,
+    }
 }
 
 /// Validate tool arguments against a JSON schema.
@@ -2826,7 +3198,7 @@ mod tests {
             provider_registry,
             tools,
             Bus::new(64),
-            PermissionManager::auto_approve(),
+            Arc::new(PermissionManager::auto_approve()),
             CostTracker::new(session_model),
             PlanMode::new(),
             project_root,
@@ -2989,6 +3361,265 @@ edition = "2021"
     }
 
     #[tokio::test]
+    async fn execute_plan_resumes_interrupted_running_step() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let provider = Arc::new(MockProvider::new());
+        provider.push_turn(MockTurn::Text("implemented resumed step".into()));
+
+        let mut engine = test_engine_with_tools(&temp_dir, &provider, ToolRegistry::new());
+        let store = engine.plan_store();
+        let created = store
+            .create_plan(NewExecutionPlan {
+                session_id: engine.session_id().to_string(),
+                title: "Resume plan".to_string(),
+                description: "Resume an interrupted plan".to_string(),
+                steps: vec![
+                    NewPlanStep {
+                        id: Some("step-1".to_string()),
+                        title: "Done".to_string(),
+                        description: "Already complete".to_string(),
+                        affected_files: Vec::new(),
+                        agent_type: "build".to_string(),
+                        estimated_tokens: None,
+                    },
+                    NewPlanStep {
+                        id: Some("step-2".to_string()),
+                        title: "Resume me".to_string(),
+                        description: "Was running before interruption".to_string(),
+                        affected_files: Vec::new(),
+                        agent_type: "build".to_string(),
+                        estimated_tokens: None,
+                    },
+                ],
+                dependencies: vec![Dependency {
+                    prerequisite: "step-1".to_string(),
+                    dependent: "step-2".to_string(),
+                }],
+            })
+            .expect("create plan");
+
+        let mut interrupted = store.load_plan(&created.id).expect("load plan");
+        interrupted.status = PlanStatus::Executing;
+        interrupted.steps[0].status = StepStatus::Completed;
+        interrupted.steps[1].status = StepStatus::Running;
+        store.save_plan(&interrupted).expect("save interrupted plan");
+
+        let result = engine.execute_plan(Some(&created.id)).await.expect("resume plan");
+        let loaded = store.load_plan(&created.id).expect("reload");
+
+        assert!(result.contains("Plan resumed and executed successfully."));
+        assert!(matches!(loaded.status, PlanStatus::Completed));
+        assert!(matches!(loaded.steps[0].status, StepStatus::Completed));
+        assert!(matches!(loaded.steps[1].status, StepStatus::Completed));
+    }
+
+    #[tokio::test]
+    async fn execute_plan_resets_failed_and_skipped_steps_before_resuming() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let provider = Arc::new(MockProvider::new());
+        provider.push_turn(MockTurn::Text("reimplemented failed step".into()));
+        provider.push_turn(MockTurn::Text("continued skipped step".into()));
+
+        let mut engine = test_engine_with_tools(&temp_dir, &provider, ToolRegistry::new());
+        let store = engine.plan_store();
+        let created = store
+            .create_plan(NewExecutionPlan {
+                session_id: engine.session_id().to_string(),
+                title: "Retry failed plan".to_string(),
+                description: "Retry the failed work".to_string(),
+                steps: vec![
+                    NewPlanStep {
+                        id: Some("step-1".to_string()),
+                        title: "Retry".to_string(),
+                        description: "Failed earlier".to_string(),
+                        affected_files: Vec::new(),
+                        agent_type: "build".to_string(),
+                        estimated_tokens: None,
+                    },
+                    NewPlanStep {
+                        id: Some("step-2".to_string()),
+                        title: "Unblocked".to_string(),
+                        description: "Was skipped because step 1 failed".to_string(),
+                        affected_files: Vec::new(),
+                        agent_type: "build".to_string(),
+                        estimated_tokens: None,
+                    },
+                ],
+                dependencies: vec![Dependency {
+                    prerequisite: "step-1".to_string(),
+                    dependent: "step-2".to_string(),
+                }],
+            })
+            .expect("create plan");
+
+        let mut failed = store.load_plan(&created.id).expect("load plan");
+        failed.status = PlanStatus::Failed;
+        failed.steps[0].status = StepStatus::Failed("previous failure".to_string());
+        failed.steps[1].status = StepStatus::Skipped;
+        store.save_plan(&failed).expect("save failed plan");
+
+        let result = engine.execute_plan(Some(&created.id)).await.expect("resume failed plan");
+        let loaded = store.load_plan(&created.id).expect("reload");
+
+        assert!(result.contains("Plan resumed and executed successfully."));
+        assert!(matches!(loaded.status, PlanStatus::Completed));
+        assert!(loaded.steps.iter().all(|step| matches!(step.status, StepStatus::Completed)));
+    }
+
+    #[tokio::test]
+    async fn assemble_messages_injects_structured_compaction_before_recent_history() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let provider = Arc::new(MockProvider::new());
+        let engine = test_engine_with_tools(&temp_dir, &provider, ToolRegistry::new());
+        let mut bus_rx = engine.state.bus.subscribe();
+
+        for idx in 0..12 {
+            let role = if idx % 2 == 0 { "user" } else { "assistant" };
+            let parts = serde_json::to_string(&vec![MessageContent::Text {
+                text: format!("message {idx} touching src/lib.rs"),
+            }])
+            .expect("parts");
+            engine
+                .state
+                .db
+                .insert_message(&format!("msg-{idx}"), engine.session_id(), role, &parts)
+                .expect("insert message");
+        }
+
+        let messages = engine.assemble_messages_with_query(None).expect("assemble messages");
+
+        assert_eq!(messages.len(), 9);
+        assert!(matches!(
+            messages.first().and_then(|msg| msg.content.first()),
+            Some(MessageContent::Compaction { summary })
+                if summary.goal.contains("message 0")
+                    && summary.referenced_files.contains(&"src/lib.rs".to_string())
+        ));
+        assert!(matches!(
+            messages.last().and_then(|msg| msg.content.first()),
+            Some(MessageContent::Text { text }) if text.contains("message 11")
+        ));
+        assert!(matches!(
+            bus_rx.try_recv().expect("compaction event emitted"),
+            BusEvent::CompactionUpdated {
+                covered_message_count: 4,
+                recent_message_count: 8,
+                referenced_files: 1,
+                ..
+            }
+        ));
+        assert!(bus_rx.try_recv().is_err());
+
+        let _ = engine.assemble_messages_with_query(None).expect("assemble messages again");
+        assert!(bus_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn assemble_messages_injects_project_memory_from_other_sessions() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let provider = Arc::new(MockProvider::new());
+        let engine = test_engine_with_tools(&temp_dir, &provider, ToolRegistry::new());
+        let mut bus_rx = engine.state.bus.subscribe();
+
+        engine
+            .compaction_store()
+            .save_session(&crate::compaction::SessionCompaction {
+                session_id: "other-session".to_string(),
+                covered_message_count: 6,
+                covered_through_message_id: "msg-5".to_string(),
+                summary: crate::provider::CompactionSummary {
+                    goal: "Prior work".to_string(),
+                    progress: vec!["Implemented planner".to_string()],
+                    todos: vec!["Add resume handling".to_string()],
+                    constraints: vec!["Do not break history rendering".to_string()],
+                    referenced_files: vec!["src/plan.rs".to_string()],
+                },
+                generated_at: chrono::Utc::now(),
+            })
+            .expect("save prior session compaction");
+
+        for idx in 0..12 {
+            let role = if idx % 2 == 0 { "user" } else { "assistant" };
+            let parts = serde_json::to_string(&vec![MessageContent::Text {
+                text: format!("message {idx} touching src/lib.rs"),
+            }])
+            .expect("parts");
+            engine
+                .state
+                .db
+                .insert_message(&format!("msg-{idx}"), engine.session_id(), role, &parts)
+                .expect("insert message");
+        }
+
+        let messages = engine.assemble_messages_with_query(None).expect("assemble messages");
+
+        assert!(matches!(
+            messages.first().and_then(|msg| msg.content.first()),
+            Some(MessageContent::ProjectMemory { summary })
+                if summary.source_sessions == 1
+                    && summary.summary.progress.contains(&"Implemented planner".to_string())
+                    && summary.summary.referenced_files.contains(&"src/plan.rs".to_string())
+        ));
+        assert!(matches!(
+            messages.get(1).and_then(|msg| msg.content.first()),
+            Some(MessageContent::Compaction { .. })
+        ));
+        assert!(matches!(
+            bus_rx.try_recv().expect("project memory event emitted"),
+            BusEvent::ProjectMemoryUpdated { source_sessions: 1, referenced_files: 1, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn assemble_messages_with_query_injects_targeted_memory_recall() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let provider = Arc::new(MockProvider::new());
+        let engine = test_engine_with_tools(&temp_dir, &provider, ToolRegistry::new());
+
+        engine
+            .compaction_store()
+            .save_session(&crate::compaction::SessionCompaction {
+                session_id: "parser-session".to_string(),
+                covered_message_count: 6,
+                covered_through_message_id: "msg-5".to_string(),
+                summary: crate::provider::CompactionSummary {
+                    goal: "Parser cleanup".to_string(),
+                    progress: vec!["Added parser state machine".to_string()],
+                    todos: vec!["Finish parser tests".to_string()],
+                    constraints: vec!["Do not break lexer".to_string()],
+                    referenced_files: vec!["src/parser.rs".to_string()],
+                },
+                generated_at: chrono::Utc::now(),
+            })
+            .expect("save parser session compaction");
+
+        for idx in 0..12 {
+            let role = if idx % 2 == 0 { "user" } else { "assistant" };
+            let parts = serde_json::to_string(&vec![MessageContent::Text {
+                text: format!("message {idx} touching src/lib.rs"),
+            }])
+            .expect("parts");
+            engine
+                .state
+                .db
+                .insert_message(&format!("msg-{idx}"), engine.session_id(), role, &parts)
+                .expect("insert message");
+        }
+
+        let messages = engine
+            .assemble_messages_with_query(Some("finish parser tests in src/parser.rs"))
+            .expect("assemble messages");
+
+        assert!(matches!(
+            messages.get(1).and_then(|msg| msg.content.first()),
+            Some(MessageContent::MemoryRecall { summary })
+                if summary.matched_sessions == 1
+                    && summary.summary.todos.contains(&"Finish parser tests".to_string())
+                    && summary.summary.referenced_files.contains(&"src/parser.rs".to_string())
+        ));
+    }
+
+    #[tokio::test]
     async fn automatic_verification_runs_after_write_tool_success() {
         let temp_dir = TempDir::new().expect("temp dir");
         write_rust_fixture(&temp_dir);
@@ -3055,6 +3686,37 @@ edition = "2021"
     }
 
     #[tokio::test]
+    async fn complex_turn_persists_routing_step_metadata() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let provider = Arc::new(MockProvider::new());
+        provider.push_turn(MockTurn::Text("done".into()));
+
+        let mut engine = test_engine_with_provider_model(
+            &temp_dir,
+            &provider,
+            ToolRegistry::new(),
+            "openai",
+            "openai/gpt-5.4",
+            "openai/gpt-5.4-mini",
+        );
+        let complex_prompt =
+            "Review this architecture plan and migration spec for a multi-agent router refactor. "
+                .repeat(90);
+        engine.send_message(&complex_prompt).await.expect("send message succeeds");
+
+        let rows = engine.state.db.list_messages(engine.session_id()).expect("list messages");
+        let assistant = rows.last().expect("assistant message");
+        let parts: Vec<MessageContent> = serde_json::from_str(&assistant.parts).expect("parts");
+
+        assert!(parts.iter().any(|part| matches!(
+            part,
+            MessageContent::Step { step }
+                if step.kind == crate::provider::StepKind::Routing
+                    && step.summary.contains("openai/gpt-5.4-mini -> openai/gpt-5.4")
+        )));
+    }
+
+    #[tokio::test]
     async fn automatic_verification_feedback_allows_single_self_fix_round() {
         let temp_dir = TempDir::new().expect("temp dir");
         write_rust_fixture(&temp_dir);
@@ -3090,6 +3752,44 @@ edition = "2021"
             std::fs::read_to_string(temp_dir.path().join("src/lib.rs")).expect("read final file"),
             "pub fn value() -> usize {\n    2\n}\n"
         );
+    }
+
+    #[tokio::test]
+    async fn automatic_verification_persists_step_metadata() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        write_rust_fixture(&temp_dir);
+
+        let provider = Arc::new(MockProvider::new());
+        provider.push_turn(MockTurn::ToolCalls(vec![MockToolCall {
+            name: "write".into(),
+            arguments: serde_json::json!({
+                "file_path": "src/lib.rs",
+                "content": "pub fn value() -> usize {\n    2\n}\n"
+            }),
+        }]));
+        provider.push_turn(MockTurn::Text("done".into()));
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(WriteTool));
+
+        let mut engine = test_engine_with_tools(&temp_dir, &provider, tools);
+        engine.send_message("update value").await.expect("send message succeeds");
+
+        let rows = engine.state.db.list_messages(engine.session_id()).expect("list messages");
+        let verification_row = rows
+            .iter()
+            .find(|row| row.role == "user" && row.parts.contains("\"type\":\"tool_result\""))
+            .expect("verification result row");
+        let parts: Vec<MessageContent> =
+            serde_json::from_str(&verification_row.parts).expect("parse verification parts");
+
+        assert!(parts.iter().any(|part| matches!(
+            part,
+            MessageContent::Step { step }
+                if step.kind == crate::provider::StepKind::Verification
+                    && step.status == crate::provider::StepStatus::Succeeded
+                    && step.summary.contains("Automatic verification passed")
+        )));
     }
 
     #[tokio::test]

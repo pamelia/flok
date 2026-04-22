@@ -12,6 +12,7 @@ mod glob_tool;
 mod grep;
 mod lsp;
 mod memory;
+mod path_security;
 mod plan;
 mod plan_tools;
 mod question;
@@ -19,6 +20,7 @@ mod read;
 mod registry;
 mod review_tool;
 mod skill;
+mod smart_grep;
 mod task;
 mod team_tools;
 mod todowrite;
@@ -39,6 +41,7 @@ pub use read::ReadTool;
 pub use registry::ToolRegistry;
 pub use review_tool::CodeReviewTool;
 pub use skill::SkillTool;
+pub use smart_grep::SmartGrepTool;
 pub use task::TaskTool;
 pub use team_tools::{SendMessageTool, TeamCreateTool, TeamDeleteTool, TeamTaskTool};
 pub use todowrite::{TodoItem, TodoList, TodoWriteTool};
@@ -112,7 +115,7 @@ pub struct PermissionManager {
     /// Default permission rules (hardcoded sensible defaults).
     default_rules: Vec<PermissionRule>,
     /// Config-provided rules (from `flok.toml`).
-    config_rules: Vec<PermissionRule>,
+    config_rules: std::sync::RwLock<Vec<PermissionRule>>,
     /// Session-level rules from user "Always Allow" decisions.
     session_rules: Mutex<Vec<PermissionRule>>,
     /// Channel to send permission requests to the TUI.
@@ -133,7 +136,7 @@ impl PermissionManager {
         let (rule_added_tx, rule_added_rx) = std::sync::mpsc::channel();
         Self {
             default_rules: defaults::default_rules(),
-            config_rules: Vec::new(),
+            config_rules: std::sync::RwLock::new(Vec::new()),
             session_rules: Mutex::new(Vec::new()),
             request_tx: Some(request_tx),
             rule_added_tx,
@@ -146,7 +149,7 @@ impl PermissionManager {
         let (rule_added_tx, rule_added_rx) = std::sync::mpsc::channel();
         Self {
             default_rules: defaults::default_rules(),
-            config_rules: Vec::new(),
+            config_rules: std::sync::RwLock::new(Vec::new()),
             session_rules: Mutex::new(Vec::new()),
             request_tx: None,
             rule_added_tx,
@@ -155,8 +158,10 @@ impl PermissionManager {
     }
 
     /// Set config-provided permission rules (from `flok.toml`).
-    pub fn set_config_rules(&mut self, rules: Vec<PermissionRule>) {
-        self.config_rules = rules;
+    pub fn set_config_rules(&self, rules: Vec<PermissionRule>) {
+        let mut config =
+            self.config_rules.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        *config = rules;
     }
 
     /// Load previously persisted session rules (e.g., from database).
@@ -198,9 +203,11 @@ impl PermissionManager {
 
         // Evaluate against all rulesets
         let action = {
+            let config =
+                self.config_rules.read().unwrap_or_else(std::sync::PoisonError::into_inner);
             let session =
                 self.session_rules.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            evaluate(permission, pattern, &[&self.default_rules, &self.config_rules, &session])
+            evaluate(permission, pattern, &[&self.default_rules, &*config, &session])
         };
 
         tracing::debug!(

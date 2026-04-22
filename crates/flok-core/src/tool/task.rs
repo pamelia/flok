@@ -13,7 +13,7 @@ use crate::agent;
 use crate::bus::BusEvent;
 use crate::config::{AgentConfig, WorktreeConfig};
 use crate::provider::{
-    CompletionRequest, Message, MessageContent, ModelRegistry, ProviderRegistry,
+    CompletionRequest, Message, MessageContent, ModelRegistry, ProviderRegistry, ReasoningEffort,
 };
 use crate::team::{TeamMessage, TeamRegistry};
 use crate::worktree::WorktreeManager;
@@ -35,6 +35,8 @@ pub struct TaskTool {
     default_provider: String,
     /// Model ID inherited from the caller when `model` is omitted.
     default_model_id: String,
+    /// Reasoning effort inherited from config when no override is provided.
+    default_reasoning_effort: Option<ReasoningEffort>,
     /// Per-built-in-agent routing and prompt overrides.
     agents_config: Arc<HashMap<String, AgentConfig>>,
     /// Tool registry (sub-agents get a filtered set — no task tool to prevent recursion).
@@ -58,6 +60,7 @@ impl TaskTool {
         provider_registry: Arc<ProviderRegistry>,
         default_provider: String,
         default_model_id: String,
+        default_reasoning_effort: Option<ReasoningEffort>,
         agents_config: HashMap<String, AgentConfig>,
         tools: Arc<crate::tool::ToolRegistry>,
         bus: crate::bus::Bus,
@@ -72,6 +75,7 @@ impl TaskTool {
             provider_registry,
             default_provider,
             default_model_id,
+            default_reasoning_effort,
             agents_config,
             tools,
             bus,
@@ -134,7 +138,12 @@ impl Tool for TaskTool {
                 },
                 "model": {
                     "type": "string",
-                    "description": "Optional model alias or full ID (e.g., 'opus', 'gpt-5.4', 'anthropic/claude-opus-4-7'). If omitted, the sub-agent uses the caller's current provider/model. Use this for cross-coverage multi-model review: spawn the same specialist once per configured provider."
+                    "description": "Optional model alias or full ID (e.g., 'opus', 'gpt-5.4', 'anthropic/claude-opus-4-7'). If omitted, the sub-agent uses its configured built-in agent model when available, otherwise the caller's current provider/model. Use this for one-off overrides."
+                },
+                "reasoning_effort": {
+                    "type": "string",
+                    "enum": ["none", "minimal", "low", "medium", "high", "xhigh"],
+                    "description": "Optional one-off reasoning depth override for models that support it. If omitted, the sub-agent uses its configured built-in agent reasoning effort when available, otherwise the caller/default config."
                 },
                 "background": {
                     "type": "boolean",
@@ -161,6 +170,7 @@ impl Tool for TaskTool {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("missing required parameter: subagent_type"))?;
         let requested_model = args.get("model").and_then(serde_json::Value::as_str);
+        let requested_reasoning_effort = parse_reasoning_effort_arg(args.get("reasoning_effort"))?;
 
         // Look up the agent definition
         let agent_def = agent::get_subagent(agent_type).ok_or_else(|| {
@@ -173,7 +183,8 @@ impl Tool for TaskTool {
 
         tracing::info!(agent = agent_type, description, background, "spawning sub-agent task");
 
-        let target = self.resolve_target(agent_type, requested_model)?;
+        let target =
+            self.resolve_target(agent_type, requested_model, requested_reasoning_effort)?;
 
         // Background mode: spawn the agent and return immediately
         if background {
@@ -292,6 +303,7 @@ impl Tool for TaskTool {
 struct SubagentTarget {
     provider_name: String,
     model_id: String,
+    reasoning_effort: Option<ReasoningEffort>,
     fallback_chain: Option<Vec<(String, String)>>,
 }
 
@@ -300,12 +312,16 @@ impl TaskTool {
         &self,
         agent_type: &str,
         requested_model: Option<&str>,
+        requested_reasoning_effort: Option<ReasoningEffort>,
     ) -> anyhow::Result<SubagentTarget> {
         let agent_model = self.agent_config(agent_type).and_then(|config| config.model.as_deref());
         let model_id = requested_model
             .map(ModelRegistry::resolve)
             .or_else(|| agent_model.map(ModelRegistry::resolve))
             .unwrap_or_else(|| self.default_model_id.clone());
+        let reasoning_effort = requested_reasoning_effort
+            .or_else(|| self.agent_config(agent_type).and_then(|config| config.reasoning_effort))
+            .or(self.default_reasoning_effort);
         let provider_name = if requested_model.is_some() || agent_model.is_some() {
             ModelRegistry::provider_name(&model_id).to_string()
         } else {
@@ -323,7 +339,7 @@ impl TaskTool {
                 .transpose()?
         };
 
-        Ok(SubagentTarget { provider_name, model_id, fallback_chain })
+        Ok(SubagentTarget { provider_name, model_id, reasoning_effort, fallback_chain })
     }
 
     fn agent_config(&self, agent_type: &str) -> Option<&AgentConfig> {
@@ -574,6 +590,7 @@ impl TaskTool {
 
             let request = CompletionRequest {
                 model: target.model_id.clone(),
+                reasoning_effort: target.reasoning_effort,
                 system: system.clone(),
                 messages: messages.clone(),
                 tools: filtered_tools.clone(),
@@ -650,6 +667,20 @@ struct SubToolCall {
     arguments: String,
 }
 
+fn parse_reasoning_effort_arg(
+    value: Option<&serde_json::Value>,
+) -> anyhow::Result<Option<ReasoningEffort>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let effort: ReasoningEffort = serde_json::from_value(value.clone()).map_err(|_| {
+        anyhow::anyhow!(
+            "invalid reasoning_effort: expected one of none, minimal, low, medium, high, xhigh"
+        )
+    })?;
+    Ok(Some(effort))
+}
+
 /// Stream a completion with runtime provider fallback for sub-agents.
 async fn stream_with_retry(
     provider_registry: &ProviderRegistry,
@@ -719,6 +750,7 @@ async fn run_subagent_standalone(
 
         let request = CompletionRequest {
             model: target.model_id.clone(),
+            reasoning_effort: target.reasoning_effort,
             system: system.to_string(),
             messages: messages.clone(),
             tools: filtered_tools.clone(),
@@ -844,6 +876,7 @@ mod tests {
             provider_registry,
             default_provider,
             default_model_id,
+            None,
             HashMap::new(),
         )
     }
@@ -852,6 +885,7 @@ mod tests {
         provider_registry: Arc<ProviderRegistry>,
         default_provider: &str,
         default_model_id: &str,
+        default_reasoning_effort: Option<ReasoningEffort>,
         agents_config: HashMap<String, AgentConfig>,
     ) -> TaskTool {
         let project_root = std::env::temp_dir();
@@ -859,6 +893,7 @@ mod tests {
             provider_registry,
             default_provider.to_string(),
             default_model_id.to_string(),
+            default_reasoning_effort,
             agents_config,
             Arc::new(crate::tool::ToolRegistry::new()),
             Bus::new(16),
@@ -890,6 +925,7 @@ mod tests {
             Arc::new(registry),
             "anthropic",
             "anthropic/claude-sonnet-4-6",
+            None,
             [(
                 "general".to_string(),
                 AgentConfig { model: Some("haiku".to_string()), ..AgentConfig::default() },
@@ -898,10 +934,11 @@ mod tests {
             .collect(),
         );
 
-        let target = tool.resolve_target("general", Some("opus")).expect("target resolves");
+        let target = tool.resolve_target("general", Some("opus"), None).expect("target resolves");
 
         assert_eq!(target.model_id, "anthropic/claude-opus-4-6");
         assert_eq!(target.provider_name, "anthropic");
+        assert_eq!(target.reasoning_effort, None);
         assert!(target.fallback_chain.is_none());
     }
 
@@ -915,6 +952,7 @@ mod tests {
             Arc::new(registry),
             "anthropic",
             "anthropic/claude-sonnet-4-6",
+            None,
             [(
                 "general".to_string(),
                 AgentConfig { model: Some("haiku".to_string()), ..AgentConfig::default() },
@@ -923,7 +961,7 @@ mod tests {
             .collect(),
         );
 
-        let target = tool.resolve_target("general", None).expect("target resolves");
+        let target = tool.resolve_target("general", None, None).expect("target resolves");
 
         assert_eq!(target.model_id, "anthropic/claude-haiku-4-5-20251001");
         assert_eq!(target.provider_name, "anthropic");
@@ -936,10 +974,84 @@ mod tests {
         registry.insert("anthropic", provider, Some("anthropic/claude-sonnet-4-6".into()), 3);
 
         let tool = test_task_tool(Arc::new(registry), "anthropic", "anthropic/claude-sonnet-4-6");
-        let target = tool.resolve_target("general", None).expect("target resolves");
+        let target = tool.resolve_target("general", None, None).expect("target resolves");
 
         assert_eq!(target.model_id, "anthropic/claude-sonnet-4-6");
         assert_eq!(target.provider_name, "anthropic");
+    }
+
+    #[test]
+    fn effective_reasoning_effort_uses_task_param_when_provided() {
+        let provider: Arc<dyn Provider> = Arc::new(RecordingProvider::new("anthropic", "ok"));
+        let mut registry = ProviderRegistry::new();
+        registry.insert("anthropic", provider, Some("anthropic/claude-sonnet-4-6".into()), 3);
+
+        let tool = test_task_tool_with_agents(
+            Arc::new(registry),
+            "anthropic",
+            "anthropic/claude-sonnet-4-6",
+            Some(ReasoningEffort::Low),
+            [(
+                "general".to_string(),
+                AgentConfig {
+                    reasoning_effort: Some(ReasoningEffort::Medium),
+                    ..AgentConfig::default()
+                },
+            )]
+            .into_iter()
+            .collect(),
+        );
+
+        let target = tool
+            .resolve_target("general", None, Some(ReasoningEffort::High))
+            .expect("target resolves");
+
+        assert_eq!(target.reasoning_effort, Some(ReasoningEffort::High));
+    }
+
+    #[test]
+    fn effective_reasoning_effort_uses_agent_config_when_no_task_param() {
+        let provider: Arc<dyn Provider> = Arc::new(RecordingProvider::new("anthropic", "ok"));
+        let mut registry = ProviderRegistry::new();
+        registry.insert("anthropic", provider, Some("anthropic/claude-sonnet-4-6".into()), 3);
+
+        let tool = test_task_tool_with_agents(
+            Arc::new(registry),
+            "anthropic",
+            "anthropic/claude-sonnet-4-6",
+            Some(ReasoningEffort::Low),
+            [(
+                "general".to_string(),
+                AgentConfig {
+                    reasoning_effort: Some(ReasoningEffort::Medium),
+                    ..AgentConfig::default()
+                },
+            )]
+            .into_iter()
+            .collect(),
+        );
+
+        let target = tool.resolve_target("general", None, None).expect("target resolves");
+
+        assert_eq!(target.reasoning_effort, Some(ReasoningEffort::Medium));
+    }
+
+    #[test]
+    fn effective_reasoning_effort_uses_default_when_no_overrides() {
+        let provider: Arc<dyn Provider> = Arc::new(RecordingProvider::new("anthropic", "ok"));
+        let mut registry = ProviderRegistry::new();
+        registry.insert("anthropic", provider, Some("anthropic/claude-sonnet-4-6".into()), 3);
+
+        let tool = test_task_tool_with_agents(
+            Arc::new(registry),
+            "anthropic",
+            "anthropic/claude-sonnet-4-6",
+            Some(ReasoningEffort::High),
+            HashMap::new(),
+        );
+        let target = tool.resolve_target("general", None, None).expect("target resolves");
+
+        assert_eq!(target.reasoning_effort, Some(ReasoningEffort::High));
     }
 
     #[test]
@@ -953,6 +1065,7 @@ mod tests {
             Arc::new(registry),
             "anthropic",
             "anthropic/claude-sonnet-4-6",
+            None,
             [(
                 "explore".to_string(),
                 AgentConfig { prompt_append: Some(append.to_string()), ..AgentConfig::default() },
@@ -994,6 +1107,7 @@ mod tests {
             Arc::new(registry),
             "anthropic",
             "anthropic/claude-sonnet-4-6",
+            None,
             [(
                 "general".to_string(),
                 AgentConfig {
@@ -1005,7 +1119,7 @@ mod tests {
             .collect(),
         );
 
-        let target = tool.resolve_target("general", None).expect("target resolves");
+        let target = tool.resolve_target("general", None, None).expect("target resolves");
 
         assert_eq!(
             target.fallback_chain,
@@ -1028,6 +1142,7 @@ mod tests {
             Arc::new(registry),
             "anthropic",
             "anthropic/claude-sonnet-4-6",
+            None,
             [(
                 "general".to_string(),
                 AgentConfig {
@@ -1039,7 +1154,7 @@ mod tests {
             .collect(),
         );
 
-        let target = tool.resolve_target("general", Some("opus")).expect("target resolves");
+        let target = tool.resolve_target("general", Some("opus"), None).expect("target resolves");
 
         assert!(target.fallback_chain.is_none());
     }

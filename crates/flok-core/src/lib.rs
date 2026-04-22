@@ -8,6 +8,7 @@
 
 pub mod agent;
 pub mod bus;
+pub mod compaction;
 pub mod compress;
 pub mod config;
 pub mod lsp;

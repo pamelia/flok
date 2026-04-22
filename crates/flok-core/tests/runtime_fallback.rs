@@ -74,6 +74,7 @@ impl Provider for TextProvider {
 fn request(model: &str) -> CompletionRequest {
     CompletionRequest {
         model: model.to_string(),
+        reasoning_effort: None,
         system: String::new(),
         messages: Vec::new(),
         tools: Vec::new(),
@@ -254,6 +255,7 @@ async fn fallback_in_task_tool_sub_agent() {
         Arc::clone(&registry),
         "anthropic".to_string(),
         "anthropic/claude-sonnet-4-6".to_string(),
+        None,
         std::collections::HashMap::<String, AgentConfig>::new(),
         Arc::new(ToolRegistry::new()),
         Bus::new(16),

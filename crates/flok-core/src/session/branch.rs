@@ -148,6 +148,18 @@ async fn generate_branch_summary(
                 MessageContent::Text { text } => {
                     let _ = writeln!(conversation, "{text}");
                 }
+                MessageContent::Compaction { summary } => {
+                    let _ = writeln!(conversation, "{}", summary.render_for_prompt());
+                }
+                MessageContent::ProjectMemory { summary } => {
+                    let _ = writeln!(conversation, "{}", summary.render_for_prompt());
+                }
+                MessageContent::MemoryRecall { summary } => {
+                    let _ = writeln!(conversation, "{}", summary.render_for_prompt());
+                }
+                MessageContent::Step { step } => {
+                    let _ = writeln!(conversation, "{}", step.render_for_prompt());
+                }
                 MessageContent::Thinking { thinking } => {
                     let preview = &thinking[..thinking.len().min(200)];
                     let _ = writeln!(conversation, "(thinking: {preview}...)");
@@ -197,6 +209,7 @@ async fn generate_branch_summary(
 
     let request = CompletionRequest {
         model: model_id.to_string(),
+        reasoning_effort: None,
         system,
         messages: vec![Message {
             role: "user".into(),

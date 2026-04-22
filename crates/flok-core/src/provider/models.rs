@@ -190,29 +190,6 @@ impl ModelRegistry {
                 supports_tools: true,
                 supports_streaming: true,
             },
-            // DeepSeek
-            ModelInfo {
-                id: "deepseek/deepseek-chat",
-                provider: "deepseek",
-                display_name: "DeepSeek V3",
-                context_window: 128_000,
-                max_output_tokens: 8_192,
-                input_cost_per_m: 0.27,
-                output_cost_per_m: 1.10,
-                supports_tools: true,
-                supports_streaming: true,
-            },
-            ModelInfo {
-                id: "deepseek/deepseek-reasoner",
-                provider: "deepseek",
-                display_name: "DeepSeek R1",
-                context_window: 128_000,
-                max_output_tokens: 16_384,
-                input_cost_per_m: 0.55,
-                output_cost_per_m: 2.19,
-                supports_tools: true,
-                supports_streaming: true,
-            },
             // MiniMax (Token Plan — subscription-based, per-request not per-token)
             ModelInfo {
                 id: "minimax/MiniMax-M2.7",
@@ -298,8 +275,6 @@ impl ModelRegistry {
             "gpt-4.1-mini" | "gpt4.1-mini" | "4.1-mini" => "openai/gpt-4.1-mini",
             "flash" | "gemini-flash" | "gemini-2.5-flash" => "google/gemini-2.5-flash",
             "pro" | "gemini-pro" | "gemini-2.5-pro" => "google/gemini-2.5-pro",
-            "deepseek" | "deepseek-v3" | "deepseek-chat" => "deepseek/deepseek-chat",
-            "r1" | "deepseek-r1" | "deepseek-reasoner" => "deepseek/deepseek-reasoner",
             "minimax" | "minimax-m2.7" | "m2.7" => "minimax/MiniMax-M2.7",
             _ => input,
         };

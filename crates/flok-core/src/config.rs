@@ -9,7 +9,11 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::SystemTime;
 
+use arc_swap::ArcSwap;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize, Serializer};
 
@@ -23,6 +27,8 @@ pub struct FlokConfig {
     /// (for example `"sonnet"`, `"opus-4.7"`, `"gpt-5.4"`), or a fully
     /// qualified ID like `"anthropic/claude-opus-4-7"`.
     pub model: Option<String>,
+    /// Default reasoning effort to use when the provider supports it.
+    pub reasoning_effort: Option<crate::provider::ReasoningEffort>,
     /// Provider configurations keyed by provider name.
     pub provider: HashMap<String, ProviderConfig>,
     /// Per-built-in-agent routing and prompt overrides.
@@ -57,6 +63,61 @@ pub struct FlokConfig {
     pub intelligent_routing: IntelligentRoutingConfig,
     /// Tool output compression configuration.
     pub output_compression: OutputCompressionConfig,
+}
+
+/// Versioned runtime config snapshot used by long-lived sessions.
+#[derive(Debug, Clone)]
+pub struct ConfigSnapshot {
+    pub version: u64,
+    pub config: Arc<FlokConfig>,
+}
+
+/// Atomically swappable runtime config handle.
+#[derive(Debug, Clone)]
+pub struct LiveConfig {
+    current: Arc<ArcSwap<ConfigSnapshot>>,
+    next_version: Arc<AtomicU64>,
+}
+
+impl LiveConfig {
+    /// Create a new live config starting at version 1.
+    #[must_use]
+    pub fn new(config: FlokConfig) -> Self {
+        Self {
+            current: Arc::new(ArcSwap::from_pointee(ConfigSnapshot {
+                version: 1,
+                config: Arc::new(config),
+            })),
+            next_version: Arc::new(AtomicU64::new(2)),
+        }
+    }
+
+    /// Load the current versioned snapshot.
+    #[must_use]
+    pub fn snapshot(&self) -> Arc<ConfigSnapshot> {
+        self.current.load_full()
+    }
+
+    /// Load just the current config value.
+    #[must_use]
+    pub fn current(&self) -> Arc<FlokConfig> {
+        let snapshot = self.current.load_full();
+        Arc::clone(&snapshot.config)
+    }
+
+    /// Replace the current config and return the new version number.
+    pub fn store(&self, config: FlokConfig) -> u64 {
+        let version = self.next_version.fetch_add(1, Ordering::Relaxed);
+        self.current.store(Arc::new(ConfigSnapshot { version, config: Arc::new(config) }));
+        version
+    }
+}
+
+/// File state used by the config watcher to detect edits, creation, and deletion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigFileStamp {
+    pub exists: bool,
+    pub modified: Option<SystemTime>,
 }
 
 /// Tool output compression configuration.
@@ -105,6 +166,8 @@ impl Default for OutputCompressionConfig {
 pub struct AgentConfig {
     /// Preferred model for this built-in agent.
     pub model: Option<String>,
+    /// Preferred reasoning effort for this built-in agent.
+    pub reasoning_effort: Option<crate::provider::ReasoningEffort>,
     /// Ordered fallback model IDs or aliases that replace the provider chain.
     pub fallback_models: Vec<String>,
     /// Extra text appended to the built-in system prompt.
@@ -161,11 +224,21 @@ pub struct LspConfig {
     pub enabled: bool,
     pub request_timeout_ms: u64,
     pub rust: RustLspConfig,
+    pub javascript: JavascriptLspConfig,
+    pub python: PythonLspConfig,
+    pub go: GoLspConfig,
 }
 
 impl Default for LspConfig {
     fn default() -> Self {
-        Self { enabled: true, request_timeout_ms: 5_000, rust: RustLspConfig::default() }
+        Self {
+            enabled: true,
+            request_timeout_ms: 5_000,
+            rust: RustLspConfig::default(),
+            javascript: JavascriptLspConfig::default(),
+            python: PythonLspConfig::default(),
+            go: GoLspConfig::default(),
+        }
     }
 }
 
@@ -179,6 +252,48 @@ pub struct RustLspConfig {
 impl Default for RustLspConfig {
     fn default() -> Self {
         Self { command: "rust-analyzer".to_string(), args: Vec::new() }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct JavascriptLspConfig {
+    pub command: String,
+    pub args: Vec<String>,
+}
+
+impl Default for JavascriptLspConfig {
+    fn default() -> Self {
+        Self {
+            command: "typescript-language-server".to_string(),
+            args: vec!["--stdio".to_string()],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PythonLspConfig {
+    pub command: String,
+    pub args: Vec<String>,
+}
+
+impl Default for PythonLspConfig {
+    fn default() -> Self {
+        Self { command: "pyright-langserver".to_string(), args: vec!["--stdio".to_string()] }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GoLspConfig {
+    pub command: String,
+    pub args: Vec<String>,
+}
+
+impl Default for GoLspConfig {
+    fn default() -> Self {
+        Self { command: "gopls".to_string(), args: Vec::new() }
     }
 }
 
@@ -281,11 +396,18 @@ fn serialize_api_key_opt<S: Serializer>(
 /// Detect the project root by walking up from `start_dir` looking for markers.
 ///
 /// Checks for: `.git`, `Cargo.toml`, `package.json`, `go.mod`, `pyproject.toml`,
-/// `.flok`, `flok.toml`. Returns the first directory containing any marker,
+/// `flok.toml`, `.flok/flok.toml`. Returns the first directory containing any marker,
 /// or `start_dir` if none found.
 pub fn detect_project_root(start_dir: &Path) -> PathBuf {
-    const MARKERS: &[&str] =
-        &[".git", "Cargo.toml", "package.json", "go.mod", "pyproject.toml", ".flok", "flok.toml"];
+    const MARKERS: &[&str] = &[
+        ".git",
+        "Cargo.toml",
+        "package.json",
+        "go.mod",
+        "pyproject.toml",
+        "flok.toml",
+        ".flok/flok.toml",
+    ];
 
     let mut dir = start_dir.to_path_buf();
     loop {
@@ -341,10 +463,62 @@ pub fn load_config(project_root: &Path) -> anyhow::Result<FlokConfig> {
     Ok(config)
 }
 
+/// All config paths that participate in the merged runtime snapshot.
+#[must_use]
+pub fn config_paths(project_root: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(config_dir) = directories::BaseDirs::new().map(|d| d.config_dir().to_path_buf()) {
+        paths.push(config_dir.join("flok").join("flok.toml"));
+    }
+    paths.push(project_root.join("flok.toml"));
+    paths.push(project_root.join(".flok").join("flok.toml"));
+    paths
+}
+
+/// Capture the current existence/modification state for all relevant config files.
+pub fn capture_config_stamps(
+    paths: &[PathBuf],
+) -> anyhow::Result<HashMap<PathBuf, ConfigFileStamp>> {
+    paths
+        .iter()
+        .map(|path| {
+            let stamp = match std::fs::metadata(path) {
+                Ok(metadata) => {
+                    ConfigFileStamp { exists: true, modified: metadata.modified().ok() }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    ConfigFileStamp { exists: false, modified: None }
+                }
+                Err(err) => return Err(anyhow::Error::new(err)),
+            };
+            Ok((path.clone(), stamp))
+        })
+        .collect()
+}
+
+/// Return the config paths whose file stamp changed between two snapshots.
+#[must_use]
+pub fn diff_config_stamps<PS, CS>(
+    previous: &HashMap<PathBuf, ConfigFileStamp, PS>,
+    current: &HashMap<PathBuf, ConfigFileStamp, CS>,
+) -> Vec<PathBuf>
+where
+    PS: std::hash::BuildHasher,
+    CS: std::hash::BuildHasher,
+{
+    current
+        .iter()
+        .filter_map(|(path, stamp)| (previous.get(path) != Some(stamp)).then_some(path.clone()))
+        .collect()
+}
+
 /// Merge `source` config into `target`. Source values override target values.
 fn merge_config(target: &mut FlokConfig, source: &FlokConfig) {
     if source.model.is_some() {
         target.model.clone_from(&source.model);
+    }
+    if source.reasoning_effort.is_some() {
+        target.reasoning_effort = source.reasoning_effort;
     }
     for (key, value) in &source.provider {
         let entry = target.provider.entry(key.clone()).or_default();
@@ -365,6 +539,9 @@ fn merge_config(target: &mut FlokConfig, source: &FlokConfig) {
         let entry = target.agents.entry(key.clone()).or_default();
         if value.model.is_some() {
             entry.model.clone_from(&value.model);
+        }
+        if value.reasoning_effort.is_some() {
+            entry.reasoning_effort = value.reasoning_effort;
         }
         if !value.fallback_models.is_empty() {
             entry.fallback_models.clone_from(&value.fallback_models);
@@ -453,8 +630,12 @@ mod tests {
     fn default_config_is_valid() {
         let config = FlokConfig::default();
         assert!(config.provider.is_empty());
+        assert!(config.reasoning_effort.is_none());
         assert!(config.lsp.enabled);
         assert_eq!(config.lsp.rust.command, "rust-analyzer");
+        assert_eq!(config.lsp.javascript.command, "typescript-language-server");
+        assert_eq!(config.lsp.python.command, "pyright-langserver");
+        assert_eq!(config.lsp.go.command, "gopls");
         assert_eq!(config.runtime_fallback, RuntimeFallbackConfig::default());
         assert_eq!(config.intelligent_routing, IntelligentRoutingConfig::default());
         assert_eq!(config.output_compression, OutputCompressionConfig::default());
@@ -496,6 +677,18 @@ mod tests {
             [lsp.rust]
             command = "custom-ra"
             args = ["--stdio"]
+
+            [lsp.javascript]
+            command = "custom-ts-lsp"
+            args = ["--stdio"]
+
+            [lsp.python]
+            command = "custom-py-lsp"
+            args = ["--stdio"]
+
+            [lsp.go]
+            command = "custom-gopls"
+            args = ["serve"]
         "#;
 
         let config: FlokConfig = toml::from_str(toml_str).unwrap();
@@ -503,6 +696,47 @@ mod tests {
         assert_eq!(config.lsp.request_timeout_ms, 1200);
         assert_eq!(config.lsp.rust.command, "custom-ra");
         assert_eq!(config.lsp.rust.args, vec!["--stdio"]);
+        assert_eq!(config.lsp.javascript.command, "custom-ts-lsp");
+        assert_eq!(config.lsp.javascript.args, vec!["--stdio"]);
+        assert_eq!(config.lsp.python.command, "custom-py-lsp");
+        assert_eq!(config.lsp.python.args, vec!["--stdio"]);
+        assert_eq!(config.lsp.go.command, "custom-gopls");
+        assert_eq!(config.lsp.go.args, vec!["serve"]);
+    }
+
+    #[test]
+    fn live_config_store_increments_version() {
+        let live = LiveConfig::new(FlokConfig::default());
+        assert_eq!(live.snapshot().version, 1);
+
+        let version =
+            live.store(FlokConfig { model: Some("gpt-5.4".to_string()), ..FlokConfig::default() });
+
+        let snapshot = live.snapshot();
+        assert_eq!(version, 2);
+        assert_eq!(snapshot.version, 2);
+        assert_eq!(snapshot.config.model.as_deref(), Some("gpt-5.4"));
+    }
+
+    #[test]
+    fn config_paths_include_project_and_dotflok_layers() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = config_paths(dir.path());
+        assert!(paths.iter().any(|path| path.ends_with("flok.toml")));
+        assert!(paths.iter().any(|path| path.ends_with(std::path::Path::new(".flok/flok.toml"))));
+    }
+
+    #[test]
+    fn diff_config_stamps_detects_created_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("flok.toml");
+        let paths = vec![path.clone()];
+        let before = capture_config_stamps(&paths).unwrap();
+
+        std::fs::write(&path, "model = \"sonnet\"\n").unwrap();
+        let after = capture_config_stamps(&paths).unwrap();
+
+        assert_eq!(diff_config_stamps(&before, &after), vec![path]);
     }
 
     #[test]
@@ -693,6 +927,7 @@ mod tests {
     fn parse_config_with_default_model() {
         let toml_str = r#"
             model = "opus-4.7"
+            reasoning_effort = "high"
 
             [provider.anthropic]
             api_key = "sk-test"
@@ -700,6 +935,7 @@ mod tests {
         "#;
         let config: FlokConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.model.as_deref(), Some("opus-4.7"));
+        assert_eq!(config.reasoning_effort, Some(crate::provider::ReasoningEffort::High));
         assert_eq!(config.provider["anthropic"].default_model.as_deref(), Some("opus-4.7"),);
         assert_eq!(
             config.provider["anthropic"].api_key.as_ref().map(SecretString::expose_secret),
@@ -724,6 +960,7 @@ mod tests {
         let toml_str = r#"
             [agents.explore]
             model = "haiku-4-5"
+            reasoning_effort = "low"
             fallback_models = ["minimax", "gpt-5.4-nano"]
             prompt_append = "Be concise."
         "#;
@@ -732,6 +969,7 @@ mod tests {
         let explore = &config.agents["explore"];
 
         assert_eq!(explore.model.as_deref(), Some("haiku-4-5"));
+        assert_eq!(explore.reasoning_effort, Some(crate::provider::ReasoningEffort::Low));
         assert_eq!(explore.fallback_models, vec!["minimax", "gpt-5.4-nano"]);
         assert_eq!(explore.prompt_append.as_deref(), Some("Be concise."));
     }
@@ -741,6 +979,7 @@ mod tests {
         let toml_str = r#"
             [agents.explore]
             model = "haiku"
+            reasoning_effort = "high"
 
             [agents.general]
             prompt_append = "Keep output short."
@@ -749,10 +988,15 @@ mod tests {
         let config: FlokConfig = toml::from_str(toml_str).unwrap();
 
         assert_eq!(config.agents["explore"].model.as_deref(), Some("haiku"));
+        assert_eq!(
+            config.agents["explore"].reasoning_effort,
+            Some(crate::provider::ReasoningEffort::High)
+        );
         assert!(config.agents["explore"].fallback_models.is_empty());
         assert!(config.agents["explore"].prompt_append.is_none());
 
         assert!(config.agents["general"].model.is_none());
+        assert!(config.agents["general"].reasoning_effort.is_none());
         assert!(config.agents["general"].fallback_models.is_empty());
         assert_eq!(config.agents["general"].prompt_append.as_deref(), Some("Keep output short."));
     }
@@ -789,14 +1033,17 @@ mod tests {
     fn merge_agents_overlay_preserves_unspecified_fields() {
         let mut base: FlokConfig = toml::from_str(
             r#"
+            reasoning_effort = "medium"
             [agents.explore]
             model = "haiku"
+            reasoning_effort = "low"
             fallback_models = ["gpt-5.4"]
             "#,
         )
         .unwrap();
         let overlay: FlokConfig = toml::from_str(
             r#"
+            reasoning_effort = "high"
             [agents.explore]
             prompt_append = "Be concise."
             "#,
@@ -805,8 +1052,10 @@ mod tests {
 
         merge_config(&mut base, &overlay);
 
+        assert_eq!(base.reasoning_effort, Some(crate::provider::ReasoningEffort::High));
         let explore = &base.agents["explore"];
         assert_eq!(explore.model.as_deref(), Some("haiku"));
+        assert_eq!(explore.reasoning_effort, Some(crate::provider::ReasoningEffort::Low));
         assert_eq!(explore.fallback_models, vec!["gpt-5.4"]);
         assert_eq!(explore.prompt_append.as_deref(), Some("Be concise."));
     }

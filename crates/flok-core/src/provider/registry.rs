@@ -525,8 +525,6 @@ fn display_model(model_id: &str) -> String {
         "openai/gpt-5.4" => "gpt-5.4".to_string(),
         "openai/gpt-5.4-mini" => "mini".to_string(),
         "openai/gpt-5.4-nano" => "nano".to_string(),
-        "deepseek/deepseek-chat" => "deepseek".to_string(),
-        "deepseek/deepseek-reasoner" => "r1".to_string(),
         "minimax/MiniMax-M2.7" => "minimax".to_string(),
         _ => ModelRegistry::model_name(model_id).to_string(),
     }
@@ -596,6 +594,7 @@ mod tests {
     fn request(model: &str) -> CompletionRequest {
         CompletionRequest {
             model: model.to_string(),
+            reasoning_effort: None,
             system: String::new(),
             messages: Vec::new(),
             tools: Vec::new(),

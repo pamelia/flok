@@ -20,7 +20,7 @@ use crate::selection::{
 };
 use crate::sidebar::SidebarState;
 use crate::tui::Tui;
-use crate::types::{TuiChannels, UiCommand};
+use crate::types::{McpAddCommand, TuiChannels, UiCommand};
 use unicode_width::UnicodeWidthStr;
 
 const COALESCE_WINDOW_MS: u64 = 50;
@@ -655,9 +655,22 @@ impl App {
                         "sessions" => {
                             let _ = self.channels.cmd_tx.send(UiCommand::ListSessions);
                         }
+                        "mcp" => match parse_mcp_command(&rest) {
+                            Ok(McpSlashCommand::List) => {
+                                let _ = self.channels.cmd_tx.send(UiCommand::ListMcpServers);
+                            }
+                            Ok(McpSlashCommand::Add(command)) => {
+                                let _ = self.channels.cmd_tx.send(UiCommand::AddMcpServer(command));
+                            }
+                            Err(message) => {
+                                self.history.push(HistoryItem::system_warn(message));
+                                self.chat_view.on_new_content();
+                                self.maintain_chat_drag_lock();
+                            }
+                        },
                         "help" => {
                             self.history.push(HistoryItem::system_info(
-                                "Slash: /new /clear /undo /redo /tree /branch /label /plans /show-plan /approve /execute-plan /plan /build /sidebar /sessions /help /quit",
+                                "Slash: /new /clear /undo /redo /tree /branch /label /plans /show-plan /approve /execute-plan /plan /build /sidebar /sessions /mcp /help /quit",
                             ));
                             self.chat_view.on_new_content();
                             self.maintain_chat_drag_lock();
@@ -1341,6 +1354,100 @@ fn ratatui_color(color: crossterm::style::Color) -> ratatui::style::Color {
     }
 }
 
+enum McpSlashCommand {
+    List,
+    Add(McpAddCommand),
+}
+
+fn parse_mcp_command(rest: &str) -> Result<McpSlashCommand, String> {
+    let mut parts = rest.split_whitespace();
+    match parts.next() {
+        None | Some("list" | "status") => Ok(McpSlashCommand::List),
+        Some("add") => parse_mcp_add_command(parts.collect()),
+        Some(other) => Err(format!(
+            "Unknown /mcp subcommand '{other}'. Use `/mcp list` or `/mcp add <name> --url <url>`."
+        )),
+    }
+}
+
+fn parse_mcp_add_command(args: Vec<&str>) -> Result<McpSlashCommand, String> {
+    let mut iter = args.into_iter();
+    let name = iter
+        .next()
+        .ok_or_else(|| {
+            "Usage: /mcp add <name> --url <url> [--bearer-token-env-var VAR]".to_string()
+        })?
+        .to_string();
+
+    let mut url = None;
+    let mut command = None;
+    let mut command_args = Vec::new();
+    let mut cwd = None;
+    let mut bearer_token_env_var = None;
+    let mut timeout_seconds = None;
+    let mut disabled = false;
+
+    while let Some(flag) = iter.next() {
+        match flag {
+            "--url" => {
+                url = Some(
+                    iter.next().ok_or_else(|| "Missing value for --url".to_string())?.to_string(),
+                );
+            }
+            "--command" => {
+                command = Some(
+                    iter.next()
+                        .ok_or_else(|| "Missing value for --command".to_string())?
+                        .to_string(),
+                );
+            }
+            "--arg" => {
+                command_args.push(
+                    iter.next().ok_or_else(|| "Missing value for --arg".to_string())?.to_string(),
+                );
+            }
+            "--cwd" => {
+                cwd = Some(
+                    iter.next().ok_or_else(|| "Missing value for --cwd".to_string())?.to_string(),
+                );
+            }
+            "--bearer-token-env-var" => {
+                bearer_token_env_var = Some(
+                    iter.next()
+                        .ok_or_else(|| "Missing value for --bearer-token-env-var".to_string())?
+                        .to_string(),
+                );
+            }
+            "--timeout-seconds" => {
+                let value =
+                    iter.next().ok_or_else(|| "Missing value for --timeout-seconds".to_string())?;
+                timeout_seconds = Some(
+                    value.parse::<u64>().map_err(|_| format!("Invalid timeout value '{value}'"))?,
+                );
+            }
+            "--disabled" => disabled = true,
+            other => return Err(format!("Unknown /mcp add flag '{other}'")),
+        }
+    }
+
+    if url.is_some() == command.is_some() {
+        return Err(
+            "Use exactly one of `--url <url>` or `--command <command>` for `/mcp add`.".to_string()
+        );
+    }
+
+    Ok(McpSlashCommand::Add(McpAddCommand {
+        name,
+        url,
+        command,
+        args: command_args,
+        cwd,
+        bearer_token_env_var,
+        timeout_seconds,
+        disabled,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1505,6 +1612,43 @@ mod tests {
 
         let command = cmd_rx.try_recv().expect("execute plan command should be queued");
         assert!(matches!(command, UiCommand::ExecutePlan(Some(plan_id)) if plan_id == "plan-123"));
+    }
+
+    #[tokio::test]
+    async fn submit_mcp_list_sends_list_mcp_command() {
+        let (channels, mut cmd_rx) = make_channels();
+        let (tx, rx) = mpsc::unbounded_channel::<AppEvent>();
+        let mut app = App::new(channels, tx, rx);
+
+        app.handle_event(AppEvent::Submit("/mcp list".to_string()));
+
+        let command = cmd_rx.try_recv().expect("list mcp command should be queued");
+        assert!(matches!(command, UiCommand::ListMcpServers));
+    }
+
+    #[tokio::test]
+    async fn submit_mcp_add_remote_sends_add_mcp_command() {
+        let (channels, mut cmd_rx) = make_channels();
+        let (tx, rx) = mpsc::unbounded_channel::<AppEvent>();
+        let mut app = App::new(channels, tx, rx);
+
+        app.handle_event(AppEvent::Submit(
+            "/mcp add github --url https://api.githubcopilot.com/mcp/ --bearer-token-env-var GITHUB_PAT_TOKEN"
+                .to_string(),
+        ));
+
+        let command = cmd_rx.try_recv().expect("add mcp command should be queued");
+        assert!(matches!(
+            command,
+            UiCommand::AddMcpServer(McpAddCommand {
+                name,
+                url: Some(url),
+                bearer_token_env_var: Some(env),
+                ..
+            }) if name == "github"
+                && url == "https://api.githubcopilot.com/mcp/"
+                && env == "GITHUB_PAT_TOKEN"
+        ));
     }
 
     #[tokio::test]

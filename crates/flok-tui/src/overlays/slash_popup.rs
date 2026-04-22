@@ -25,6 +25,7 @@ pub(crate) const SLASH_COMMANDS: &[&str] = &[
     "build",
     "sidebar",
     "sessions",
+    "mcp",
     "help",
     "quit",
 ];

@@ -456,6 +456,7 @@ impl LspManager {
             Some(WorkspaceLspKind::JavaScript) => runtime.config.javascript.command,
             Some(WorkspaceLspKind::Python) => runtime.config.python.command,
             Some(WorkspaceLspKind::Go) => runtime.config.go.command,
+            Some(WorkspaceLspKind::Java) => runtime.config.java.command,
             None => String::new(),
         }
     }
@@ -467,6 +468,7 @@ impl LspManager {
             Some(WorkspaceLspKind::JavaScript) => runtime.config.javascript.args,
             Some(WorkspaceLspKind::Python) => runtime.config.python.args,
             Some(WorkspaceLspKind::Go) => runtime.config.go.args,
+            Some(WorkspaceLspKind::Java) => runtime.config.java.args,
             None => Vec::new(),
         }
     }
@@ -518,6 +520,7 @@ impl LspRuntimeState {
             Some(WorkspaceLspKind::JavaScript) => &self.config.javascript.command,
             Some(WorkspaceLspKind::Python) => &self.config.python.command,
             Some(WorkspaceLspKind::Go) => &self.config.go.command,
+            Some(WorkspaceLspKind::Java) => &self.config.java.command,
             None => "",
         }
     }
@@ -528,6 +531,7 @@ impl LspRuntimeState {
             Some(WorkspaceLspKind::JavaScript) => &self.config.javascript.args,
             Some(WorkspaceLspKind::Python) => &self.config.python.args,
             Some(WorkspaceLspKind::Go) => &self.config.go.args,
+            Some(WorkspaceLspKind::Java) => &self.config.java.args,
             None => &[],
         }
     }
@@ -539,6 +543,7 @@ enum WorkspaceLspKind {
     JavaScript,
     Python,
     Go,
+    Java,
 }
 
 impl WorkspaceLspKind {
@@ -549,6 +554,7 @@ impl WorkspaceLspKind {
                 | (Self::JavaScript, Some("js" | "jsx" | "ts" | "tsx"))
                 | (Self::Python, Some("py" | "pyi"))
                 | (Self::Go, Some("go"))
+                | (Self::Java, Some("java"))
         )
     }
 
@@ -561,6 +567,7 @@ impl WorkspaceLspKind {
             (Self::JavaScript, _) => "javascript",
             (Self::Python, _) => "python",
             (Self::Go, _) => "go",
+            (Self::Java, _) => "java",
         }
     }
 
@@ -570,6 +577,7 @@ impl WorkspaceLspKind {
             Self::JavaScript => "JavaScript/TypeScript",
             Self::Python => "Python",
             Self::Go => "Go",
+            Self::Java => "Java",
         }
     }
 }
@@ -577,6 +585,16 @@ impl WorkspaceLspKind {
 fn detect_workspace_kind(project_root: &Path) -> Option<WorkspaceLspKind> {
     if project_root.join("Cargo.toml").exists() {
         return Some(WorkspaceLspKind::Rust);
+    }
+    if project_root.join("pom.xml").exists()
+        || project_root.join("build.gradle").exists()
+        || project_root.join("build.gradle.kts").exists()
+        || project_root.join("settings.gradle").exists()
+        || project_root.join("settings.gradle.kts").exists()
+        || project_root.join("gradlew").exists()
+        || project_root.join("mvnw").exists()
+    {
+        return Some(WorkspaceLspKind::Java);
     }
     if project_root.join("package.json").exists()
         || project_root.join("tsconfig.json").exists()
@@ -943,6 +961,11 @@ fn configuration_response(
                             || section.starts_with("gopls.")
                             || section == "go"
                             || section.starts_with("go.") =>
+                    {
+                        serde_json::json!({})
+                    }
+                    (Some(WorkspaceLspKind::Java), Some(section))
+                        if section == "java" || section.starts_with("java.") =>
                     {
                         serde_json::json!({})
                     }
@@ -1368,6 +1391,14 @@ mod tests {
     }
 
     #[test]
+    fn lsp_tools_enable_for_java_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("pom.xml"), "<project />\n").unwrap();
+        let manager = LspManager::new(dir.path().to_path_buf(), LspConfig::default());
+        assert!(manager.tools_enabled());
+    }
+
+    #[test]
     fn workspace_supported_survives_disabled_config() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("package.json"), "{ \"name\": \"demo\" }\n").unwrap();
@@ -1479,6 +1510,32 @@ mod tests {
         .unwrap();
 
         assert_eq!(response["id"], serde_json::json!(12));
+        assert_eq!(response["result"], serde_json::json!([{}, {}, null]));
+    }
+
+    #[test]
+    fn configuration_requests_get_minimal_java_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let response = response_for_server_request(
+            dir.path(),
+            Some(WorkspaceLspKind::Java),
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 13,
+                "method": "workspace/configuration",
+                "params": {
+                    "items": [
+                        { "section": "java" },
+                        { "section": "java.format" },
+                        { "section": "other.section" }
+                    ]
+                }
+            }),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(response["id"], serde_json::json!(13));
         assert_eq!(response["result"], serde_json::json!([{}, {}, null]));
     }
 

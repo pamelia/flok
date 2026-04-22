@@ -33,6 +33,11 @@ pub struct FlokConfig {
     pub provider: HashMap<String, ProviderConfig>,
     /// Per-built-in-agent routing and prompt overrides.
     pub agents: HashMap<String, AgentConfig>,
+    /// MCP server configurations keyed by server name.
+    ///
+    /// Supports both `[mcp_servers.<name>]` and the legacy alias `[mcp.<name>]`.
+    #[serde(alias = "mcp")]
+    pub mcp_servers: HashMap<String, McpServerConfig>,
     pub lsp: LspConfig,
     /// Git worktree isolation settings.
     pub worktree: WorktreeConfig,
@@ -63,6 +68,59 @@ pub struct FlokConfig {
     pub intelligent_routing: IntelligentRoutingConfig,
     /// Tool output compression configuration.
     pub output_compression: OutputCompressionConfig,
+}
+
+/// Configuration for a single MCP server.
+///
+/// The shape is intentionally close to Codex-style MCP config so users can
+/// translate existing setups with minimal friction.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct McpServerConfig {
+    /// Disable the server without removing config.
+    pub disabled: Option<bool>,
+    /// Per-server tool call timeout in seconds. Defaults to 30 when unset.
+    pub timeout_seconds: Option<u64>,
+    /// Stdio transport command.
+    pub command: Option<String>,
+    /// Stdio transport arguments.
+    pub args: Option<Vec<String>>,
+    /// Optional stdio working directory.
+    pub cwd: Option<PathBuf>,
+    /// Extra environment variables for stdio servers.
+    pub env: Option<HashMap<String, String>>,
+    /// Remote transport URL.
+    pub url: Option<String>,
+    /// Extra remote headers.
+    pub headers: Option<HashMap<String, String>>,
+    /// Env var containing a bearer token for remote HTTP auth.
+    pub bearer_token_env_var: Option<String>,
+}
+
+impl McpServerConfig {
+    /// Effective timeout in seconds.
+    #[must_use]
+    pub fn timeout_seconds(&self) -> u64 {
+        self.timeout_seconds.unwrap_or(30)
+    }
+
+    /// Whether this server is disabled.
+    #[must_use]
+    pub fn disabled(&self) -> bool {
+        self.disabled.unwrap_or(false)
+    }
+
+    /// Whether this entry is configured for stdio transport.
+    #[must_use]
+    pub fn is_stdio(&self) -> bool {
+        self.command.is_some()
+    }
+
+    /// Whether this entry is configured for remote transport.
+    #[must_use]
+    pub fn is_remote(&self) -> bool {
+        self.url.is_some()
+    }
 }
 
 /// Versioned runtime config snapshot used by long-lived sessions.
@@ -227,6 +285,7 @@ pub struct LspConfig {
     pub javascript: JavascriptLspConfig,
     pub python: PythonLspConfig,
     pub go: GoLspConfig,
+    pub java: JavaLspConfig,
 }
 
 impl Default for LspConfig {
@@ -238,6 +297,7 @@ impl Default for LspConfig {
             javascript: JavascriptLspConfig::default(),
             python: PythonLspConfig::default(),
             go: GoLspConfig::default(),
+            java: JavaLspConfig::default(),
         }
     }
 }
@@ -294,6 +354,19 @@ pub struct GoLspConfig {
 impl Default for GoLspConfig {
     fn default() -> Self {
         Self { command: "gopls".to_string(), args: Vec::new() }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct JavaLspConfig {
+    pub command: String,
+    pub args: Vec<String>,
+}
+
+impl Default for JavaLspConfig {
+    fn default() -> Self {
+        Self { command: "jdtls".to_string(), args: Vec::new() }
     }
 }
 
@@ -395,13 +468,19 @@ fn serialize_api_key_opt<S: Serializer>(
 
 /// Detect the project root by walking up from `start_dir` looking for markers.
 ///
-/// Checks for: `.git`, `Cargo.toml`, `package.json`, `go.mod`, `pyproject.toml`,
-/// `flok.toml`, `.flok/flok.toml`. Returns the first directory containing any marker,
-/// or `start_dir` if none found.
+/// Checks for: `.git`, `Cargo.toml`, `pom.xml`, `build.gradle`,
+/// `build.gradle.kts`, `package.json`, `go.mod`, `pyproject.toml`, `flok.toml`,
+/// `.flok/flok.toml`. Returns the first directory containing any marker, or
+/// `start_dir` if none found.
 pub fn detect_project_root(start_dir: &Path) -> PathBuf {
     const MARKERS: &[&str] = &[
         ".git",
         "Cargo.toml",
+        "pom.xml",
+        "build.gradle",
+        "build.gradle.kts",
+        "settings.gradle",
+        "settings.gradle.kts",
         "package.json",
         "go.mod",
         "pyproject.toml",
@@ -550,6 +629,36 @@ fn merge_config(target: &mut FlokConfig, source: &FlokConfig) {
             entry.prompt_append.clone_from(&value.prompt_append);
         }
     }
+    for (key, value) in &source.mcp_servers {
+        let entry = target.mcp_servers.entry(key.clone()).or_default();
+        if value.disabled.is_some() {
+            entry.disabled = value.disabled;
+        }
+        if value.timeout_seconds.is_some() {
+            entry.timeout_seconds = value.timeout_seconds;
+        }
+        if value.command.is_some() {
+            entry.command.clone_from(&value.command);
+        }
+        if value.args.is_some() {
+            entry.args.clone_from(&value.args);
+        }
+        if value.cwd.is_some() {
+            entry.cwd.clone_from(&value.cwd);
+        }
+        if value.env.is_some() {
+            entry.env.clone_from(&value.env);
+        }
+        if value.url.is_some() {
+            entry.url.clone_from(&value.url);
+        }
+        if value.headers.is_some() {
+            entry.headers.clone_from(&value.headers);
+        }
+        if value.bearer_token_env_var.is_some() {
+            entry.bearer_token_env_var.clone_from(&value.bearer_token_env_var);
+        }
+    }
     target.lsp = source.lsp.clone();
     // Worktree config: source overrides target entirely if present in source file
     // (serde default handles missing fields; if explicitly set in source, override)
@@ -631,11 +740,13 @@ mod tests {
         let config = FlokConfig::default();
         assert!(config.provider.is_empty());
         assert!(config.reasoning_effort.is_none());
+        assert!(config.mcp_servers.is_empty());
         assert!(config.lsp.enabled);
         assert_eq!(config.lsp.rust.command, "rust-analyzer");
         assert_eq!(config.lsp.javascript.command, "typescript-language-server");
         assert_eq!(config.lsp.python.command, "pyright-langserver");
         assert_eq!(config.lsp.go.command, "gopls");
+        assert_eq!(config.lsp.java.command, "jdtls");
         assert_eq!(config.runtime_fallback, RuntimeFallbackConfig::default());
         assert_eq!(config.intelligent_routing, IntelligentRoutingConfig::default());
         assert_eq!(config.output_compression, OutputCompressionConfig::default());
@@ -689,6 +800,10 @@ mod tests {
             [lsp.go]
             command = "custom-gopls"
             args = ["serve"]
+
+            [lsp.java]
+            command = "custom-jdtls"
+            args = ["--data", ".flok/jdtls-workspace"]
         "#;
 
         let config: FlokConfig = toml::from_str(toml_str).unwrap();
@@ -702,6 +817,88 @@ mod tests {
         assert_eq!(config.lsp.python.args, vec!["--stdio"]);
         assert_eq!(config.lsp.go.command, "custom-gopls");
         assert_eq!(config.lsp.go.args, vec!["serve"]);
+        assert_eq!(config.lsp.java.command, "custom-jdtls");
+        assert_eq!(config.lsp.java.args, vec!["--data", ".flok/jdtls-workspace"]);
+    }
+
+    #[test]
+    fn parse_mcp_servers_config_codex_style() {
+        let toml_str = r#"
+            [mcp_servers.github]
+            url = "https://api.githubcopilot.com/mcp/"
+            bearer_token_env_var = "GITHUB_PAT_TOKEN"
+            timeout_seconds = 45
+
+            [mcp_servers.filesystem]
+            command = "npx"
+            args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
+        "#;
+
+        let config: FlokConfig = toml::from_str(toml_str).unwrap();
+        let github = &config.mcp_servers["github"];
+        assert_eq!(github.url.as_deref(), Some("https://api.githubcopilot.com/mcp/"));
+        assert_eq!(github.bearer_token_env_var.as_deref(), Some("GITHUB_PAT_TOKEN"));
+        assert_eq!(github.timeout_seconds(), 45);
+        assert!(github.is_remote());
+
+        let filesystem = &config.mcp_servers["filesystem"];
+        assert_eq!(filesystem.command.as_deref(), Some("npx"));
+        assert_eq!(
+            filesystem.args.as_deref(),
+            Some(
+                vec![
+                    "-y".to_string(),
+                    "@modelcontextprotocol/server-filesystem".to_string(),
+                    ".".to_string(),
+                ]
+                .as_slice()
+            )
+        );
+        assert!(filesystem.is_stdio());
+        assert_eq!(filesystem.timeout_seconds(), 30);
+    }
+
+    #[test]
+    fn parse_mcp_servers_config_accepts_legacy_alias() {
+        let toml_str = r#"
+            [mcp.search]
+            url = "https://mcp.example.com/search"
+        "#;
+
+        let config: FlokConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.mcp_servers.get("search").and_then(|server| server.url.as_deref()),
+            Some("https://mcp.example.com/search")
+        );
+    }
+
+    #[test]
+    fn merge_mcp_server_overlay_preserves_unspecified_fields() {
+        let mut base: FlokConfig = toml::from_str(
+            r#"
+            [mcp_servers.github]
+            url = "https://api.githubcopilot.com/mcp/"
+            bearer_token_env_var = "GITHUB_PAT_TOKEN"
+            timeout_seconds = 30
+        "#,
+        )
+        .unwrap();
+
+        let overlay: FlokConfig = toml::from_str(
+            r"
+            [mcp_servers.github]
+            timeout_seconds = 60
+            disabled = true
+        ",
+        )
+        .unwrap();
+
+        merge_config(&mut base, &overlay);
+        let github = &base.mcp_servers["github"];
+        assert_eq!(github.url.as_deref(), Some("https://api.githubcopilot.com/mcp/"));
+        assert_eq!(github.bearer_token_env_var.as_deref(), Some("GITHUB_PAT_TOKEN"));
+        assert_eq!(github.timeout_seconds(), 60);
+        assert!(github.disabled());
     }
 
     #[test]
@@ -756,6 +953,17 @@ mod tests {
         let sub = dir.path().join("src");
         std::fs::create_dir_all(&sub).unwrap();
         std::fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
+
+        let root = detect_project_root(&sub);
+        assert_eq!(root, dir.path());
+    }
+
+    #[test]
+    fn detect_project_root_finds_java_build_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("server").join("src");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(dir.path().join("pom.xml"), "<project />").unwrap();
 
         let root = detect_project_root(&sub);
         assert_eq!(root, dir.path());

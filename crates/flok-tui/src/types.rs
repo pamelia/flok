@@ -2,6 +2,19 @@
 
 use tokio::sync::{mpsc, oneshot};
 
+/// TUI-side MCP add request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpAddCommand {
+    pub name: String,
+    pub url: Option<String>,
+    pub command: Option<String>,
+    pub args: Vec<String>,
+    pub cwd: Option<String>,
+    pub bearer_token_env_var: Option<String>,
+    pub timeout_seconds: Option<u64>,
+    pub disabled: bool,
+}
+
 /// Messages from the TUI to the background session task.
 #[derive(Debug)]
 pub enum UiCommand {
@@ -17,6 +30,10 @@ pub enum UiCommand {
     ExecutePlan(Option<String>),
     /// User wants to list sessions.
     ListSessions,
+    /// List configured MCP servers from user config.
+    ListMcpServers,
+    /// Add or update an MCP server in user config.
+    AddMcpServer(McpAddCommand),
     /// User selected a model from the picker. Value is the full model ID.
     SwitchModel(String),
     /// Undo the last user message and restore files.

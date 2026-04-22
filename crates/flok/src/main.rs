@@ -5,6 +5,7 @@
 
 mod cli;
 
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -80,6 +81,7 @@ async fn run(args: cli::Args) -> Result<()> {
             cli::Command::Version => return run_version(),
             cli::Command::Sessions { .. } => {} // Needs DB — fall through
             cli::Command::Auth { .. } => return run_auth(cmd),
+            cli::Command::Mcp { .. } => return run_mcp(cmd),
         }
     }
 
@@ -158,6 +160,7 @@ async fn run(args: cli::Args) -> Result<()> {
     tools.register(Arc::new(PlanCreateTool));
     tools.register(Arc::new(PlanUpdateTool));
     tools.register(Arc::new(CodeReviewTool::new(Arc::clone(&provider))));
+    flok_core::mcp::register_configured_tools(&mut tools, &config.mcp_servers).await;
 
     // Create bus (needs to be before team/task tools which use it)
     let bus = Bus::new(512);
@@ -517,6 +520,46 @@ async fn run_interactive(
                         }
                     }
                 }
+                flok_tui::UiCommand::ListMcpServers => match list_mcp_servers_text() {
+                    Ok(text) => {
+                        let _ = ui_tx.send(flok_tui::UiEvent::HistoryMessage {
+                            role: "system".to_string(),
+                            content: text,
+                        });
+                    }
+                    Err(e) => {
+                        let _ = ui_tx.send(flok_tui::UiEvent::Error(format!(
+                            "Failed to list MCP servers: {e}"
+                        )));
+                    }
+                },
+                flok_tui::UiCommand::AddMcpServer(command) => {
+                    let cwd = command.cwd.as_ref().map(PathBuf::from);
+                    match run_mcp_add(&McpAddRequest {
+                        name: &command.name,
+                        url: command.url.as_ref(),
+                        command: command.command.as_ref(),
+                        args: &command.args,
+                        cwd: cwd.as_ref(),
+                        bearer_token_env_var: command.bearer_token_env_var.as_ref(),
+                        timeout_seconds: command.timeout_seconds,
+                        disabled: command.disabled,
+                    }) {
+                        Ok(()) => {
+                            let _ = ui_tx.send(flok_tui::UiEvent::HistoryMessage {
+                                role: "system".to_string(),
+                                content:
+                                    "Saved MCP server to config. New or changed MCP tools will be picked up the next time flok starts."
+                                        .to_string(),
+                            });
+                        }
+                        Err(e) => {
+                            let _ = ui_tx.send(flok_tui::UiEvent::Error(format!(
+                                "Failed to add MCP server: {e}"
+                            )));
+                        }
+                    }
+                }
                 flok_tui::UiCommand::SwitchModel(model_id) => {
                     let _ = ui_tx.send(flok_tui::UiEvent::Error(format!(
                         "Model switch to {model_id} — will take effect on next message. (Full mid-session model switching coming soon.)"
@@ -861,6 +904,35 @@ fn run_auth(cmd: &cli::Command) -> Result<()> {
     }
 }
 
+/// Run the MCP subcommand.
+fn run_mcp(cmd: &cli::Command) -> Result<()> {
+    match cmd {
+        cli::Command::Mcp {
+            command:
+                cli::McpCommand::Add {
+                    name,
+                    url,
+                    command,
+                    args,
+                    cwd,
+                    bearer_token_env_var,
+                    timeout_seconds,
+                    disabled,
+                },
+        } => run_mcp_add(&McpAddRequest {
+            name,
+            url: url.as_ref(),
+            command: command.as_ref(),
+            args,
+            cwd: cwd.as_ref(),
+            bearer_token_env_var: bearer_token_env_var.as_ref(),
+            timeout_seconds: *timeout_seconds,
+            disabled: *disabled,
+        }),
+        _ => unreachable!(),
+    }
+}
+
 /// Interactive auth login.
 fn run_auth_login(provider_arg: Option<&String>) -> Result<()> {
     let provider_meta = if let Some(name) = provider_arg {
@@ -889,24 +961,15 @@ fn run_auth_login(provider_arg: Option<&String>) -> Result<()> {
 
     let secret = SecretString::from(api_key);
 
-    let config_path = {
-        let dirs = directories::BaseDirs::new().context("cannot determine home directory")?;
-        dirs.config_dir().join("flok").join("flok.toml")
-    };
-
-    let mut config: flok_core::config::FlokConfig = if config_path.exists() {
-        let content = std::fs::read_to_string(&config_path)?;
-        toml::from_str(&content).unwrap_or_default()
-    } else {
-        flok_core::config::FlokConfig::default()
-    };
+    let config_path = user_config_path()?;
+    let mut config = load_user_config(&config_path)?;
 
     // Preserve any existing provider fields (e.g. base_url, default_model) when
     // updating just the api_key.
     let entry = config.provider.entry(provider_meta.name.to_string()).or_default();
     entry.api_key = Some(secret);
 
-    write_auth_config(&config_path, &config)?;
+    write_user_config(&config_path, &config)?;
 
     #[allow(clippy::print_stdout)]
     {
@@ -916,8 +979,102 @@ fn run_auth_login(provider_arg: Option<&String>) -> Result<()> {
     Ok(())
 }
 
+struct McpAddRequest<'a> {
+    name: &'a str,
+    url: Option<&'a String>,
+    command: Option<&'a String>,
+    args: &'a [String],
+    cwd: Option<&'a PathBuf>,
+    bearer_token_env_var: Option<&'a String>,
+    timeout_seconds: Option<u64>,
+    disabled: bool,
+}
+
+fn run_mcp_add(request: &McpAddRequest<'_>) -> Result<()> {
+    if request.url.is_some() && request.command.is_some() {
+        anyhow::bail!("MCP add accepts either --url or --command, not both");
+    }
+
+    let config_path = user_config_path()?;
+    let mut config = load_user_config(&config_path)?;
+    config.mcp_servers.insert(
+        request.name.to_string(),
+        flok_core::config::McpServerConfig {
+            disabled: Some(request.disabled),
+            timeout_seconds: request.timeout_seconds,
+            command: request.command.cloned(),
+            args: (!request.args.is_empty()).then(|| request.args.to_vec()),
+            cwd: request.cwd.cloned(),
+            env: None,
+            url: request.url.cloned(),
+            headers: None,
+            bearer_token_env_var: request.bearer_token_env_var.cloned(),
+        },
+    );
+
+    write_user_config(&config_path, &config)?;
+
+    #[allow(clippy::print_stdout)]
+    {
+        println!("✓ Saved MCP server '{}' to {}", request.name, config_path.display());
+    }
+
+    Ok(())
+}
+
+fn user_config_path() -> Result<PathBuf> {
+    let dirs = directories::BaseDirs::new().context("cannot determine home directory")?;
+    Ok(dirs.config_dir().join("flok").join("flok.toml"))
+}
+
+fn load_user_config(path: &std::path::Path) -> Result<flok_core::config::FlokConfig> {
+    if path.exists() {
+        let content = std::fs::read_to_string(path)?;
+        Ok(toml::from_str(&content).unwrap_or_default())
+    } else {
+        Ok(flok_core::config::FlokConfig::default())
+    }
+}
+
+fn list_mcp_servers_text() -> Result<String> {
+    let config_path = user_config_path()?;
+    let config = load_user_config(&config_path)?;
+    if config.mcp_servers.is_empty() {
+        return Ok(format!("No MCP servers configured in {}.", config_path.display()));
+    }
+
+    let mut names: Vec<_> = config.mcp_servers.keys().cloned().collect();
+    names.sort();
+
+    let mut lines = vec![format!("Configured MCP servers from {}:", config_path.display())];
+    for name in names {
+        let server = &config.mcp_servers[&name];
+        let transport = if let Some(url) = &server.url {
+            format!("remote {url}")
+        } else if let Some(command) = &server.command {
+            let args = server.args.clone().unwrap_or_default().join(" ");
+            if args.is_empty() {
+                format!("stdio {command}")
+            } else {
+                format!("stdio {command} {args}")
+            }
+        } else {
+            "incomplete config".to_string()
+        };
+        let mut detail = format!("- {name}: {transport}");
+        if let Some(env_var) = &server.bearer_token_env_var {
+            let _ = write!(detail, " bearer_token_env_var={env_var}");
+        }
+        if server.disabled() {
+            detail.push_str(" [disabled]");
+        }
+        lines.push(detail);
+    }
+    Ok(lines.join("\n"))
+}
+
 /// Write a `FlokConfig` to `path`, creating parent dirs, then (on Unix) chmod 0600.
-fn write_auth_config(path: &std::path::Path, config: &flok_core::config::FlokConfig) -> Result<()> {
+fn write_user_config(path: &std::path::Path, config: &flok_core::config::FlokConfig) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -1177,9 +1334,32 @@ mod credential_tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("flok").join("flok.toml");
         let config = config_with_key("anthropic", "sk-permtest");
-        write_auth_config(&path, &config).expect("write");
+        write_user_config(&path, &config).expect("write");
         let mode = std::fs::metadata(&path).expect("metadata").permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "expected 0600, got {mode:o}");
+    }
+
+    #[test]
+    fn write_user_config_persists_mcp_server() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("flok").join("flok.toml");
+
+        let mut config = config_with_key("openai", "sk-test");
+        config.mcp_servers.insert(
+            "github".to_string(),
+            flok_core::config::McpServerConfig {
+                url: Some("https://api.githubcopilot.com/mcp/".to_string()),
+                bearer_token_env_var: Some("GITHUB_PAT_TOKEN".to_string()),
+                ..Default::default()
+            },
+        );
+
+        write_user_config(&path, &config).expect("write");
+        let reloaded = load_user_config(&path).expect("reload");
+        let github = &reloaded.mcp_servers["github"];
+        assert_eq!(github.url.as_deref(), Some("https://api.githubcopilot.com/mcp/"));
+        assert_eq!(github.bearer_token_env_var.as_deref(), Some("GITHUB_PAT_TOKEN"));
+        assert!(reloaded.provider.contains_key("openai"));
     }
 
     #[tokio::test]

@@ -1,0 +1,42 @@
+# Flok config: route the lead session and all built-in sub-agents to GPT-5.4.
+#
+# This template sets both the model and reasoning effort for the lead session,
+# and routes all built-in sub-agents to GPT-5.4 as well.
+
+# Default model for the lead session when `--model` is not passed.
+model = "gpt-5.4"
+reasoning_effort = "high"
+
+[provider.openai]
+# api_key = "sk-..."         # Set via: flok auth login --provider openai
+default_model = "gpt-5.4"
+
+[agents.explore]
+model = "gpt-5.4"
+
+[agents.general]
+model = "gpt-5.4"
+
+[agents.feasibility-reviewer]
+model = "gpt-5.4"
+
+[agents.complexity-reviewer]
+model = "gpt-5.4"
+
+[agents.completeness-reviewer]
+model = "gpt-5.4"
+
+[agents.operations-reviewer]
+model = "gpt-5.4"
+
+[agents.api-reviewer]
+model = "gpt-5.4"
+
+[agents.clarity-reviewer]
+model = "gpt-5.4"
+
+[agents.scope-reviewer]
+model = "gpt-5.4"
+
+[agents.product-reviewer]
+model = "gpt-5.4"

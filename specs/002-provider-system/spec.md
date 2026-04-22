@@ -53,7 +53,7 @@
 - **FR-003**: Flok MUST support intelligent model routing via the ModelRouter (see spec-012 for full details):
   ```toml
   [routing]
-  explore = "deepseek/deepseek-chat"        # Cheap, fast: file reads, grep, exploration
+  explore = "minimax/MiniMax-M2.7"          # Cheap, fast: file reads, grep, exploration
   build   = "anthropic/claude-sonnet-4.6"   # Balanced: code gen, refactoring
   plan    = "anthropic/claude-opus-4.6"     # Deep reasoning: architecture, planning
   utility = "anthropic/claude-haiku-4.5"    # Internal: title gen, compaction, summaries

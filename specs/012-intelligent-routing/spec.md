@@ -141,7 +141,7 @@ The agent's effective system prompt = `AgentDef::system_prompt` (the built-in sp
 - **FR-001**: Flok MUST support three routing tiers with configurable model assignments:
   ```toml
   [routing]
-  explore = "deepseek/deepseek-chat"          # Cheap, fast: file reads, grep, exploration
+  explore = "minimax/MiniMax-M2.7"            # Cheap, fast: file reads, grep, exploration
   build   = "anthropic/claude-sonnet-4.6"     # Balanced: code gen, refactoring, standard tasks
   plan    = "anthropic/claude-opus-4.6"       # Deep reasoning: architecture, planning, debugging
   utility = "anthropic/claude-haiku-4.5"      # Internal: title gen, compaction, summaries

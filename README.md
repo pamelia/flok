@@ -33,7 +33,7 @@ AI-assisted coding workflows. Single binary, no runtime dependencies.
 - **Streaming responses** — real-time text and reasoning delta streaming
 
 **Terminal UI**
-- **Rich terminal UI** — iocraft-based declarative TUI with sidebar stats, markdown rendering, dark theme
+- **Rich terminal UI** — ratatui-based TUI with sidebar stats, markdown rendering, dark theme
 - **Command palette** (`Ctrl+K`) and model picker (`Ctrl+M`)
 - **Text selection & copy** — click-drag, double-click word, triple-click line, auto-copy to clipboard
 - **Scrolling** — mouse wheel per-panel, keyboard scroll (Page Up/Down)
@@ -553,7 +553,7 @@ flok/
 │   │                  #   review, LSP, worktrees, snapshots, compression,
 │   │                  #   permissions, routing, cost tracking
 │   ├── flok-db/       # Library: SQLite persistence, migrations
-│   └── flok-tui/      # Library: iocraft TUI components and rendering
+│   └── flok-tui/      # Library: ratatui TUI components and rendering
 ├── specs/             # Feature specifications
 ├── flok.example.toml  # Annotated config reference
 └── AGENTS.md          # Project coding conventions

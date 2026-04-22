@@ -45,6 +45,22 @@ impl MiniMaxProvider {
                         MessageContent::Text { text } => {
                             AnthropicContent::Text { text: text.clone(), cache_control: None }
                         }
+                        MessageContent::Compaction { summary } => AnthropicContent::Text {
+                            text: summary.render_for_prompt(),
+                            cache_control: None,
+                        },
+                        MessageContent::ProjectMemory { summary } => AnthropicContent::Text {
+                            text: summary.render_for_prompt(),
+                            cache_control: None,
+                        },
+                        MessageContent::MemoryRecall { summary } => AnthropicContent::Text {
+                            text: summary.render_for_prompt(),
+                            cache_control: None,
+                        },
+                        MessageContent::Step { step } => AnthropicContent::Text {
+                            text: step.render_for_prompt(),
+                            cache_control: None,
+                        },
                         MessageContent::ToolUse { id, name, input } => AnthropicContent::ToolUse {
                             id: id.clone(),
                             name: name.clone(),
@@ -479,6 +495,7 @@ mod tests {
         let _provider = MiniMaxProvider::new(SecretString::from("test-key".to_string()), None);
         let request = CompletionRequest {
             model: "minimax/MiniMax-M2.7".into(),
+            reasoning_effort: None,
             system: "You are a helpful assistant.".into(),
             messages: vec![super::super::types::Message {
                 role: "user".into(),

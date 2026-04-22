@@ -60,6 +60,30 @@ impl OpenAiProvider {
                                 }
                                 text_parts.push_str(text);
                             }
+                            MessageContent::Compaction { summary } => {
+                                if !text_parts.is_empty() {
+                                    text_parts.push('\n');
+                                }
+                                text_parts.push_str(&summary.render_for_prompt());
+                            }
+                            MessageContent::ProjectMemory { summary } => {
+                                if !text_parts.is_empty() {
+                                    text_parts.push('\n');
+                                }
+                                text_parts.push_str(&summary.render_for_prompt());
+                            }
+                            MessageContent::MemoryRecall { summary } => {
+                                if !text_parts.is_empty() {
+                                    text_parts.push('\n');
+                                }
+                                text_parts.push_str(&summary.render_for_prompt());
+                            }
+                            MessageContent::Step { step } => {
+                                if !text_parts.is_empty() {
+                                    text_parts.push('\n');
+                                }
+                                text_parts.push_str(&step.render_for_prompt());
+                            }
                             MessageContent::ToolResult { tool_use_id, content, .. } => {
                                 tool_results.push(OpenAiMessage {
                                     role: "tool".into(),
@@ -91,6 +115,18 @@ impl OpenAiProvider {
                         match c {
                             MessageContent::Text { text: t } => {
                                 text.push_str(t);
+                            }
+                            MessageContent::Compaction { summary } => {
+                                text.push_str(&summary.render_for_prompt());
+                            }
+                            MessageContent::ProjectMemory { summary } => {
+                                text.push_str(&summary.render_for_prompt());
+                            }
+                            MessageContent::MemoryRecall { summary } => {
+                                text.push_str(&summary.render_for_prompt());
+                            }
+                            MessageContent::Step { step } => {
+                                text.push_str(&step.render_for_prompt());
                             }
                             MessageContent::ToolUse { id, name, input } => {
                                 tool_calls.push(OpenAiToolCall {
@@ -132,14 +168,34 @@ impl OpenAiProvider {
             })
             .collect();
 
+        let reasoning_effort =
+            if Self::omit_reasoning_effort_for_chat_completions(request, !tools.is_empty()) {
+                None
+            } else {
+                request.reasoning_effort.map(|effort| effort.to_string())
+            };
+
         OpenAiRequest {
             model: ModelRegistry::model_name(&request.model).to_string(),
             messages,
             tools: if tools.is_empty() { None } else { Some(tools) },
             max_completion_tokens: Some(request.max_tokens),
+            reasoning_effort,
             stream: true,
             stream_options: Some(StreamOptions { include_usage: true }),
         }
+    }
+
+    fn omit_reasoning_effort_for_chat_completions(
+        request: &CompletionRequest,
+        has_tools: bool,
+    ) -> bool {
+        has_tools
+            && request.reasoning_effort.is_some()
+            && matches!(
+                ModelRegistry::model_name(&request.model),
+                "gpt-5.4" | "gpt-5.4-mini" | "gpt-5.4-nano"
+            )
     }
 }
 
@@ -277,6 +333,8 @@ struct OpenAiRequest {
     tools: Option<Vec<OpenAiTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_completion_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<String>,
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<StreamOptions>,
@@ -417,6 +475,7 @@ mod tests {
     fn build_request_body_with_tools() {
         let request = CompletionRequest {
             model: "openai/gpt-5.4".into(),
+            reasoning_effort: Some(super::super::types::ReasoningEffort::High),
             system: "You are a helper.".into(),
             messages: vec![super::super::types::Message {
                 role: "user".into(),
@@ -436,10 +495,55 @@ mod tests {
         assert_eq!(body.messages.len(), 2); // system + user
         assert!(body.tools.is_some());
         assert_eq!(body.tools.as_ref().unwrap().len(), 1);
+        assert_eq!(body.reasoning_effort, None);
 
         // Verify serialization
         let json = serde_json::to_string(&body).unwrap();
         assert!(json.contains("gpt-5.4"));
         assert!(json.contains("function"));
+        assert!(!json.contains("reasoning_effort"));
+    }
+
+    #[test]
+    fn build_request_body_omits_reasoning_effort_for_gpt_5_4_tools() {
+        let request = CompletionRequest {
+            model: "openai/gpt-5.4".into(),
+            reasoning_effort: Some(super::super::types::ReasoningEffort::High),
+            system: "You are a helper.".into(),
+            messages: vec![super::super::types::Message {
+                role: "user".into(),
+                content: vec![MessageContent::Text { text: "hello".into() }],
+            }],
+            tools: vec![super::super::types::ToolDefinition {
+                name: "read".into(),
+                description: "Read a file.".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }],
+            max_tokens: 4096,
+        };
+
+        let body = OpenAiProvider::build_request_body(&request);
+        assert_eq!(body.reasoning_effort, None);
+
+        let json = serde_json::to_string(&body).unwrap();
+        assert!(!json.contains("reasoning_effort"));
+    }
+
+    #[test]
+    fn build_request_body_keeps_reasoning_effort_without_tools() {
+        let request = CompletionRequest {
+            model: "openai/gpt-5.4".into(),
+            reasoning_effort: Some(super::super::types::ReasoningEffort::High),
+            system: "You are a helper.".into(),
+            messages: vec![super::super::types::Message {
+                role: "user".into(),
+                content: vec![MessageContent::Text { text: "hello".into() }],
+            }],
+            tools: vec![],
+            max_tokens: 4096,
+        };
+
+        let body = OpenAiProvider::build_request_body(&request);
+        assert_eq!(body.reasoning_effort.as_deref(), Some("high"));
     }
 }

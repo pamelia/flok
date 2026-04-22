@@ -453,6 +453,31 @@ impl App {
                 flok_core::bus::BusEvent::CompressionStats { t1_pruned, l2_compressed, .. } => {
                     tracing::debug!(t1_pruned, l2_compressed, "compression stats updated");
                 }
+                flok_core::bus::BusEvent::CompactionUpdated {
+                    covered_message_count,
+                    recent_message_count,
+                    referenced_files,
+                    ..
+                } => {
+                    self.history.push(HistoryItem::system_info(format!(
+                        "Structured memory refreshed: compacted {covered_message_count} messages, keeping {recent_message_count} recent, tracking {referenced_files} referenced files"
+                    )));
+                    self.chat_view.on_new_content();
+                    self.maintain_chat_drag_lock();
+                    self.dirty = true;
+                }
+                flok_core::bus::BusEvent::ProjectMemoryUpdated {
+                    source_sessions,
+                    referenced_files,
+                    ..
+                } => {
+                    self.history.push(HistoryItem::system_info(format!(
+                        "Project memory refreshed: {source_sessions} prior sessions, {referenced_files} referenced files"
+                    )));
+                    self.chat_view.on_new_content();
+                    self.maintain_chat_drag_lock();
+                    self.dirty = true;
+                }
                 flok_core::bus::BusEvent::VerificationStarted { command, .. } => {
                     self.history
                         .push(HistoryItem::system_info(format!("Verification running: {command}")));
@@ -467,6 +492,32 @@ impl App {
                         HistoryItem::system_error(summary)
                     };
                     self.history.push(item);
+                    self.chat_view.on_new_content();
+                    self.maintain_chat_drag_lock();
+                    self.dirty = true;
+                }
+                flok_core::bus::BusEvent::ConfigReloaded { version, changed_paths } => {
+                    let changed = if changed_paths.is_empty() {
+                        "config files changed".to_string()
+                    } else {
+                        changed_paths.join(", ")
+                    };
+                    self.history.push(HistoryItem::system_info(format!(
+                        "Config reloaded to v{version}: {changed}"
+                    )));
+                    self.chat_view.on_new_content();
+                    self.maintain_chat_drag_lock();
+                    self.dirty = true;
+                }
+                flok_core::bus::BusEvent::ConfigReloadFailed { changed_paths, error } => {
+                    let changed = if changed_paths.is_empty() {
+                        "config files changed".to_string()
+                    } else {
+                        changed_paths.join(", ")
+                    };
+                    self.history.push(HistoryItem::system_error(format!(
+                        "Config reload failed after {changed}: {error}"
+                    )));
                     self.chat_view.on_new_content();
                     self.maintain_chat_drag_lock();
                     self.dirty = true;
@@ -1473,6 +1524,48 @@ mod tests {
             item,
             HistoryItem::System { text, .. }
                 if text.contains("Model routed: openai/gpt-5.4-mini -> openai/gpt-5.4")
+        )));
+    }
+
+    #[tokio::test]
+    async fn compaction_updated_bus_event_adds_system_history_item() {
+        let (channels, _cmd_rx) = make_channels();
+        let (tx, rx) = mpsc::unbounded_channel::<AppEvent>();
+        let mut app = App::new(channels, tx, rx);
+
+        app.handle_event(AppEvent::BusEvent(flok_core::bus::BusEvent::CompactionUpdated {
+            session_id: "session-1".to_string(),
+            covered_message_count: 14,
+            recent_message_count: 8,
+            referenced_files: 3,
+        }));
+
+        assert!(app.history.iter().any(|item| matches!(
+            item,
+            HistoryItem::System { text, .. }
+                if text.contains("Structured memory refreshed: compacted 14 messages")
+                    && text.contains("keeping 8 recent")
+                    && text.contains("tracking 3 referenced files")
+        )));
+    }
+
+    #[tokio::test]
+    async fn project_memory_updated_bus_event_adds_system_history_item() {
+        let (channels, _cmd_rx) = make_channels();
+        let (tx, rx) = mpsc::unbounded_channel::<AppEvent>();
+        let mut app = App::new(channels, tx, rx);
+
+        app.handle_event(AppEvent::BusEvent(flok_core::bus::BusEvent::ProjectMemoryUpdated {
+            session_id: "session-1".to_string(),
+            source_sessions: 2,
+            referenced_files: 5,
+        }));
+
+        assert!(app.history.iter().any(|item| matches!(
+            item,
+            HistoryItem::System { text, .. }
+                if text.contains("Project memory refreshed: 2 prior sessions")
+                    && text.contains("5 referenced files")
         )));
     }
 

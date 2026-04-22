@@ -3,6 +3,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context};
@@ -41,8 +42,7 @@ impl SeverityFilter {
 #[derive(Clone)]
 pub struct LspManager {
     project_root: PathBuf,
-    config: LspConfig,
-    enabled: bool,
+    runtime: Arc<RwLock<LspRuntimeState>>,
     documents: Arc<Mutex<HashMap<PathBuf, TrackedDocument>>>,
     diagnostics: Arc<Mutex<HashMap<PathBuf, Vec<Diagnostic>>>>,
     server: Arc<Mutex<Option<Arc<LspServer>>>>,
@@ -52,11 +52,9 @@ pub struct LspManager {
 impl LspManager {
     pub fn new(project_root: PathBuf, config: LspConfig) -> Self {
         let project_root = std::fs::canonicalize(&project_root).unwrap_or(project_root);
-        let enabled = config.enabled && project_root.join("Cargo.toml").exists();
         Self {
+            runtime: Arc::new(RwLock::new(LspRuntimeState::new(&project_root, config))),
             project_root,
-            config,
-            enabled,
             documents: Arc::new(Mutex::new(HashMap::new())),
             diagnostics: Arc::new(Mutex::new(HashMap::new())),
             server: Arc::new(Mutex::new(None)),
@@ -70,7 +68,33 @@ impl LspManager {
     }
 
     pub fn tools_enabled(&self) -> bool {
-        self.enabled
+        self.runtime_snapshot().enabled
+    }
+
+    pub fn workspace_supported(&self) -> bool {
+        self.runtime_snapshot().workspace_kind.is_some()
+    }
+
+    pub async fn reload_config(&self, config: LspConfig) {
+        let next = LspRuntimeState::new(&self.project_root, config);
+        let previous = self.runtime_snapshot();
+        let should_restart = previous.should_restart_for(&next);
+
+        {
+            let mut runtime =
+                self.runtime.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+            *runtime = next.clone();
+        }
+
+        if should_restart {
+            *self.startup_error.lock().await = None;
+            self.server.lock().await.take();
+            self.diagnostics.lock().await.clear();
+            let mut documents = self.documents.lock().await;
+            for document in documents.values_mut() {
+                document.opened_in_server = false;
+            }
+        }
     }
 
     pub async fn track_read(&self, path: &Path, text: String) -> anyhow::Result<()> {
@@ -291,7 +315,7 @@ impl LspManager {
                         serde_json::json!({
                             "textDocument": {
                                 "uri": path_to_uri(&path)?,
-                                "languageId": "rust",
+                                "languageId": self.language_id(&path),
                                 "version": version,
                                 "text": text,
                             }
@@ -334,8 +358,8 @@ impl LspManager {
     }
 
     async fn ensure_server(&self) -> anyhow::Result<Arc<LspServer>> {
-        if !self.enabled {
-            bail!("native lsp is disabled or no Rust project was detected");
+        if !self.runtime_snapshot().enabled {
+            bail!("native lsp is disabled or no supported project was detected");
         }
 
         if let Some(message) = self.startup_error.lock().await.clone() {
@@ -349,10 +373,11 @@ impl LspManager {
 
         let server = match LspServer::spawn(
             self.project_root.clone(),
-            self.config.rust.command.clone(),
-            self.config.rust.args.clone(),
+            self.server_command(),
+            self.server_args(),
             Arc::clone(&self.diagnostics),
             self.request_timeout(),
+            self.runtime_snapshot().workspace_kind,
         )
         .await
         {
@@ -369,12 +394,13 @@ impl LspManager {
     }
 
     fn request_timeout(&self) -> Duration {
-        Duration::from_millis(self.config.request_timeout_ms.max(1))
+        Duration::from_millis(self.runtime_snapshot().config.request_timeout_ms.max(1))
     }
 
     fn normalize_supported_target(&self, path: &Path) -> anyhow::Result<PathBuf> {
-        if !self.enabled {
-            bail!("native lsp is disabled or no Rust project was detected");
+        let runtime = self.runtime_snapshot();
+        if !runtime.enabled {
+            bail!("native lsp is disabled or no supported project was detected");
         }
 
         if path.is_dir() {
@@ -390,13 +416,20 @@ impl LspManager {
     }
 
     fn normalize_supported_file(&self, path: &Path) -> anyhow::Result<PathBuf> {
+        let runtime = self.runtime_snapshot();
         self.normalize_relevant_path(path)?.ok_or_else(|| {
-            anyhow!("native lsp currently supports Rust files inside the project root")
+            anyhow!(
+                "native lsp currently supports {} files inside the project root",
+                runtime.workspace_kind.map_or("supported".to_string(), |kind| kind
+                    .file_support_message()
+                    .to_string())
+            )
         })
     }
 
     fn normalize_relevant_path(&self, path: &Path) -> anyhow::Result<Option<PathBuf>> {
-        if !self.enabled {
+        let runtime = self.runtime_snapshot();
+        if !runtime.enabled {
             return Ok(None);
         }
 
@@ -405,11 +438,45 @@ impl LspManager {
             return Ok(None);
         }
 
-        if normalized.extension().and_then(std::ffi::OsStr::to_str) != Some("rs") {
+        let Some(kind) = runtime.workspace_kind else {
+            return Ok(None);
+        };
+
+        if !kind.supports_path(&normalized) {
             return Ok(None);
         }
 
         Ok(Some(normalized))
+    }
+
+    fn server_command(&self) -> String {
+        let runtime = self.runtime_snapshot();
+        match runtime.workspace_kind {
+            Some(WorkspaceLspKind::Rust) => runtime.config.rust.command,
+            Some(WorkspaceLspKind::JavaScript) => runtime.config.javascript.command,
+            Some(WorkspaceLspKind::Python) => runtime.config.python.command,
+            Some(WorkspaceLspKind::Go) => runtime.config.go.command,
+            None => String::new(),
+        }
+    }
+
+    fn server_args(&self) -> Vec<String> {
+        let runtime = self.runtime_snapshot();
+        match runtime.workspace_kind {
+            Some(WorkspaceLspKind::Rust) => runtime.config.rust.args,
+            Some(WorkspaceLspKind::JavaScript) => runtime.config.javascript.args,
+            Some(WorkspaceLspKind::Python) => runtime.config.python.args,
+            Some(WorkspaceLspKind::Go) => runtime.config.go.args,
+            None => Vec::new(),
+        }
+    }
+
+    fn language_id(&self, path: &Path) -> &'static str {
+        self.runtime_snapshot().workspace_kind.map_or("plaintext", |kind| kind.language_id(path))
+    }
+
+    fn runtime_snapshot(&self) -> LspRuntimeState {
+        self.runtime.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
     }
 }
 
@@ -417,9 +484,117 @@ impl std::fmt::Debug for LspManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LspManager")
             .field("project_root", &self.project_root)
-            .field("enabled", &self.enabled)
+            .field("workspace_kind", &self.runtime_snapshot().workspace_kind)
+            .field("enabled", &self.runtime_snapshot().enabled)
             .finish_non_exhaustive()
     }
+}
+
+#[derive(Debug, Clone)]
+struct LspRuntimeState {
+    config: LspConfig,
+    workspace_kind: Option<WorkspaceLspKind>,
+    enabled: bool,
+}
+
+impl LspRuntimeState {
+    fn new(project_root: &Path, config: LspConfig) -> Self {
+        let workspace_kind = detect_workspace_kind(project_root);
+        let enabled = config.enabled && workspace_kind.is_some();
+        Self { config, workspace_kind, enabled }
+    }
+
+    fn should_restart_for(&self, next: &Self) -> bool {
+        self.enabled != next.enabled
+            || self.workspace_kind != next.workspace_kind
+            || self.config.request_timeout_ms != next.config.request_timeout_ms
+            || self.server_command() != next.server_command()
+            || self.server_args() != next.server_args()
+    }
+
+    fn server_command(&self) -> &str {
+        match self.workspace_kind {
+            Some(WorkspaceLspKind::Rust) => &self.config.rust.command,
+            Some(WorkspaceLspKind::JavaScript) => &self.config.javascript.command,
+            Some(WorkspaceLspKind::Python) => &self.config.python.command,
+            Some(WorkspaceLspKind::Go) => &self.config.go.command,
+            None => "",
+        }
+    }
+
+    fn server_args(&self) -> &[String] {
+        match self.workspace_kind {
+            Some(WorkspaceLspKind::Rust) => &self.config.rust.args,
+            Some(WorkspaceLspKind::JavaScript) => &self.config.javascript.args,
+            Some(WorkspaceLspKind::Python) => &self.config.python.args,
+            Some(WorkspaceLspKind::Go) => &self.config.go.args,
+            None => &[],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceLspKind {
+    Rust,
+    JavaScript,
+    Python,
+    Go,
+}
+
+impl WorkspaceLspKind {
+    fn supports_path(self, path: &Path) -> bool {
+        matches!(
+            (self, path.extension().and_then(std::ffi::OsStr::to_str)),
+            (Self::Rust, Some("rs"))
+                | (Self::JavaScript, Some("js" | "jsx" | "ts" | "tsx"))
+                | (Self::Python, Some("py" | "pyi"))
+                | (Self::Go, Some("go"))
+        )
+    }
+
+    fn language_id(self, path: &Path) -> &'static str {
+        match (self, path.extension().and_then(std::ffi::OsStr::to_str)) {
+            (Self::Rust, _) => "rust",
+            (Self::JavaScript, Some("ts")) => "typescript",
+            (Self::JavaScript, Some("tsx")) => "typescriptreact",
+            (Self::JavaScript, Some("jsx")) => "javascriptreact",
+            (Self::JavaScript, _) => "javascript",
+            (Self::Python, _) => "python",
+            (Self::Go, _) => "go",
+        }
+    }
+
+    fn file_support_message(self) -> &'static str {
+        match self {
+            Self::Rust => "Rust",
+            Self::JavaScript => "JavaScript/TypeScript",
+            Self::Python => "Python",
+            Self::Go => "Go",
+        }
+    }
+}
+
+fn detect_workspace_kind(project_root: &Path) -> Option<WorkspaceLspKind> {
+    if project_root.join("Cargo.toml").exists() {
+        return Some(WorkspaceLspKind::Rust);
+    }
+    if project_root.join("package.json").exists()
+        || project_root.join("tsconfig.json").exists()
+        || project_root.join("jsconfig.json").exists()
+    {
+        return Some(WorkspaceLspKind::JavaScript);
+    }
+    if project_root.join("pyproject.toml").exists()
+        || project_root.join("requirements.txt").exists()
+        || project_root.join("setup.py").exists()
+        || project_root.join("Pipfile").exists()
+    {
+        return Some(WorkspaceLspKind::Python);
+    }
+    if project_root.join("go.mod").exists() || project_root.join("go.work").exists() {
+        return Some(WorkspaceLspKind::Go);
+    }
+    None
 }
 
 struct LspServer {
@@ -437,6 +612,7 @@ impl LspServer {
         args: Vec<String>,
         diagnostics: Arc<Mutex<HashMap<PathBuf, Vec<Diagnostic>>>>,
         timeout: Duration,
+        workspace_kind: Option<WorkspaceLspKind>,
     ) -> anyhow::Result<Self> {
         let mut child = Command::new(&command)
             .args(&args)
@@ -463,7 +639,7 @@ impl LspServer {
             next_request_id: AtomicU64::new(1),
         };
 
-        server.spawn_reader(stdout, diagnostics);
+        server.spawn_reader(stdout, diagnostics, workspace_kind);
 
         let root_uri = path_to_uri(&project_root)?;
         let initialize = serde_json::json!({
@@ -493,6 +669,7 @@ impl LspServer {
         &self,
         stdout: ChildStdout,
         diagnostics: Arc<Mutex<HashMap<PathBuf, Vec<Diagnostic>>>>,
+        workspace_kind: Option<WorkspaceLspKind>,
     ) {
         let pending = self.pending.clone();
         let writer = self.writer.clone();
@@ -514,6 +691,7 @@ impl LspServer {
                     &diagnostics,
                     &writer,
                     &project_root,
+                    workspace_kind,
                     &message,
                 )
                 .await
@@ -657,6 +835,7 @@ async fn handle_incoming_message(
     diagnostics: &Arc<Mutex<HashMap<PathBuf, Vec<Diagnostic>>>>,
     writer: &Arc<Mutex<ChildStdin>>,
     project_root: &Path,
+    workspace_kind: Option<WorkspaceLspKind>,
     message: &[u8],
 ) -> anyhow::Result<()> {
     let value: serde_json::Value = serde_json::from_slice(message)?;
@@ -673,7 +852,7 @@ async fn handle_incoming_message(
         return Ok(());
     }
 
-    if let Some(response) = response_for_server_request(project_root, &value)? {
+    if let Some(response) = response_for_server_request(project_root, workspace_kind, &value)? {
         let mut writer = writer.lock().await;
         write_rpc_message(&mut *writer, &response).await?;
         return Ok(());
@@ -700,6 +879,7 @@ async fn handle_incoming_message(
 
 fn response_for_server_request(
     project_root: &Path,
+    workspace_kind: Option<WorkspaceLspKind>,
     value: &serde_json::Value,
 ) -> anyhow::Result<Option<serde_json::Value>> {
     let Some(method) = value.get("method").and_then(serde_json::Value::as_str) else {
@@ -710,7 +890,7 @@ fn response_for_server_request(
     };
 
     let result = match method {
-        "workspace/configuration" => configuration_response(value.get("params")),
+        "workspace/configuration" => configuration_response(workspace_kind, value.get("params")),
         "workspace/workspaceFolders" => workspace_folders_response(project_root)?,
         _ => serde_json::Value::Null,
     };
@@ -722,7 +902,10 @@ fn response_for_server_request(
     })))
 }
 
-fn configuration_response(params: Option<&serde_json::Value>) -> serde_json::Value {
+fn configuration_response(
+    workspace_kind: Option<WorkspaceLspKind>,
+    params: Option<&serde_json::Value>,
+) -> serde_json::Value {
     let items = params
         .and_then(|params| params.get("items"))
         .and_then(serde_json::Value::as_array)
@@ -732,13 +915,39 @@ fn configuration_response(params: Option<&serde_json::Value>) -> serde_json::Val
     serde_json::Value::Array(
         items
             .into_iter()
-            .map(|item| match item.get("section").and_then(serde_json::Value::as_str) {
-                Some(section)
-                    if section == "rust-analyzer" || section.starts_with("rust-analyzer.") =>
-                {
-                    serde_json::json!({})
+            .map(|item| {
+                match (workspace_kind, item.get("section").and_then(serde_json::Value::as_str)) {
+                    (Some(WorkspaceLspKind::Rust), Some(section))
+                        if section == "rust-analyzer" || section.starts_with("rust-analyzer.") =>
+                    {
+                        serde_json::json!({})
+                    }
+                    (Some(WorkspaceLspKind::JavaScript), Some(section))
+                        if section == "typescript"
+                            || section.starts_with("typescript.")
+                            || section == "javascript"
+                            || section.starts_with("javascript.") =>
+                    {
+                        serde_json::json!({})
+                    }
+                    (Some(WorkspaceLspKind::Python), Some(section))
+                        if section == "python"
+                            || section.starts_with("python.")
+                            || section == "pyright"
+                            || section.starts_with("pyright.") =>
+                    {
+                        serde_json::json!({})
+                    }
+                    (Some(WorkspaceLspKind::Go), Some(section))
+                        if section == "gopls"
+                            || section.starts_with("gopls.")
+                            || section == "go"
+                            || section.starts_with("go.") =>
+                    {
+                        serde_json::json!({})
+                    }
+                    _ => serde_json::Value::Null,
                 }
-                _ => serde_json::Value::Null,
             })
             .collect(),
     )
@@ -1131,10 +1340,51 @@ mod tests {
     }
 
     #[test]
+    fn lsp_tools_enable_for_javascript_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{ \"name\": \"demo\" }\n").unwrap();
+        let manager = LspManager::new(dir.path().to_path_buf(), LspConfig::default());
+        assert!(manager.tools_enabled());
+    }
+
+    #[test]
+    fn lsp_tools_enable_for_python_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("pyproject.toml"),
+            "[project]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let manager = LspManager::new(dir.path().to_path_buf(), LspConfig::default());
+        assert!(manager.tools_enabled());
+    }
+
+    #[test]
+    fn lsp_tools_enable_for_go_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("go.mod"), "module example.com/demo\n\ngo 1.22\n").unwrap();
+        let manager = LspManager::new(dir.path().to_path_buf(), LspConfig::default());
+        assert!(manager.tools_enabled());
+    }
+
+    #[test]
+    fn workspace_supported_survives_disabled_config() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{ \"name\": \"demo\" }\n").unwrap();
+        let manager = LspManager::new(
+            dir.path().to_path_buf(),
+            LspConfig { enabled: false, ..LspConfig::default() },
+        );
+        assert!(!manager.tools_enabled());
+        assert!(manager.workspace_supported());
+    }
+
+    #[test]
     fn configuration_requests_get_minimal_rust_analyzer_response() {
         let dir = tempfile::tempdir().unwrap();
         let response = response_for_server_request(
             dir.path(),
+            Some(WorkspaceLspKind::Rust),
             &serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": 7,
@@ -1155,10 +1405,120 @@ mod tests {
     }
 
     #[test]
+    fn configuration_requests_get_minimal_javascript_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let response = response_for_server_request(
+            dir.path(),
+            Some(WorkspaceLspKind::JavaScript),
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 9,
+                "method": "workspace/configuration",
+                "params": {
+                    "items": [
+                        { "section": "typescript" },
+                        { "section": "javascript.preferences" },
+                        { "section": "other.section" }
+                    ]
+                }
+            }),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(response["id"], serde_json::json!(9));
+        assert_eq!(response["result"], serde_json::json!([{}, {}, null]));
+    }
+
+    #[test]
+    fn configuration_requests_get_minimal_python_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let response = response_for_server_request(
+            dir.path(),
+            Some(WorkspaceLspKind::Python),
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 10,
+                "method": "workspace/configuration",
+                "params": {
+                    "items": [
+                        { "section": "python" },
+                        { "section": "pyright.analysis" },
+                        { "section": "other.section" }
+                    ]
+                }
+            }),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(response["id"], serde_json::json!(10));
+        assert_eq!(response["result"], serde_json::json!([{}, {}, null]));
+    }
+
+    #[test]
+    fn configuration_requests_get_minimal_go_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let response = response_for_server_request(
+            dir.path(),
+            Some(WorkspaceLspKind::Go),
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 12,
+                "method": "workspace/configuration",
+                "params": {
+                    "items": [
+                        { "section": "gopls" },
+                        { "section": "go.formatTool" },
+                        { "section": "other.section" }
+                    ]
+                }
+            }),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(response["id"], serde_json::json!(12));
+        assert_eq!(response["result"], serde_json::json!([{}, {}, null]));
+    }
+
+    #[tokio::test]
+    async fn reload_config_restarts_runtime_for_next_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("main.py");
+        std::fs::write(dir.path().join("pyproject.toml"), "[project]\nname = \"demo\"\n").unwrap();
+        std::fs::write(&file, "print('demo')\n").unwrap();
+
+        let manager = LspManager::new(
+            dir.path().to_path_buf(),
+            LspConfig { enabled: false, ..LspConfig::default() },
+        );
+        assert!(!manager.tools_enabled());
+
+        let normalized = std::fs::canonicalize(&file).unwrap();
+        manager.documents.lock().await.insert(
+            normalized.clone(),
+            TrackedDocument {
+                text: "print('demo')\n".to_string(),
+                version: 1,
+                opened_in_server: true,
+            },
+        );
+        manager.startup_error.lock().await.replace("boom".to_string());
+
+        manager.reload_config(LspConfig::default()).await;
+
+        assert!(manager.tools_enabled());
+        assert!(manager.startup_error.lock().await.is_none());
+        assert!(!manager.documents.lock().await[&normalized].opened_in_server);
+    }
+
+    #[test]
     fn register_capability_requests_receive_null_result() {
         let dir = tempfile::tempdir().unwrap();
         let response = response_for_server_request(
             dir.path(),
+            Some(WorkspaceLspKind::Rust),
             &serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": 11,

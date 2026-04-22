@@ -7,7 +7,7 @@ use std::sync::Arc;
 use flok_db::Db;
 
 use crate::bus::Bus;
-use crate::config::FlokConfig;
+use crate::config::{FlokConfig, LiveConfig};
 use crate::lsp::LspManager;
 use crate::provider::{Provider, ProviderRegistry};
 use crate::snapshot::SnapshotManager;
@@ -55,12 +55,12 @@ impl Default for PlanMode {
 /// independently of the `Db` (which is `!Send` due to `rusqlite`).
 pub struct AppState {
     pub db: Db,
-    pub config: FlokConfig,
+    pub config: LiveConfig,
     pub provider: Arc<dyn Provider>,
     pub provider_registry: Arc<ProviderRegistry>,
     pub tools: ToolRegistry,
     pub bus: Bus,
-    pub permissions: PermissionManager,
+    pub permissions: Arc<PermissionManager>,
     pub cost_tracker: CostTracker,
     pub plan_mode: PlanMode,
     pub project_root: PathBuf,
@@ -79,7 +79,7 @@ impl AppState {
         provider_registry: Arc<ProviderRegistry>,
         tools: ToolRegistry,
         bus: Bus,
-        permissions: PermissionManager,
+        permissions: Arc<PermissionManager>,
         cost_tracker: CostTracker,
         plan_mode: PlanMode,
         project_root: PathBuf,
@@ -89,7 +89,7 @@ impl AppState {
     ) -> Self {
         Self {
             db,
-            config,
+            config: LiveConfig::new(config),
             provider,
             provider_registry,
             tools,
@@ -113,13 +113,14 @@ impl AppState {
         session_id: &str,
         cancel: tokio_util::sync::CancellationToken,
     ) -> ToolContext {
+        let config = self.config.current();
         ToolContext {
             project_root: self.project_root.clone(),
             session_id: session_id.to_string(),
             agent: "primary".to_string(),
             cancel,
             lsp: Some(Arc::clone(&self.lsp)),
-            output_compression: self.config.output_compression.clone(),
+            output_compression: config.output_compression.clone(),
         }
     }
 }

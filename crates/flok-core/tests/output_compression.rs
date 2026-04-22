@@ -23,13 +23,7 @@ fn numbered_output(count: usize) -> String {
 #[tokio::test]
 async fn bash_tool_long_output_is_compressed() {
     let ctx = tool_context(OutputCompressionConfig::default());
-    let command = concat!(
-        "i=0; ",
-        "while [ $i -lt 1000 ]; do ",
-        "printf '[build] compiling foo/%s.2.3\\n' \"$i\"; ",
-        "i=$((i+1)); ",
-        "done"
-    );
+    let command = "python3 -c 'for i in range(1000): print(f\"[build] compiling foo/{i}.2.3\")'";
 
     let output = BashTool.execute(serde_json::json!({"command": command}), &ctx).await.unwrap();
 
@@ -42,13 +36,7 @@ async fn bash_tool_long_output_is_compressed() {
 #[tokio::test]
 async fn bash_tool_short_output_is_passthrough() {
     let ctx = tool_context(OutputCompressionConfig::default());
-    let command = concat!(
-        "i=0; ",
-        "while [ $i -lt 20 ]; do ",
-        "printf 'line %s\\n' \"$i\"; ",
-        "i=$((i+1)); ",
-        "done"
-    );
+    let command = "python3 -c 'for i in range(20): print(f\"line {i}\")'";
 
     let output = BashTool.execute(serde_json::json!({"command": command}), &ctx).await.unwrap();
 
@@ -62,13 +50,7 @@ async fn compression_disabled_bypasses_pipeline() {
         enabled: false,
         ..OutputCompressionConfig::default()
     });
-    let command = concat!(
-        "i=0; ",
-        "while [ $i -lt 50 ]; do ",
-        "printf 'line %s\\n' \"$i\"; ",
-        "i=$((i+1)); ",
-        "done"
-    );
+    let command = "python3 -c 'for i in range(50): print(f\"line {i}\")'";
 
     let output = BashTool.execute(serde_json::json!({"command": command}), &ctx).await.unwrap();
 

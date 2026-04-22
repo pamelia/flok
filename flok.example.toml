@@ -1,24 +1,49 @@
 # flok configuration
 #
-# Copy this file to ~/.config/flok/flok.toml (or project-local flok.toml or
-# .flok/flok.toml) and edit as needed.
+# Copy this file to your global config directory or project root and edit as
+# needed. The global config path depends on your platform:
+#
+#   Linux:   ~/.config/flok/flok.toml
+#   macOS:   ~/Library/Application Support/flok/flok.toml
+#   Windows: {FOLDERPATH:RoamingAppData}\flok\flok.toml
+#
+# If XDG_CONFIG_HOME is set, it is respected on all platforms.
+#
+# You can also place a project-local config at:
+#   <project>/flok.toml          (committable, shared with team)
+#   <project>/.flok/flok.toml    (gitignore-able, private overrides)
+#
+# Layers merge with higher-priority files overriding lower ones:
+#   .flok/flok.toml > flok.toml > global config
 #
 # API keys are read ONLY from this file at runtime — environment variables
 # are NOT consulted. Set a key interactively via:
 #
-#     flok auth login --provider <anthropic|openai|deepseek|minimax>
+#     flok auth login --provider <anthropic|openai|minimax>
 #
-# The CLI writes ~/.config/flok/flok.toml with mode 0600 on Unix.
+# The CLI writes the global config file with mode 0600 on Unix.
+
+# ---------------------------------------------------------------------------
+# Model & Reasoning
+# ---------------------------------------------------------------------------
 
 # Default model to use when the `--model` CLI flag is not given. Accepts any
 # alias supported by `flok models` (e.g. "sonnet", "opus-4.7", "gpt-5.4") or
 # a full ID like "anthropic/claude-opus-4-7".
 # model = "opus-4.7"
 
+# Default reasoning effort for providers/models that support it.
+# Supported values: "none", "minimal", "low", "medium", "high", "xhigh"
+# reasoning_effort = "high"
+
+# ---------------------------------------------------------------------------
+# Providers
+# ---------------------------------------------------------------------------
+
 # Anthropic provider configuration
 [provider.anthropic]
 # api_key = "sk-ant-..."       # Set via: flok auth login --provider anthropic
-# default_model = "opus-4.7"   # Fallback model when `model` above is unset.
+# default_model = "opus-4.7"   # Fallback model when top-level `model` is unset
 # fallback = ["openai"]        # Try OpenAI automatically on 429/5xx/529
 
 # OpenAI provider configuration
@@ -28,25 +53,134 @@
 # default_model = "gpt-5.4"
 # fallback = ["anthropic"]
 
-# DeepSeek provider configuration (uses OpenAI-compatible API)
-[provider.deepseek]
-# api_key = "sk-..."           # Set via: flok auth login --provider deepseek
-# base_url = "https://api.deepseek.com/v1"
-# default_model = "deepseek"
-
 # MiniMax provider configuration (uses Anthropic-compatible API)
 [provider.minimax]
 # api_key = "..."              # Set via: flok auth login --provider minimax
 # default_model = "minimax"
 
+# ---------------------------------------------------------------------------
+# Per-Agent Overrides
+# ---------------------------------------------------------------------------
+#
+# Any built-in sub-agent can have its own block under [agents.<name>].
+# Known built-ins:
+# - explore                    (fast codebase search)
+# - general                    (general-purpose multi-step tasks)
+# - feasibility-reviewer       (technical feasibility & architecture fit)
+# - complexity-reviewer        (complexity & simplicity analysis)
+# - completeness-reviewer      (completeness & edge case coverage)
+# - operations-reviewer        (operations & reliability)
+# - api-reviewer               (API design & contracts)
+# - clarity-reviewer           (clarity & precision)
+# - scope-reviewer             (scope & delivery risk)
+# - product-reviewer           (product & value alignment)
+#
+# Repeat this block shape for any of the names above.
+
 [agents.explore]
-# model = "haiku"                            # Preferred model for this built-in agent
-# fallback_models = ["minimax", "nano"]    # Replaces provider fallback chain for this agent
-# prompt_append = "Be concise."              # Appended to the built-in system prompt
+# model = "haiku"                           # Preferred model for this agent
+# reasoning_effort = "low"                  # Per-agent reasoning override
+# fallback_models = ["minimax", "nano"]     # Replaces provider fallback chain
+# prompt_append = "Be concise."             # Appended to the built-in system prompt
+
+[agents.feasibility-reviewer]
+# model = "opus-4.7"
+# reasoning_effort = "high"
+
+[agents.completeness-reviewer]
+# model = "gpt-5.4"
+# reasoning_effort = "medium"
+
+# ---------------------------------------------------------------------------
+# Runtime Fallback
+# ---------------------------------------------------------------------------
 
 [runtime_fallback]
-# enabled = true
-# retry_on_errors = [429, 500, 502, 503, 529]
-# max_attempts = 3              # Total attempts across primary + fallbacks
-# cooldown_seconds = 120        # Provider-wide cooldown after retriable failure
-# notify_on_fallback = true     # Emit inline fallback notices in the TUI
+# enabled = true                            # Enable automatic provider failover
+# retry_on_errors = [429, 500, 502, 503, 529]  # HTTP codes that trigger fallback
+# max_attempts = 3                          # Total attempts across primary + fallbacks
+# cooldown_seconds = 120                    # Provider-wide cooldown after failure
+# notify_on_fallback = true                 # Emit inline fallback notices in TUI
+
+# ---------------------------------------------------------------------------
+# Intelligent Routing
+# ---------------------------------------------------------------------------
+#
+# Automatically upgrades complex turns to stronger models based on heuristic
+# complexity signals (tool density, verification retries, architecture keywords,
+# conversation length, etc.).
+
+[intelligent_routing]
+# enabled = true                            # Enable request-time model routing
+# complexity_threshold = 4                  # Min complexity score before upgrade
+
+# ---------------------------------------------------------------------------
+# LSP Integration
+# ---------------------------------------------------------------------------
+#
+# Built-in LSP client. Currently supports rust-analyzer for Rust projects
+# (auto-detected via Cargo.toml or rust-toolchain.toml). When enabled, adds
+# four tools: lsp_diagnostics, lsp_goto_definition, lsp_find_references,
+# lsp_symbols.
+
+[lsp]
+# enabled = true                            # Enable LSP integration
+# request_timeout_ms = 5000                 # Timeout for LSP requests (ms)
+
+[lsp.rust]
+# command = "rust-analyzer"                 # LSP server binary
+# args = []                                 # Extra arguments for the server
+
+# ---------------------------------------------------------------------------
+# Worktree Isolation
+# ---------------------------------------------------------------------------
+#
+# Sub-agents run in isolated git worktrees so they can edit files without
+# conflicting with the main session or each other. Only active in git repos.
+
+[worktree]
+# enabled = true                            # Enable worktree isolation
+# auto_merge = true                         # Auto-merge non-conflicting changes
+# cleanup_on_complete = true                # Remove worktree dir after merge
+
+# ---------------------------------------------------------------------------
+# Permissions
+# ---------------------------------------------------------------------------
+#
+# Configure per-tool permission rules. Each entry can be:
+# - A bare action:   read = "allow"         (applies to all patterns)
+# - A pattern table: [permission.bash]      (with pattern = action pairs)
+#
+# Actions: "allow", "deny", "ask"
+# Patterns support * (zero or more chars) and ? (exactly one char).
+
+[permission]
+# read = "allow"                            # Allow all file reads
+# glob = "allow"                            # Allow all glob searches
+# grep = "allow"                            # Allow all grep searches
+
+# [permission.bash]
+# "*" = "allow"                             # Allow all bash commands
+# "rm -rf *" = "deny"                       # Deny destructive patterns
+
+# [permission.external_directory]
+# "*" = "ask"                               # Always prompt for external dirs
+
+# ---------------------------------------------------------------------------
+# Output Compression
+# ---------------------------------------------------------------------------
+#
+# Controls the tool output compression pipeline, primarily for bash output.
+# Includes line truncation, deduplication, progress bar stripping, and
+# command-specific smart filters.
+
+[output_compression]
+# enabled = true                            # Enable compression pipeline
+# passthrough_threshold_lines = 40          # Skip compression below this
+# max_lines = 200                           # Max line budget before truncation
+# head_lines = 50                           # Lines preserved at start
+# tail_lines = 50                           # Lines preserved at end
+# max_chars = 20000                         # Hard character budget
+# group_exact_min = 3                       # Min exact-repeat run to group
+# group_similar_min = 5                     # Min normalized-repeat run to group
+# apply_to_tools = ["bash"]                 # Tools that use this pipeline

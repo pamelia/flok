@@ -163,6 +163,7 @@ async fn run_single_reviewer(
 ) -> anyhow::Result<String> {
     let request = CompletionRequest {
         model: String::new(),
+        reasoning_effort: None,
         system: system.to_string(),
         messages: vec![Message {
             role: "user".into(),

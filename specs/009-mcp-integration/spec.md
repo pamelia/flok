@@ -25,13 +25,22 @@
 1. **Given** config specifies `url = "https://mcp.example.com"`, **When** flok connects, **Then** it uses StreamableHTTP transport with SSE fallback.
 2. **Given** the remote server requires OAuth, **When** flok detects the auth requirement, **Then** it opens a browser for the OAuth flow and stores the token.
 
+### User Story 4 - MCP Coexists with Built-in Tools (Priority: P1)
+**Why this priority**: MCP extends flok's tool surface, but it must not destabilize or implicitly replace the built-in tools the agent already relies on.
+**Acceptance Scenarios**:
+1. **Given** built-in tools and MCP tools are both available, **When** a completion request is built, **Then** built-in tools are still present and MCP tools appear alongside them under namespaced names.
+2. **Given** an MCP server fails or disconnects, **When** the agent later calls a built-in tool like `read`, `bash`, or `task`, **Then** that built-in tool still works normally.
+3. **Given** a sub-agent is spawned while MCP tools are connected, **When** it receives its tool snapshot, **Then** it sees the same eligible MCP tools as the parent at snapshot time, filtered through the same mode and permission rules.
+
 ### Edge Cases
 - MCP server has slow tool calls (>30s): timeout per-call (configurable, default 30s)
 - MCP server returns invalid JSON: log error, return tool error to LLM
 - Tool name collision between MCP servers: prefix with server name (e.g., `filesystem_read_file`)
+- MCP tool name collision with a built-in tool: namespace ensures the MCP tool does not shadow the built-in
 - MCP server declared in config but not installed: log warning, skip, don't block startup
 - MCP server returns tools dynamically (list changes): handle `ToolListChanged` notification
 - OAuth token expires: auto-refresh before next request
+- Built-in tool surface may be rationalized separately over time, but MCP integration must not assume any current built-in tool disappears
 
 ## Requirements
 
@@ -70,6 +79,13 @@
   args = [...]
   disabled = true
   ```
+- **FR-013**: MCP tools MUST coexist with built-in tools; introducing MCP MUST NOT remove, proxy, or otherwise replace core built-in tools as part of this feature.
+- **FR-014**: Core built-in tools that enforce local security, workspace mutation, TUI interaction, session orchestration, or in-process LSP behavior MUST remain first-class in-process tools rather than being reimplemented as MCP shims.
+- **FR-015**: MCP tools MUST participate in the same permission and tool-filtering pipeline as built-in tools, keyed by their qualified names (for example, `filesystem_read_file`).
+- **FR-016**: The tool registry MUST support dynamic MCP tool names with owned `String` keys; the design MUST NOT assume all tool names are `&'static str`.
+- **FR-017**: MCP tool refresh for a single server MUST atomically replace only that server's dynamic tool set without disturbing built-in tools or MCP tools from other servers.
+- **FR-018**: Sub-agent tool snapshots, plan/build mode filtering, and tool-definition generation MUST treat currently connected MCP tools as first-class discovered tools.
+- **FR-019**: Reducing overlap among existing built-in tools is a separate tool-surface cleanup effort. MCP integration MAY benefit from that cleanup, but MUST NOT depend on it for correctness.
 
 ### Key Entities
 
@@ -128,6 +144,11 @@ pub struct McpToolDefinition {
     pub description: String,
     pub input_schema: serde_json::Value,
 }
+
+pub struct ToolRegistry {
+    pub builtins: HashMap<String, Arc<dyn Tool>>,
+    pub dynamic_tools: DashMap<String, Arc<dyn Tool>>,
+}
 ```
 
 ## Design
@@ -135,6 +156,21 @@ pub struct McpToolDefinition {
 ### Overview
 
 The MCP integration provides flok with extensible tool capabilities via the Model Context Protocol. It manages connections to external MCP servers, discovers their tools, and routes tool calls from the LLM to the appropriate server. The design prioritizes: (1) non-blocking startup (MCP connections don't delay TUI launch), (2) graceful degradation (failed servers don't crash flok), and (3) transparent tool routing (the LLM doesn't need to know it's calling an MCP tool).
+
+### Impact on Existing Built-in Tools
+
+The MCP/tool-system analysis produced two important conclusions that shape this spec:
+
+1. **MCP extends flok; it does not obsolete the current built-ins.**
+   - Security-critical workspace tools such as `read`, `write`, `edit`/`fast_apply`, `bash`, `grep`, `glob`, and `smart_grep` remain in-process because they enforce sandbox and path-safety guarantees.
+   - TUI/session-coupled tools such as `question`, `todowrite`, `skill`, `agent_memory`, and plan-mode tooling remain in-process because they interact directly with flok state and UI channels.
+   - Agent-orchestration tools such as `task`, team coordination tools, and review/workflow orchestration remain in-process because they are built on flok's session engine, event bus, and worktree model.
+   - LSP-backed tools remain in-process because flok already owns the LSP lifecycle; wrapping them in MCP would add complexity without clear benefit.
+
+2. **Built-in tool count and overlap are real concerns, but they are a separate problem.**
+   - MCP should be designed so dynamic tools can coexist with the current built-ins today.
+   - Consolidating overlapping built-ins (for example, planning or team-management tools) is a follow-up tool-surface cleanup effort, not a prerequisite for MCP correctness.
+   - The registry, permission model, and tool filtering should therefore optimize for coexistence first and treat built-in cleanup as an orthogonal future change.
 
 ### Detailed Design
 
@@ -318,20 +354,43 @@ MCP tools are registered dynamically in the tool registry:
 
 ```rust
 impl ToolRegistry {
-    pub fn register_mcp_tools(&self, mcp: &McpManager) {
-        for tool_def in mcp.all_tools() {
-            let mcp = Arc::clone(mcp);
-            let qualified_name = tool_def.qualified_name.clone();
+    pub fn register_builtin(&mut self, tool: Arc<dyn Tool>) {
+        self.builtins.insert(tool.name().to_string(), tool);
+    }
 
-            self.mcp_tools.insert(
-                tool_def.qualified_name.clone(),
+    pub fn replace_server_mcp_tools(
+        &self,
+        server_name: &str,
+        tool_defs: Vec<McpToolDefinition>,
+        mcp: Arc<McpManager>,
+    ) {
+        // Remove only this server's previously registered dynamic tools.
+        self.dynamic_tools
+            .retain(|qualified_name, _| !qualified_name.starts_with(&format!("{server_name}_")));
+
+        for tool_def in tool_defs {
+            let qualified_name = tool_def.qualified_name.clone();
+            self.dynamic_tools.insert(
+                qualified_name.clone(),
                 Arc::new(McpToolWrapper {
                     definition: tool_def,
-                    mcp,
+                    mcp: Arc::clone(&mcp),
                     qualified_name,
                 }),
             );
         }
+    }
+
+    pub fn tool_definitions(&self) -> Vec<ToolDefinition> {
+        self.builtins
+            .values()
+            .chain(self.dynamic_tools.iter().map(|entry| entry.value()))
+            .map(|tool| ToolDefinition {
+                name: tool.name().to_string(),
+                description: tool.description().to_string(),
+                input_schema: tool.parameters_schema(),
+            })
+            .collect()
     }
 }
 
@@ -354,12 +413,31 @@ impl Tool for McpToolWrapper {
 }
 ```
 
+The important behavioral constraints are:
+
+- Built-in tools are registered once and remain stable for the lifetime of the process.
+- MCP tools are dynamic and may be added, replaced, or removed per server as discovery changes.
+- A failed MCP server removes only its own dynamic tool entries; it does not affect built-ins or other MCP servers.
+- Parent sessions and sub-agents both consume the same merged built-in + MCP tool-definition view after plan/build filtering and permission checks are applied.
+
+#### Tool Filtering and Permissions
+
+MCP tools plug into the existing tool pipeline rather than bypassing it:
+
+- **Plan/build mode** still decides whether a tool is visible for the next turn.
+- **Permission checks** still run before execution, but match against the MCP tool's qualified name.
+- **Sub-agent snapshots** capture the currently visible merged tool set (built-ins + connected MCP tools).
+- **Error handling** remains local: a failed MCP call returns a tool error, but does not damage the rest of the tool registry.
+
+This gives MCP tools first-class usability without weakening the guardrails already attached to built-ins.
+
 ### Alternatives Considered
 
 1. **Use the `rmcp` crate (like Spacebot)**: Evaluate. If `rmcp` is well-maintained and supports both transports, use it instead of implementing from scratch. If it has too many dependencies or lacks StreamableHTTP, implement our own.
 2. **Skip MCP, only support built-in tools**: Rejected. MCP is the industry standard for tool extensibility. Without it, users can't integrate custom tools (databases, APIs, etc.) without forking flok.
 3. **MCP server auto-discovery**: Deferred. For now, servers must be explicitly configured. Auto-discovery via well-known files or mDNS can be added later.
 4. **MCP server sandboxing**: Deferred. Stdio servers run as child processes with the user's permissions. Sandboxing can be added later (same as for `bash` tool).
+5. **Assume MCP will replace overlapping built-in tools**: Rejected. The current analysis shows that MCP mainly covers external integrations; most existing built-ins remain necessary because they are security-sensitive, UI-coupled, orchestration-coupled, or already have an in-process runtime.
 
 ## Success Criteria
 
@@ -368,6 +446,8 @@ impl Tool for McpToolWrapper {
 - **SC-003**: MCP initialization doesn't block TUI startup (async, with 10s total timeout)
 - **SC-004**: Graceful degradation: failed MCP servers don't affect built-in tools
 - **SC-005**: Tool list refresh on `ToolListChanged` notification < 100ms
+- **SC-006**: MCP tool refresh for one server does not add, remove, or rename built-in tools
+- **SC-007**: Plan/build mode and sub-agent snapshots include connected MCP tools without regressing existing built-in tool visibility
 
 ## Assumptions
 
@@ -375,10 +455,11 @@ impl Tool for McpToolWrapper {
 - Stdio MCP servers use Content-Length framing (not newline-delimited)
 - OAuth for remote MCP servers follows standard flows (authorization code + PKCE)
 - Most users will use 0-3 MCP servers (not hundreds)
+- Built-in tool consolidation may happen later, but MCP must work against the current built-in inventory first
 
 ## Open Questions
 
 - Should we support MCP server process management (auto-restart on crash)?
 - Should we support MCP sampling (server-initiated LLM requests)?
 - Should we bundle any MCP servers (e.g., filesystem server) with flok?
-- Should MCP tool permissions use the same system as built-in tools?
+- When we later rationalize overlapping built-in tools, should the registry expose a compatibility layer for old tool names during migration?

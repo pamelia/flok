@@ -127,6 +127,7 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let request = CompletionRequest {
             model: "test".into(),
+            reasoning_effort: None,
             system: String::new(),
             messages: vec![],
             tools: vec![],
@@ -157,6 +158,7 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let request = CompletionRequest {
             model: "test".into(),
+            reasoning_effort: None,
             system: String::new(),
             messages: vec![],
             tools: vec![],
@@ -184,6 +186,7 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let request = CompletionRequest {
             model: "test".into(),
+            reasoning_effort: None,
             system: String::new(),
             messages: vec![],
             tools: vec![],

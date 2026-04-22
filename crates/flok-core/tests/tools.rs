@@ -100,6 +100,25 @@ async fn grep_tool_finds_pattern() {
 }
 
 #[tokio::test]
+async fn smart_grep_tool_finds_symbol_results() {
+    let mut h = TestHarness::new();
+    h.write_file("src/auth.rs", "pub fn verify_token() {}\nfn refresh_token() {}\n");
+
+    h.push_turn(MockTurn::ToolCalls(vec![MockToolCall {
+        name: "smart_grep".into(),
+        arguments: serde_json::json!({
+            "pattern": "verify_*",
+            "query_type": "symbol",
+            "path": h.path("src"),
+        }),
+    }]));
+    h.push_turn(MockTurn::Text("Found symbol.".into()));
+
+    let result = h.send_message("find auth symbol").await.unwrap();
+    assert!(matches!(result, SendMessageResult::Complete(_)));
+}
+
+#[tokio::test]
 async fn glob_tool_finds_files() {
     let mut h = TestHarness::new();
     h.write_file("src/main.rs", "");

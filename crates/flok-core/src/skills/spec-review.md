@@ -29,7 +29,7 @@ Based on the spec content, select 3-5 specialists from:
 | product-reviewer | When the spec has user-facing impact | User value, UX issues, root cause alignment |
 | operations-reviewer | When the spec has deployment/infra concerns | Deployment safety, observability, security |
 
-After selecting specialists, you will spawn EACH selected specialist ONCE PER CONFIGURED PROVIDER. For example, if 4 specialists are selected and 2 providers (Anthropic, OpenAI) are configured, you will spawn 8 sub-agents in total.
+After selecting specialists, spawn each selected specialist once. If you want a specialist to use a specific model, prefer configuring it via `flok.toml` with `[agents.<reviewer-name>].model`. Use the `task.model` parameter only for one-off overrides.
 
 ### Phase 3: Parallel Review
 
@@ -41,20 +41,21 @@ After selecting specialists, you will spawn EACH selected specialist ONCE PER CO
    - Self-critique: remove speculative findings that lack evidence from the spec
    - Send findings back to lead via `send_message`
 
-### Cross-Coverage Multi-Model Fan-Out
+### Per-Agent Model Selection
 
-Check your system prompt for the "Available Providers" section. For each configured provider, you MUST spawn every selected specialist.
+Default behavior is one reviewer per specialist. Set reviewer defaults in config when you want different built-in agents to use different models:
 
-Example for 2 selected specialists (feasibility, clarity) + 2 providers (Anthropic, OpenAI):
+```toml
+[agents.feasibility-reviewer]
+model = "opus"
 
+[agents.clarity-reviewer]
+model = "gpt-5.4"
 ```
-task(subagent_type: "feasibility-reviewer", model: "opus", background: true, team_id: "...", prompt: "...")
-task(subagent_type: "feasibility-reviewer", model: "gpt-5.4", background: true, team_id: "...", prompt: "...")
-task(subagent_type: "clarity-reviewer", model: "opus", background: true, team_id: "...", prompt: "...")
-task(subagent_type: "clarity-reviewer", model: "gpt-5.4", background: true, team_id: "...", prompt: "...")
-```
 
-All agents run in parallel. If only ONE provider is configured, spawn each specialist once without a `model` parameter.
+When no explicit `model` is passed to `task`, the reviewer uses its configured `[agents.<name>].model` value if present, otherwise the lead agent's current model.
+
+If the user explicitly asks for a multi-model cross-check, you may spawn additional copies of a specialist with explicit `model` overrides. That is opt-in, not the default review pattern.
 
 IMPORTANT: Spawn ALL reviewers in a single message. Do NOT spawn them one at a time.
 
@@ -66,7 +67,7 @@ After all reviewers report back, check for conflicting findings:
 - If multiple specialists flag the same concern from different angles, elevate its priority
 - Remove duplicate findings (same section + same concern = duplicate)
 
-**Cross-review challenges are single-model**: when challenging a finding, spawn the challenger on the same model the original reviewer used. Only Phase 3 (initial review) uses cross-coverage multi-model fan-out.
+**Cross-review challenges are usually single-model**: when challenging a finding, prefer using the same model as the original reviewer unless the user explicitly wants a second-model check.
 
 ### Phase 5: Synthesize & Output
 
@@ -76,18 +77,17 @@ After all reviewers report back, check for conflicting findings:
    - **REQUEST_CHANGES** if any critical or high-priority findings exist that would cause implementation failure or user harm
    - **APPROVE** otherwise (minor gaps can be addressed during implementation)
 
-### Cross-Model Synthesis
+### Synthesis
 
 Each finding arrives tagged with its reviewer AND the model that produced it. Synthesize as follows:
 
-1. **Group findings by topic**: Findings from different models about the same spec section and concern are the SAME finding.
+1. **Group findings by topic**: Findings about the same spec section and concern are the SAME finding.
 
-2. **Classify confidence**:
-   - **HIGH CONFIDENCE**: Flagged by the same specialist on BOTH providers. Report first.
-   - **MODEL-SPECIFIC**: Flagged only by one provider. Report, but label with the model (e.g., "[Only flagged by anthropic/opus-4.7]").
-   - **CONTRADICTORY**: One provider says "this is a bug", the other says "this is intentional". Flag for human judgment.
+2. **Deduplicate overlaps**:
+   - If multiple reviewers flag the same concern, merge them into one finding.
+   - If the same specialist was intentionally run on multiple models, note agreement or disagreement when it adds signal.
 
-3. **In the final report**, include a summary line: "Reviewed by N specialists × M providers = K total agents. X findings with cross-model agreement, Y model-specific findings, Z contradictions."
+3. **In the final report**, include a summary line: "Reviewed by N specialists. K total agents run. X unique findings, Y overlapping findings, Z unresolved disagreements."
 
 Output format:
 
@@ -113,7 +113,7 @@ Output format:
 
 ### Summary
 <1-2 paragraph synthesis of the spec's readiness>
-Reviewed by N specialists × M providers = K total agents. X findings with cross-model agreement, Y model-specific findings, Z contradictions.
+Reviewed by N specialists. K total agents run. X unique findings, Y overlapping findings, Z unresolved disagreements.
 ```
 
 After the review, disband the team with `team_delete`.

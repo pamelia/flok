@@ -53,6 +53,17 @@ pub enum BusEvent {
         l2_compressed: u32,
     },
 
+    /// Structured warm-memory compaction refreshed for the session.
+    CompactionUpdated {
+        session_id: String,
+        covered_message_count: usize,
+        recent_message_count: usize,
+        referenced_files: usize,
+    },
+
+    /// Project-level memory refreshed from prior session summaries.
+    ProjectMemoryUpdated { session_id: String, source_sessions: usize, referenced_files: usize },
+
     /// A snapshot was taken (before or after tool execution).
     SnapshotCreated {
         session_id: String,
@@ -77,6 +88,12 @@ pub enum BusEvent {
 
     /// Automatic verification finished.
     VerificationCompleted { session_id: String, command: String, success: bool, summary: String },
+
+    /// Runtime config reloaded successfully.
+    ConfigReloaded { version: u64, changed_paths: Vec<String> },
+
+    /// Runtime config reload failed; the previous snapshot remains active.
+    ConfigReloadFailed { changed_paths: Vec<String>, error: String },
 
     /// The current operation was cancelled by the user.
     Cancelled { session_id: String },

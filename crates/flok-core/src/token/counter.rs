@@ -32,7 +32,7 @@ impl TokenCounter {
         {
             Some(get_cl100k())
         } else {
-            // For Gemini, DeepSeek, etc. — use char-based fallback
+            // For Gemini, MiniMax, and unknown models — use char-based fallback
             None
         };
 
@@ -75,7 +75,7 @@ mod tests {
 
     #[test]
     fn count_tokens_fallback() {
-        let counter = TokenCounter::for_model("deepseek/deepseek-chat");
+        let counter = TokenCounter::for_model("minimax/MiniMax-M2.7");
         let count = counter.count("Hello, world!");
         assert!(count > 0);
         assert!(!counter.is_exact());

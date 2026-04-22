@@ -4,7 +4,9 @@ use std::sync::{Arc, Mutex};
 use flok_core::agent;
 use flok_core::bus::Bus;
 use flok_core::config::{AgentConfig, FlokConfig, WorktreeConfig};
-use flok_core::provider::{CompletionRequest, Provider, ProviderRegistry, StreamEvent};
+use flok_core::provider::{
+    CompletionRequest, Provider, ProviderRegistry, ReasoningEffort, StreamEvent,
+};
 use flok_core::team::TeamRegistry;
 use flok_core::tool::{TaskTool, Tool, ToolContext, ToolRegistry};
 use flok_core::worktree::WorktreeManager;
@@ -21,6 +23,7 @@ struct RecordingProvider {
     name: &'static str,
     behavior: ProviderBehavior,
     seen_models: Mutex<Vec<String>>,
+    seen_reasoning_efforts: Mutex<Vec<Option<ReasoningEffort>>>,
     seen_systems: Mutex<Vec<String>>,
     calls: Mutex<u32>,
 }
@@ -31,6 +34,7 @@ impl RecordingProvider {
             name,
             behavior,
             seen_models: Mutex::new(Vec::new()),
+            seen_reasoning_efforts: Mutex::new(Vec::new()),
             seen_systems: Mutex::new(Vec::new()),
             calls: Mutex::new(0),
         }
@@ -42,6 +46,13 @@ impl RecordingProvider {
 
     fn seen_systems(&self) -> Vec<String> {
         self.seen_systems.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+
+    fn seen_reasoning_efforts(&self) -> Vec<Option<ReasoningEffort>> {
+        self.seen_reasoning_efforts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     fn call_count(&self) -> u32 {
@@ -64,6 +75,10 @@ impl Provider for RecordingProvider {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(request.model);
+        self.seen_reasoning_efforts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(request.reasoning_effort);
         self.seen_systems
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -110,6 +125,7 @@ fn make_task_tool(
         provider_registry,
         default_provider.to_string(),
         default_model_id.to_string(),
+        None,
         agents_config,
         Arc::new(ToolRegistry::new()),
         Bus::new(16),
@@ -289,6 +305,82 @@ async fn task_model_param_overrides_agent_config() {
 
     assert!(!output.is_error);
     assert_eq!(anthropic.seen_models(), vec!["anthropic/claude-opus-4-6".to_string()]);
+}
+
+#[tokio::test]
+async fn reviewer_agent_config_overrides_default_model() {
+    let anthropic = Arc::new(RecordingProvider::new("anthropic", ProviderBehavior::Text("ok")));
+    let anthropic_dyn: Arc<dyn Provider> = anthropic.clone();
+    let mut registry = ProviderRegistry::new();
+    registry.insert("anthropic", anthropic_dyn, Some("anthropic/claude-sonnet-4-6".into()), 3);
+
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let project_root = std::fs::canonicalize(temp_dir.path()).expect("canonical project root");
+    let tool = make_task_tool(
+        Arc::new(registry),
+        "anthropic",
+        "anthropic/claude-sonnet-4-6",
+        parse_agents_config(
+            r#"
+            [agents.feasibility-reviewer]
+            model = "opus"
+            "#,
+        ),
+        project_root.clone(),
+    );
+
+    let output = tool
+        .execute(
+            serde_json::json!({
+                "description": "reviewer override",
+                "prompt": "respond once",
+                "subagent_type": "feasibility-reviewer"
+            }),
+            &test_context(project_root),
+        )
+        .await
+        .expect("task succeeds");
+
+    assert!(!output.is_error);
+    assert_eq!(anthropic.seen_models(), vec!["anthropic/claude-opus-4-6".to_string()]);
+}
+
+#[tokio::test]
+async fn reviewer_agent_config_overrides_default_reasoning_effort() {
+    let anthropic = Arc::new(RecordingProvider::new("anthropic", ProviderBehavior::Text("ok")));
+    let anthropic_dyn: Arc<dyn Provider> = anthropic.clone();
+    let mut registry = ProviderRegistry::new();
+    registry.insert("anthropic", anthropic_dyn, Some("anthropic/claude-sonnet-4-6".into()), 3);
+
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let project_root = std::fs::canonicalize(temp_dir.path()).expect("canonical project root");
+    let tool = make_task_tool(
+        Arc::new(registry),
+        "anthropic",
+        "anthropic/claude-sonnet-4-6",
+        parse_agents_config(
+            r#"
+            [agents.feasibility-reviewer]
+            reasoning_effort = "high"
+            "#,
+        ),
+        project_root.clone(),
+    );
+
+    let output = tool
+        .execute(
+            serde_json::json!({
+                "description": "reviewer reasoning override",
+                "prompt": "respond once",
+                "subagent_type": "feasibility-reviewer"
+            }),
+            &test_context(project_root),
+        )
+        .await
+        .expect("task succeeds");
+
+    assert!(!output.is_error);
+    assert_eq!(anthropic.seen_reasoning_efforts(), vec![Some(ReasoningEffort::High)]);
 }
 
 #[tokio::test]

@@ -7,6 +7,7 @@ mod cli;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use secrecy::{ExposeSecret, SecretString};
@@ -25,8 +26,8 @@ use flok_core::tool::{
     AgentMemoryTool, BashTool, CodeReviewTool, EditTool, FastApplyTool, GlobTool, GrepTool,
     LspDiagnosticsTool, LspFindReferencesTool, LspGotoDefinitionTool, LspSymbolsTool,
     PlanCreateTool, PlanTool, PlanUpdateTool, QuestionTool, ReadTool, SendMessageTool, SkillTool,
-    TaskTool, TeamCreateTool, TeamDeleteTool, TeamTaskTool, TodoList, TodoWriteTool, ToolRegistry,
-    WebfetchTool, WriteTool,
+    SmartGrepTool, TaskTool, TeamCreateTool, TeamDeleteTool, TeamTaskTool, TodoList, TodoWriteTool,
+    ToolRegistry, WebfetchTool, WriteTool,
 };
 use flok_core::worktree::WorktreeManager;
 use tokio::sync::mpsc;
@@ -146,6 +147,7 @@ async fn run(args: cli::Args) -> Result<()> {
     tools.register(Arc::new(FastApplyTool));
     tools.register(Arc::new(BashTool));
     tools.register(Arc::new(GrepTool));
+    tools.register(Arc::new(SmartGrepTool));
     tools.register(Arc::new(GlobTool));
     tools.register(Arc::new(WebfetchTool::new()));
     tools.register(Arc::new(QuestionTool::new(question_tx)));
@@ -187,6 +189,7 @@ async fn run(args: cli::Args) -> Result<()> {
         Arc::clone(&provider_registry),
         flok_core::provider::ModelRegistry::provider_name(&model_id).to_string(),
         model_id.clone(),
+        config.reasoning_effort,
         config.agents.clone(),
         base_tools,
         bus.clone(),
@@ -196,7 +199,7 @@ async fn run(args: cli::Args) -> Result<()> {
         team_registry,
     )));
 
-    if lsp.tools_enabled() {
+    if lsp.workspace_supported() {
         tools.register(Arc::new(LspDiagnosticsTool::new(Arc::clone(&lsp))));
         tools.register(Arc::new(LspGotoDefinitionTool::new(Arc::clone(&lsp))));
         tools.register(Arc::new(LspFindReferencesTool::new(Arc::clone(&lsp))));
@@ -220,7 +223,7 @@ async fn run(args: cli::Args) -> Result<()> {
     // Handle non-interactive mode vs interactive mode
     if let Some(prompt) = args.prompt {
         // Non-interactive: auto-approve all permissions
-        let permissions = flok_core::tool::PermissionManager::auto_approve();
+        let permissions = Arc::new(flok_core::tool::PermissionManager::auto_approve());
         let cost_tracker = flok_core::token::CostTracker::new(&model_id);
         let state = AppState::new(
             db,
@@ -242,7 +245,7 @@ async fn run(args: cli::Args) -> Result<()> {
 
     // Interactive mode — create permission channel for TUI prompts
     let (perm_tx, perm_rx) = mpsc::unbounded_channel();
-    let mut permissions = flok_core::tool::PermissionManager::new(perm_tx);
+    let permissions = Arc::new(flok_core::tool::PermissionManager::new(perm_tx));
 
     // Load config-provided permission rules
     if !config.permission.is_empty() {
@@ -297,6 +300,13 @@ async fn run(args: cli::Args) -> Result<()> {
         snapshot,
         Arc::clone(&lsp),
     );
+    tokio::task::spawn_local(watch_config_reload_loop(
+        state.project_root.clone(),
+        state.config.clone(),
+        Arc::clone(&state.permissions),
+        Arc::clone(&state.lsp),
+        bus.clone(),
+    ));
 
     run_interactive(
         state,
@@ -733,15 +743,6 @@ fn create_provider_for_name(
             let base_url = config.provider.get("openai").and_then(|c| c.base_url.clone());
             Ok(Arc::new(flok_core::provider::OpenAiProvider::new(api_key, base_url)))
         }
-        "deepseek" => {
-            let api_key = resolve_api_key("deepseek", config)?;
-            let base_url = config
-                .provider
-                .get("deepseek")
-                .and_then(|c| c.base_url.clone())
-                .or_else(|| Some("https://api.deepseek.com/v1".to_string()));
-            Ok(Arc::new(flok_core::provider::OpenAiProvider::new(api_key, base_url)))
-        }
         "minimax" => {
             let api_key = resolve_api_key("minimax", config)?;
             Ok(Arc::new(MiniMaxProvider::new(api_key, None)))
@@ -751,7 +752,7 @@ fn create_provider_for_name(
         )),
         _ => Err(anyhow::anyhow!(
             "Unknown provider '{provider_name}'. \
-             Supported providers: anthropic, openai, deepseek, minimax"
+             Supported providers: anthropic, openai, minimax"
         )),
     }
 }
@@ -820,7 +821,7 @@ fn run_models() -> Result<()> {
         }
         println!("\n{} models available", models.len());
         println!(
-            "\nShorthands: sonnet, opus, haiku, gpt-5.4, chatgpt-5.4, mini, nano, gpt-4.1, flash, pro, deepseek, r1"
+            "\nShorthands: sonnet, opus, haiku, gpt-5.4, chatgpt-5.4, mini, nano, gpt-4.1, flash, pro, minimax"
         );
     }
     Ok(())
@@ -847,7 +848,6 @@ struct ProviderMeta {
 const AUTH_PROVIDERS: &[ProviderMeta] = &[
     ProviderMeta { name: "anthropic", display_name: "Anthropic (Claude)" },
     ProviderMeta { name: "openai", display_name: "OpenAI (GPT-5.4)" },
-    ProviderMeta { name: "deepseek", display_name: "DeepSeek (V3 / R1)" },
     ProviderMeta { name: "minimax", display_name: "MiniMax (M2.7)" },
 ];
 
@@ -865,7 +865,7 @@ fn run_auth(cmd: &cli::Command) -> Result<()> {
 fn run_auth_login(provider_arg: Option<&String>) -> Result<()> {
     let provider_meta = if let Some(name) = provider_arg {
         AUTH_PROVIDERS.iter().find(|p| p.name == name).with_context(|| {
-            format!("unknown provider '{name}' — valid: anthropic, openai, deepseek, minimax")
+            format!("unknown provider '{name}' — valid: anthropic, openai, minimax")
         })?
     } else {
         let items: Vec<&str> = AUTH_PROVIDERS.iter().map(|p| p.display_name).collect();
@@ -967,6 +967,104 @@ fn run_sessions(db: &flok_db::Db, _project_filter: Option<&str>, limit: usize) -
         println!("\nResume a session: flok --resume <ID>");
     }
     Ok(())
+}
+
+fn describe_reload_path(project_root: &std::path::Path, path: &std::path::Path) -> String {
+    let project_config = project_root.join("flok.toml");
+    let dotflok_config = project_root.join(".flok").join("flok.toml");
+    if path == project_config {
+        "project flok.toml".to_string()
+    } else if path == dotflok_config {
+        ".flok/flok.toml".to_string()
+    } else {
+        "global flok.toml".to_string()
+    }
+}
+
+fn apply_reloaded_permission_rules(
+    permissions: &flok_core::tool::PermissionManager,
+    config: &flok_core::config::FlokConfig,
+) {
+    permissions.set_config_rules(flok_core::config::permission_config_to_rules(&config.permission));
+}
+
+async fn reload_runtime_config(
+    project_root: &std::path::Path,
+    live_config: &flok_core::config::LiveConfig,
+    permissions: &flok_core::tool::PermissionManager,
+    lsp: &flok_core::lsp::LspManager,
+    bus: &Bus,
+    changed_paths: &[PathBuf],
+) {
+    let changed_labels: Vec<String> =
+        changed_paths.iter().map(|path| describe_reload_path(project_root, path)).collect();
+
+    match flok_core::config::load_config(project_root) {
+        Ok(config) => {
+            apply_reloaded_permission_rules(permissions, &config);
+            lsp.reload_config(config.lsp.clone()).await;
+            let version = live_config.store(config);
+            tracing::info!(version, changed = ?changed_labels, "reloaded runtime config");
+            bus.send(flok_core::bus::BusEvent::ConfigReloaded {
+                version,
+                changed_paths: changed_labels,
+            });
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, changed = ?changed_labels, "config reload failed");
+            bus.send(flok_core::bus::BusEvent::ConfigReloadFailed {
+                changed_paths: changed_labels,
+                error: err.to_string(),
+            });
+        }
+    }
+}
+
+async fn watch_config_reload_loop(
+    project_root: PathBuf,
+    live_config: flok_core::config::LiveConfig,
+    permissions: Arc<flok_core::tool::PermissionManager>,
+    lsp: Arc<LspManager>,
+    bus: Bus,
+) {
+    use tokio::time::MissedTickBehavior;
+
+    let paths = flok_core::config::config_paths(&project_root);
+    let mut previous = match flok_core::config::capture_config_stamps(&paths) {
+        Ok(stamps) => stamps,
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to initialize config watcher");
+            return;
+        }
+    };
+
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+    loop {
+        interval.tick().await;
+        let current = match flok_core::config::capture_config_stamps(&paths) {
+            Ok(stamps) => stamps,
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to poll config watcher");
+                continue;
+            }
+        };
+        let changed_paths = flok_core::config::diff_config_stamps(&previous, &current);
+        if changed_paths.is_empty() {
+            continue;
+        }
+        previous = current;
+        reload_runtime_config(
+            &project_root,
+            &live_config,
+            &permissions,
+            &lsp,
+            &bus,
+            &changed_paths,
+        )
+        .await;
+    }
 }
 
 #[cfg(test)]
@@ -1082,5 +1180,78 @@ mod credential_tests {
         write_auth_config(&path, &config).expect("write");
         let mode = std::fs::metadata(&path).expect("metadata").permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "expected 0600, got {mode:o}");
+    }
+
+    #[tokio::test]
+    async fn reload_runtime_config_swaps_live_snapshot_and_permissions() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("flok.toml"),
+            r#"
+model = "gpt-5.4"
+
+[permission]
+read = "deny"
+"#,
+        )
+        .expect("write config");
+
+        let live = flok_core::config::LiveConfig::new(FlokConfig::default());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let permissions = flok_core::tool::PermissionManager::new(tx);
+        let lsp = flok_core::lsp::LspManager::disabled(tmp.path().to_path_buf());
+        let bus = Bus::new(16);
+        let mut bus_rx = bus.subscribe();
+
+        reload_runtime_config(
+            tmp.path(),
+            &live,
+            &permissions,
+            &lsp,
+            &bus,
+            &[tmp.path().join("flok.toml")],
+        )
+        .await;
+
+        let snapshot = live.snapshot();
+        assert_eq!(snapshot.version, 2);
+        assert_eq!(snapshot.config.model.as_deref(), Some("gpt-5.4"));
+        assert!(!permissions.check("read", "src/main.rs", "read file").await);
+
+        let event = bus_rx.recv().await.expect("reload event");
+        assert!(matches!(event, flok_core::bus::BusEvent::ConfigReloaded { version: 2, .. }));
+    }
+
+    #[tokio::test]
+    async fn reload_runtime_config_keeps_previous_snapshot_on_invalid_toml() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("flok.toml"), "model = ").expect("write invalid config");
+
+        let live = flok_core::config::LiveConfig::new(FlokConfig {
+            model: Some("sonnet".to_string()),
+            ..FlokConfig::default()
+        });
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let permissions = flok_core::tool::PermissionManager::new(tx);
+        let lsp = flok_core::lsp::LspManager::disabled(tmp.path().to_path_buf());
+        let bus = Bus::new(16);
+        let mut bus_rx = bus.subscribe();
+
+        reload_runtime_config(
+            tmp.path(),
+            &live,
+            &permissions,
+            &lsp,
+            &bus,
+            &[tmp.path().join("flok.toml")],
+        )
+        .await;
+
+        let snapshot = live.snapshot();
+        assert_eq!(snapshot.version, 1);
+        assert_eq!(snapshot.config.model.as_deref(), Some("sonnet"));
+
+        let event = bus_rx.recv().await.expect("reload failure event");
+        assert!(matches!(event, flok_core::bus::BusEvent::ConfigReloadFailed { .. }));
     }
 }

@@ -69,12 +69,17 @@ impl WorktreeManager {
     /// Disabled if the project root does not contain a `.git` directory.
     pub fn new(project_id: &str, project_root: PathBuf) -> Self {
         let enabled = project_root.join(".git").exists();
-
-        // Use XDG state dir or fall back to data dir
-        let state_base = directories::BaseDirs::new().map_or_else(
-            || project_root.join(".flok").join("worktrees"),
-            |d| d.data_dir().join("flok").join("worktrees").join(project_id),
-        );
+        let fallback_base = project_root.join(".flok").join("worktrees").join(project_id);
+        let state_base = if cfg!(test) {
+            let _ = std::fs::create_dir_all(&fallback_base);
+            fallback_base
+        } else {
+            select_writable_storage_dir(
+                directories::BaseDirs::new()
+                    .map(|dirs| dirs.data_dir().join("flok").join("worktrees").join(project_id)),
+                fallback_base,
+            )
+        };
 
         Self { project_root, worktree_base: state_base, merge_lock: Mutex::new(()), enabled }
     }
@@ -321,6 +326,22 @@ impl WorktreeManager {
         tracing::debug!(session_id, "worktree removed");
         Ok(())
     }
+}
+
+fn select_writable_storage_dir(primary: Option<PathBuf>, fallback: PathBuf) -> PathBuf {
+    if let Some(primary) = primary {
+        if std::fs::create_dir_all(&primary).is_ok() {
+            return primary;
+        }
+        tracing::warn!(
+            path = %primary.display(),
+            fallback = %fallback.display(),
+            "worktree storage directory unavailable, using project-local fallback"
+        );
+    }
+
+    let _ = std::fs::create_dir_all(&fallback);
+    fallback
 }
 
 impl std::fmt::Debug for WorktreeManager {

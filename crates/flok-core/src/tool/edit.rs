@@ -1,7 +1,6 @@
 //! The `edit` tool — performs search-and-replace edits on files.
 
-use std::path::Path;
-
+use super::path_security::resolve_write_path;
 use super::{Tool, ToolContext, ToolOutput};
 
 /// Edit a file by replacing a string with another.
@@ -63,7 +62,10 @@ impl Tool for EditTool {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("missing required parameter: new_string"))?;
 
-        let full_path = resolve_path(&ctx.project_root, file_path);
+        let full_path = match resolve_write_path(&ctx.project_root, file_path) {
+            Ok(path) => path,
+            Err(error) => return Ok(ToolOutput::error(error.to_string())),
+        };
 
         if !full_path.exists() {
             return Ok(ToolOutput::error(format!("File not found: {}", full_path.display())));
@@ -95,15 +97,6 @@ impl Tool for EditTool {
         }
 
         Ok(ToolOutput::success(format!("Applied edit to {}", full_path.display())))
-    }
-}
-
-fn resolve_path(project_root: &Path, file_path: &str) -> std::path::PathBuf {
-    let path = Path::new(file_path);
-    let resolved = if path.is_absolute() { path.to_path_buf() } else { project_root.join(path) };
-    match std::fs::canonicalize(&resolved) {
-        Ok(canonical) if canonical.starts_with(project_root) => canonical,
-        _ => resolved,
     }
 }
 
@@ -166,5 +159,24 @@ mod tests {
         let result = EditTool.execute(args, &ctx).await.unwrap();
         assert!(result.is_error);
         assert!(result.content.contains("3 matches"));
+    }
+
+    #[tokio::test]
+    async fn edit_blocks_dotflok_internal_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let internal = dir.path().join(".flok").join("internal.txt");
+        std::fs::create_dir_all(internal.parent().unwrap()).unwrap();
+        std::fs::write(&internal, "secret").unwrap();
+
+        let ctx = ToolContext::test(dir.path().to_path_buf());
+        let args = serde_json::json!({
+            "file_path": ".flok/internal.txt",
+            "old_string": "secret",
+            "new_string": "changed"
+        });
+
+        let result = EditTool.execute(args, &ctx).await.unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains(".flok internals"));
     }
 }

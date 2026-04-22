@@ -29,13 +29,14 @@ async fn large_bash_output_does_not_crash() {
 async fn many_tool_rounds_complete_without_doom_loop() {
     let mut h = TestHarness::new();
 
-    // 3 rounds of tool calls using bash (simpler, no path issues)
+    // 3 rounds of tool calls using write to exercise repeated mutating rounds
+    // without depending on unsupported shell redirection syntax.
     for i in 0..3 {
-        let path = h.path(&format!("file_{i}.txt"));
         h.push_turn(MockTurn::ToolCalls(vec![MockToolCall {
-            name: "bash".into(),
+            name: "write".into(),
             arguments: serde_json::json!({
-                "command": format!("echo 'content {i}' > '{path}'"),
+                "file_path": h.path(&format!("file_{i}.txt")),
+                "content": format!("content {i}"),
             }),
         }]));
     }

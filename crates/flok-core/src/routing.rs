@@ -17,11 +17,21 @@ pub struct ModelRoutingDecision {
     pub reason: Option<String>,
 }
 
+/// Runtime state that should influence request routing beyond prompt contents.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RoutingContext {
+    pub round: usize,
+    pub verification_retries: usize,
+    pub consecutive_tool_error_rounds: usize,
+    pub max_repeated_tool_calls: usize,
+}
+
 /// Choose the model for the next completion request.
 #[must_use]
 pub fn route_model(
     session_model: &str,
     messages: &[Message],
+    context: RoutingContext,
     provider_registry: &ProviderRegistry,
     config: &IntelligentRoutingConfig,
 ) -> ModelRoutingDecision {
@@ -29,7 +39,7 @@ pub fn route_model(
         return ModelRoutingDecision { model_id: session_model.to_string(), reason: None };
     }
 
-    let analysis = analyze_complexity(messages);
+    let analysis = analyze_complexity(messages, context);
     let strongest = strongest_configured_model(session_model, provider_registry);
     let session_rank = model_rank(session_model);
 
@@ -55,7 +65,7 @@ struct ComplexityAnalysis {
     signals: Vec<&'static str>,
 }
 
-fn analyze_complexity(messages: &[Message]) -> ComplexityAnalysis {
+fn analyze_complexity(messages: &[Message], context: RoutingContext) -> ComplexityAnalysis {
     let mut analysis = ComplexityAnalysis::default();
     let recent_messages = messages.iter().rev().take(8).collect::<Vec<_>>();
     let mut total_text_chars = 0usize;
@@ -68,6 +78,30 @@ fn analyze_complexity(messages: &[Message]) -> ComplexityAnalysis {
                 MessageContent::Text { text } => {
                     total_text_chars += text.len();
                     normalized_text.push_str(text);
+                    normalized_text.push('\n');
+                }
+                MessageContent::Compaction { summary } => {
+                    let rendered = summary.render_for_prompt();
+                    total_text_chars += rendered.len();
+                    normalized_text.push_str(&rendered);
+                    normalized_text.push('\n');
+                }
+                MessageContent::ProjectMemory { summary } => {
+                    let rendered = summary.render_for_prompt();
+                    total_text_chars += rendered.len();
+                    normalized_text.push_str(&rendered);
+                    normalized_text.push('\n');
+                }
+                MessageContent::MemoryRecall { summary } => {
+                    let rendered = summary.render_for_prompt();
+                    total_text_chars += rendered.len();
+                    normalized_text.push_str(&rendered);
+                    normalized_text.push('\n');
+                }
+                MessageContent::Step { step } => {
+                    let rendered = step.render_for_prompt();
+                    total_text_chars += rendered.len();
+                    normalized_text.push_str(&rendered);
                     normalized_text.push('\n');
                 }
                 MessageContent::Thinking { thinking } => {
@@ -129,6 +163,35 @@ fn analyze_complexity(messages: &[Message]) -> ComplexityAnalysis {
         analysis.signals.push("active verification repair loop");
     }
 
+    if context.verification_retries >= 1 {
+        analysis.score += 4;
+        analysis.signals.push("verification retry escalation");
+    }
+
+    if context.consecutive_tool_error_rounds >= 2 {
+        analysis.score += 4;
+        analysis.signals.push("repeated tool failure rounds");
+    } else if context.consecutive_tool_error_rounds == 1 {
+        analysis.score += 2;
+        analysis.signals.push("recent tool failure round");
+    }
+
+    if context.max_repeated_tool_calls >= 3 {
+        analysis.score += 4;
+        analysis.signals.push("repeated identical tool calls");
+    } else if context.max_repeated_tool_calls >= 2 {
+        analysis.score += 2;
+        analysis.signals.push("repeated tool calls");
+    }
+
+    if context.round >= 6 {
+        analysis.score += 4;
+        analysis.signals.push("extended prompt loop");
+    } else if context.round >= 3 {
+        analysis.score += 2;
+        analysis.signals.push("multi-round prompt loop");
+    }
+
     if analysis.signals.is_empty() {
         analysis.signals.push("simple turn");
     }
@@ -161,11 +224,9 @@ fn model_rank(model_id: &str) -> u32 {
         "google/gemini-2.5-pro" => 92,
         "anthropic/claude-sonnet-4-6" => 85,
         "openai/gpt-4.1" => 82,
-        "deepseek/deepseek-reasoner" => 80,
         "minimax/MiniMax-M2.7" => 78,
         "google/gemini-2.5-flash" => 65,
         "openai/gpt-5.4-mini" | "openai/gpt-4.1-mini" => 60,
-        "deepseek/deepseek-chat" => 55,
         "anthropic/claude-haiku-4-5-20251001" => 40,
         "openai/gpt-5.4-nano" => 30,
         _ => 50,
@@ -203,6 +264,7 @@ mod tests {
         let decision = route_model(
             "openai/gpt-5.4-mini",
             &[text_message("rename this function")],
+            RoutingContext::default(),
             &registry,
             &IntelligentRoutingConfig::default(),
         );
@@ -253,6 +315,7 @@ mod tests {
         let decision = route_model(
             "openai/gpt-5.4-mini",
             &messages,
+            RoutingContext::default(),
             &registry,
             &IntelligentRoutingConfig::default(),
         );
@@ -274,6 +337,7 @@ mod tests {
         let decision = route_model(
             "openai/gpt-5.4",
             &[text_message("review the architecture and migration plan")],
+            RoutingContext::default(),
             &registry,
             &IntelligentRoutingConfig::default(),
         );
@@ -292,11 +356,98 @@ mod tests {
         let decision = route_model(
             "openai/gpt-5.4-mini",
             &[text_message(&prompt)],
+            RoutingContext::default(),
             &registry,
             &IntelligentRoutingConfig { enabled: false, complexity_threshold: 1 },
         );
 
         assert_eq!(decision.model_id, "openai/gpt-5.4-mini");
         assert!(decision.reason.is_none());
+    }
+
+    #[test]
+    fn route_model_upgrades_for_verification_retry_context() {
+        let registry = registry_with_defaults(&[("openai", "openai/gpt-5.4")]);
+
+        let decision = route_model(
+            "openai/gpt-5.4-mini",
+            &[text_message("fix this compile error")],
+            RoutingContext { round: 2, verification_retries: 1, ..RoutingContext::default() },
+            &registry,
+            &IntelligentRoutingConfig::default(),
+        );
+
+        assert_eq!(decision.model_id, "openai/gpt-5.4");
+        assert!(decision
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("verification retry escalation")));
+    }
+
+    #[test]
+    fn route_model_upgrades_for_extended_prompt_loop() {
+        let registry = registry_with_defaults(&[("openai", "openai/gpt-5.4")]);
+
+        let decision = route_model(
+            "openai/gpt-5.4-mini",
+            &[text_message("inspect the repo and try another approach")],
+            RoutingContext { round: 6, verification_retries: 0, ..RoutingContext::default() },
+            &registry,
+            &IntelligentRoutingConfig::default(),
+        );
+
+        assert_eq!(decision.model_id, "openai/gpt-5.4");
+        assert!(decision
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("extended prompt loop")));
+    }
+
+    #[test]
+    fn route_model_upgrades_for_repeated_tool_failure_rounds() {
+        let registry = registry_with_defaults(&[("openai", "openai/gpt-5.4")]);
+
+        let decision = route_model(
+            "openai/gpt-5.4-mini",
+            &[text_message("try the tool again")],
+            RoutingContext {
+                round: 2,
+                verification_retries: 0,
+                consecutive_tool_error_rounds: 2,
+                max_repeated_tool_calls: 0,
+            },
+            &registry,
+            &IntelligentRoutingConfig::default(),
+        );
+
+        assert_eq!(decision.model_id, "openai/gpt-5.4");
+        assert!(decision
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("repeated tool failure rounds")));
+    }
+
+    #[test]
+    fn route_model_upgrades_for_repeated_identical_tool_calls() {
+        let registry = registry_with_defaults(&[("openai", "openai/gpt-5.4")]);
+
+        let decision = route_model(
+            "openai/gpt-5.4-mini",
+            &[text_message("inspect the same file again")],
+            RoutingContext {
+                round: 2,
+                verification_retries: 0,
+                consecutive_tool_error_rounds: 0,
+                max_repeated_tool_calls: 3,
+            },
+            &registry,
+            &IntelligentRoutingConfig::default(),
+        );
+
+        assert_eq!(decision.model_id, "openai/gpt-5.4");
+        assert!(decision
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("repeated identical tool calls")));
     }
 }

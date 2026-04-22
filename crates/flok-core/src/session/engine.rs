@@ -726,7 +726,7 @@ impl SessionEngine {
                 } else {
                     "Plan executed successfully."
                 };
-                return Ok(format!("{summary}\n\n{}", format_plan_details(&plan, &store),));
+                return Ok(format!("{summary}\n\n{}", format_plan_details(&plan, &store)));
             }
 
             if plan.steps.iter().any(|step| matches!(step.status, StepStatus::Failed(_))) {

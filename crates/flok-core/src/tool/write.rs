@@ -1,7 +1,6 @@
 //! The `write` tool — writes content to a file.
 
-use std::path::Path;
-
+use super::path_security::resolve_write_path;
 use super::{Tool, ToolContext, ToolOutput};
 
 /// Write content to a file, creating it if it doesn't exist.
@@ -55,7 +54,10 @@ impl Tool for WriteTool {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("missing required parameter: content"))?;
 
-        let full_path = resolve_path(&ctx.project_root, file_path);
+        let full_path = match resolve_write_path(&ctx.project_root, file_path) {
+            Ok(path) => path,
+            Err(error) => return Ok(ToolOutput::error(error.to_string())),
+        };
 
         // Create parent directories if needed
         if let Some(parent) = full_path.parent() {
@@ -72,15 +74,6 @@ impl Tool for WriteTool {
 
         let line_count = content.lines().count();
         Ok(ToolOutput::success(format!("Wrote {} lines to {}", line_count, full_path.display())))
-    }
-}
-
-fn resolve_path(project_root: &Path, file_path: &str) -> std::path::PathBuf {
-    let path = Path::new(file_path);
-    let resolved = if path.is_absolute() { path.to_path_buf() } else { project_root.join(path) };
-    match std::fs::canonicalize(&resolved) {
-        Ok(canonical) if canonical.starts_with(project_root) => canonical,
-        _ => resolved,
     }
 }
 
@@ -117,5 +110,33 @@ mod tests {
         let result = WriteTool.execute(args, &ctx).await.unwrap();
         assert!(!result.is_error);
         assert!(dir.path().join("deep/nested/dir/file.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn write_blocks_dotflok_internal_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolContext::test(dir.path().to_path_buf());
+        let args = serde_json::json!({
+            "file_path": ".flok/internal.txt",
+            "content": "nope"
+        });
+
+        let result = WriteTool.execute(args, &ctx).await.unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains(".flok internals"));
+    }
+
+    #[tokio::test]
+    async fn write_blocks_project_flok_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolContext::test(dir.path().to_path_buf());
+        let args = serde_json::json!({
+            "file_path": "flok.toml",
+            "content": "model = \"gpt-5.4\""
+        });
+
+        let result = WriteTool.execute(args, &ctx).await.unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains("flok config"));
     }
 }

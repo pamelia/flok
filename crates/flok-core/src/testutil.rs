@@ -20,7 +20,7 @@ use crate::snapshot::SnapshotManager;
 use crate::token::CostTracker;
 use crate::tool::{
     BashTool, EditTool, FastApplyTool, GlobTool, GrepTool, PermissionManager, ReadTool, SkillTool,
-    ToolRegistry, WriteTool,
+    SmartGrepTool, ToolRegistry, WriteTool,
 };
 
 /// A self-contained test environment with mock provider and temp filesystem.
@@ -62,8 +62,18 @@ impl TestHarness {
         let canonical_root =
             std::fs::canonicalize(dir.path()).expect("failed to canonicalize temp dir");
 
-        // Create a marker so detect_project_root stops here
-        std::fs::create_dir_all(canonical_root.join(".git")).expect("failed to create .git dir");
+        // Initialize a real git repository so snapshot-dependent features like
+        // undo/redo exercise the same baseline they rely on in production.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test harness setup is synchronous and only initializes a local temp repo"
+        )]
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&canonical_root)
+            .status()
+            .expect("failed to run git init");
+        assert!(init.success(), "git init should succeed in test harness");
 
         let db = Db::open_in_memory().expect("failed to open in-memory DB");
         let project_id = "test-project";
@@ -85,11 +95,12 @@ impl TestHarness {
         tools.register(Arc::new(FastApplyTool));
         tools.register(Arc::new(BashTool));
         tools.register(Arc::new(GrepTool));
+        tools.register(Arc::new(SmartGrepTool));
         tools.register(Arc::new(GlobTool));
         tools.register(Arc::new(SkillTool));
 
         let bus = Bus::new(64);
-        let permissions = PermissionManager::auto_approve();
+        let permissions = Arc::new(PermissionManager::auto_approve());
         let cost_tracker = CostTracker::new("test-model");
         let plan_mode = PlanMode::new();
         let snapshot = Arc::new(SnapshotManager::new("test-session", canonical_root.clone()));

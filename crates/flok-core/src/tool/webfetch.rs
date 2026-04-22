@@ -3,10 +3,13 @@
 //! Returns the page content as text, stripping HTML tags for a cleaner
 //! representation. Supports HTML, JSON, and plain text responses.
 
+use std::net::{Ipv4Addr, Ipv6Addr};
+
 use super::{Tool, ToolContext, ToolOutput};
 
 const MAX_RESPONSE_BYTES: usize = 100_000;
 const TIMEOUT_SECS: u64 = 30;
+const MAX_REDIRECTS: usize = 5;
 
 /// Fetch content from a URL.
 pub struct WebfetchTool {
@@ -19,7 +22,7 @@ impl WebfetchTool {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(TIMEOUT_SECS))
             .user_agent("flok/0.0.1")
-            .redirect(reqwest::redirect::Policy::limited(5))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Self { client }
@@ -30,6 +33,83 @@ impl Default for WebfetchTool {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn normalize_domain(domain: &str) -> String {
+    domain.trim_end_matches('.').to_ascii_lowercase()
+}
+
+fn is_blocked_ipv4(addr: Ipv4Addr) -> bool {
+    let octets = addr.octets();
+    addr.is_private()
+        || addr.is_loopback()
+        || addr.is_link_local()
+        || addr.is_broadcast()
+        || addr.is_unspecified()
+        || addr.is_multicast()
+        || octets[0] == 0
+        || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+        || (octets[0] == 198 && (octets[1] == 18 || octets[1] == 19))
+}
+
+fn is_blocked_ipv6(addr: Ipv6Addr) -> bool {
+    if let Some(mapped) = addr.to_ipv4_mapped() {
+        return is_blocked_ipv4(mapped);
+    }
+
+    let segments = addr.segments();
+    addr.is_loopback()
+        || addr.is_unspecified()
+        || addr.is_multicast()
+        || (segments[0] & 0xfe00) == 0xfc00
+        || (segments[0] & 0xffc0) == 0xfe80
+}
+
+fn validate_fetch_url(url: &reqwest::Url) -> anyhow::Result<()> {
+    match url.scheme() {
+        "https" | "http" => {}
+        scheme => anyhow::bail!("unsupported URL scheme: {scheme}"),
+    }
+
+    if !url.username().is_empty() || url.password().is_some() {
+        anyhow::bail!("embedded URL credentials are not allowed");
+    }
+
+    let host = url.host().ok_or_else(|| anyhow::anyhow!("URL is missing a host"))?;
+    match host {
+        url::Host::Domain(domain) => {
+            let normalized = normalize_domain(domain);
+            if normalized == "localhost"
+                || normalized.ends_with(".localhost")
+                || normalized == "metadata.google.internal"
+                || normalized.ends_with(".internal")
+            {
+                anyhow::bail!("cannot fetch from private/internal URLs");
+            }
+        }
+        url::Host::Ipv4(addr) => {
+            if is_blocked_ipv4(addr) {
+                anyhow::bail!("cannot fetch from private/internal URLs");
+            }
+        }
+        url::Host::Ipv6(addr) => {
+            if is_blocked_ipv6(addr) {
+                anyhow::bail!("cannot fetch from private/internal URLs");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn upgrade_insecure_url(url: reqwest::Url) -> anyhow::Result<reqwest::Url> {
+    if url.scheme() != "http" {
+        return Ok(url);
+    }
+
+    let mut upgraded = url;
+    upgraded.set_scheme("https").map_err(|()| anyhow::anyhow!("failed to upgrade URL to https"))?;
+    Ok(upgraded)
 }
 
 #[async_trait::async_trait]
@@ -75,37 +155,60 @@ impl Tool for WebfetchTool {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("missing required parameter: url"))?;
 
-        // Validate URL
         let parsed = reqwest::Url::parse(url).map_err(|e| anyhow::anyhow!("invalid URL: {e}"))?;
-
-        // Security: block private/internal URLs
-        if let Some(host) = parsed.host_str() {
-            if host == "localhost"
-                || host == "127.0.0.1"
-                || host == "0.0.0.0"
-                || host.starts_with("10.")
-                || host.starts_with("172.")
-                || host.starts_with("192.168.")
-                || host == "169.254.169.254" // Cloud metadata
-                || host == "metadata.google.internal"
-            {
-                return Ok(ToolOutput::error("Blocked: cannot fetch from private/internal URLs."));
-            }
+        let mut fetch_url = upgrade_insecure_url(parsed)?;
+        if let Err(error) = validate_fetch_url(&fetch_url) {
+            return Ok(ToolOutput::error(format!("Blocked: {error}")));
         }
 
-        // Upgrade HTTP to HTTPS
-        let fetch_url = if parsed.scheme() == "http" {
-            url.replacen("http://", "https://", 1)
-        } else {
-            url.to_string()
-        };
+        let mut redirect_count = 0usize;
+        let response = loop {
+            let response = self
+                .client
+                .get(fetch_url.clone())
+                .send()
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to fetch {fetch_url}: {e}"))?;
 
-        let response = self
-            .client
-            .get(&fetch_url)
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to fetch {fetch_url}: {e}"))?;
+            if !response.status().is_redirection() {
+                break response;
+            }
+
+            if response.headers().get(reqwest::header::LOCATION).is_none() {
+                return Ok(ToolOutput::error(format!(
+                    "HTTP {} for {} without redirect location",
+                    response.status(),
+                    fetch_url
+                )));
+            }
+
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| anyhow::anyhow!("invalid redirect location header"))?;
+
+            let next_url = fetch_url
+                .join(location)
+                .map_err(|e| anyhow::anyhow!("invalid redirect target {location}: {e}"))?;
+            let next_url = upgrade_insecure_url(next_url)?;
+            if let Err(error) = validate_fetch_url(&next_url) {
+                return Ok(ToolOutput::error(format!("Blocked redirect target: {error}")));
+            }
+
+            if next_url == fetch_url {
+                return Ok(ToolOutput::error(format!("Redirect loop detected for {fetch_url}")));
+            }
+
+            if redirect_count >= MAX_REDIRECTS {
+                return Ok(ToolOutput::error(format!(
+                    "Too many redirects while fetching {next_url}"
+                )));
+            }
+
+            redirect_count += 1;
+            fetch_url = next_url;
+        };
 
         let status = response.status();
         if !status.is_success() {
@@ -237,6 +340,40 @@ mod tests {
         let result = strip_html_tags(html);
         assert!(result.contains("text"));
         assert!(!result.contains("color"));
+    }
+
+    #[test]
+    fn validate_fetch_url_blocks_ipv6_loopback() {
+        let url = reqwest::Url::parse("https://[::1]/secret").expect("url");
+        let error = validate_fetch_url(&url).expect_err("expected blocked loopback");
+        assert!(error.to_string().contains("private/internal"));
+    }
+
+    #[test]
+    fn validate_fetch_url_blocks_private_ipv4() {
+        let url = reqwest::Url::parse("https://192.168.1.20/admin").expect("url");
+        let error = validate_fetch_url(&url).expect_err("expected blocked private ipv4");
+        assert!(error.to_string().contains("private/internal"));
+    }
+
+    #[test]
+    fn validate_fetch_url_blocks_localhost_subdomains() {
+        let url = reqwest::Url::parse("https://api.localhost/metrics").expect("url");
+        let error = validate_fetch_url(&url).expect_err("expected blocked localhost subdomain");
+        assert!(error.to_string().contains("private/internal"));
+    }
+
+    #[test]
+    fn validate_fetch_url_blocks_embedded_credentials() {
+        let url = reqwest::Url::parse("https://user:pass@example.com/private").expect("url");
+        let error = validate_fetch_url(&url).expect_err("expected blocked credentials");
+        assert!(error.to_string().contains("credentials"));
+    }
+
+    #[test]
+    fn validate_fetch_url_allows_public_https() {
+        let url = reqwest::Url::parse("https://example.com/docs").expect("url");
+        validate_fetch_url(&url).expect("public https should be allowed");
     }
 
     #[tokio::test]

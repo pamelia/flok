@@ -7,6 +7,98 @@ use super::compression::CompressionPipeline;
 use super::{Tool, ToolContext, ToolOutput};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
+const STRIPPED_ENV_VARS: &[&str] = &[
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "NODE_OPTIONS",
+    "PYTHONPATH",
+    "PYTHONHOME",
+    "RUBYOPT",
+    "RUBYLIB",
+    "PERL5OPT",
+    "PERLLIB",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuoteMode {
+    Single,
+    Double,
+}
+
+fn parse_command(command: &str) -> anyhow::Result<(String, Vec<String>)> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut chars = command.chars().peekable();
+    let mut quote = None;
+
+    while let Some(ch) = chars.next() {
+        match quote {
+            None => match ch {
+                ' ' | '\t' => {
+                    if !current.is_empty() {
+                        parts.push(std::mem::take(&mut current));
+                    }
+                }
+                '\n' | '\r' | '|' | '&' | ';' | '>' | '<' | '(' | ')' | '$' | '`' => {
+                    anyhow::bail!("unsupported shell syntax: '{ch}'");
+                }
+                '\'' => quote = Some(QuoteMode::Single),
+                '"' => quote = Some(QuoteMode::Double),
+                '\\' => {
+                    let escaped = chars
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("dangling escape at end of command"))?;
+                    current.push(escaped);
+                }
+                _ => current.push(ch),
+            },
+            Some(QuoteMode::Single) => {
+                if ch == '\'' {
+                    quote = None;
+                } else {
+                    current.push(ch);
+                }
+            }
+            Some(QuoteMode::Double) => match ch {
+                '"' => quote = None,
+                '\\' => {
+                    let escaped = chars
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("dangling escape at end of command"))?;
+                    current.push(escaped);
+                }
+                '$' | '`' => anyhow::bail!("unsupported shell syntax: '{ch}'"),
+                _ => current.push(ch),
+            },
+        }
+    }
+
+    if quote.is_some() {
+        anyhow::bail!("unterminated quoted string");
+    }
+
+    if !current.is_empty() {
+        parts.push(current);
+    }
+
+    let Some((program, args)) = parts.split_first() else {
+        anyhow::bail!("command is empty");
+    };
+
+    if program.contains('=') {
+        anyhow::bail!("environment variable prefixes are not supported");
+    }
+
+    Ok((program.clone(), args.to_vec()))
+}
+
+fn scrub_child_env(cmd: &mut tokio::process::Command) {
+    for env_var in STRIPPED_ENV_VARS {
+        cmd.env_remove(env_var);
+    }
+}
 
 /// Execute a shell command.
 pub struct BashTool;
@@ -62,14 +154,20 @@ impl Tool for BashTool {
             .ok_or_else(|| anyhow::anyhow!("missing required parameter: command"))?;
         let timeout_ms = args["timeout"].as_u64();
         let timeout = timeout_ms.map_or(DEFAULT_TIMEOUT, Duration::from_millis);
+        let (program, program_args) = match parse_command(command) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                return Ok(ToolOutput::error(format!("Unsupported bash command: {error}")));
+            }
+        };
 
-        let mut cmd = tokio::process::Command::new("sh");
-        cmd.arg("-c")
-            .arg(command)
+        let mut cmd = tokio::process::Command::new(&program);
+        cmd.args(&program_args)
             .current_dir(&ctx.project_root)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
+        scrub_child_env(&mut cmd);
 
         let child = cmd.spawn()?;
 
@@ -113,7 +211,7 @@ impl Tool for BashTool {
 
                     tracing::debug!(
                         tool = self.name(),
-                        command,
+                        program,
                         original_lines = compressed.original_lines,
                         final_lines = compressed.final_lines,
                         original_chars = compressed.original_chars,
@@ -151,17 +249,17 @@ mod tests {
     #[tokio::test]
     async fn bash_echo() {
         let result = BashTool
-            .execute(serde_json::json!({"command": "echo hello"}), &test_ctx())
+            .execute(serde_json::json!({"command": "echo 'hello world'"}), &test_ctx())
             .await
             .unwrap();
         assert!(!result.is_error);
-        assert!(result.content.contains("hello"));
+        assert!(result.content.contains("hello world"));
     }
 
     #[tokio::test]
     async fn bash_nonzero_exit_is_error() {
         let result =
-            BashTool.execute(serde_json::json!({"command": "exit 1"}), &test_ctx()).await.unwrap();
+            BashTool.execute(serde_json::json!({"command": "false"}), &test_ctx()).await.unwrap();
         assert!(result.is_error);
         assert!(result.content.contains("Exit code: 1"));
     }
@@ -174,5 +272,36 @@ mod tests {
             .unwrap();
         assert!(result.is_error);
         assert!(result.content.contains("timed out"));
+    }
+
+    #[test]
+    fn parse_command_supports_quoted_arguments() {
+        let (program, args) =
+            parse_command(r#"echo "hello world" 'from test'"#).expect("parsed command");
+        assert_eq!(program, "echo");
+        assert_eq!(args, vec!["hello world", "from test"]);
+    }
+
+    #[test]
+    fn parse_command_rejects_shell_operators() {
+        let error = parse_command("echo hello | cat").expect_err("expected shell syntax error");
+        assert!(error.to_string().contains("unsupported shell syntax"));
+    }
+
+    #[test]
+    fn parse_command_rejects_env_prefixes() {
+        let error =
+            parse_command("PYTHONPATH=/tmp python3 script.py").expect_err("expected env prefix");
+        assert!(error.to_string().contains("environment variable prefixes"));
+    }
+
+    #[tokio::test]
+    async fn bash_rejects_pipe_syntax() {
+        let result = BashTool
+            .execute(serde_json::json!({"command": "echo hello | cat"}), &test_ctx())
+            .await
+            .unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains("Unsupported bash command"));
     }
 }

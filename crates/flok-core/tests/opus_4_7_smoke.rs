@@ -28,6 +28,7 @@ async fn opus_4_7_accepts_floks_request_shape() {
     let provider = AnthropicProvider::new(SecretString::from(api_key), None);
     let request = CompletionRequest {
         model: "anthropic/claude-opus-4-7".into(),
+        reasoning_effort: None,
         system: "You are a terse assistant.".into(),
         messages: vec![Message {
             role: "user".into(),

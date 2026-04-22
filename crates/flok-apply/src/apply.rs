@@ -1,10 +1,14 @@
 //! Core apply engine — merges a lazy edit snippet into an original file.
 
+use std::collections::HashMap;
+
 use crate::fuzzy;
 
 /// The strategy that was used to apply the edit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Strategy {
+    /// Rust top-level items were matched and replaced via tree-sitter.
+    AstMerge,
     /// Ellipsis markers were detected and resolved against the original.
     EllipsisMerge,
     /// The snippet was matched as a contiguous block via line-level fuzzy matching.
@@ -16,6 +20,7 @@ pub enum Strategy {
 impl std::fmt::Display for Strategy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::AstMerge => write!(f, "ast-merge"),
             Self::EllipsisMerge => write!(f, "ellipsis-merge"),
             Self::FuzzyMatch => write!(f, "fuzzy-match"),
             Self::FullFile => write!(f, "full-file"),
@@ -30,6 +35,19 @@ pub struct ApplyResult {
     pub content: String,
     /// Which strategy was used.
     pub strategy: Strategy,
+    /// Strategy attempts in the order they were evaluated.
+    pub attempts: Vec<StrategyAttempt>,
+}
+
+/// A single strategy attempt recorded during apply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StrategyAttempt {
+    /// Strategy that was attempted.
+    pub strategy: Strategy,
+    /// Whether the strategy succeeded.
+    pub success: bool,
+    /// Failure reason for unsuccessful attempts.
+    pub reason: Option<String>,
 }
 
 /// Apply an edit snippet to an original file.
@@ -44,24 +62,78 @@ pub struct ApplyResult {
 /// Returns an error if the snippet cannot be matched against the original
 /// by any strategy.
 pub fn apply_edit(original: &str, snippet: &str) -> Result<ApplyResult, ApplyError> {
+    let mut attempts = Vec::new();
+
     // Strategy 1: Ellipsis merge
     if has_ellipsis_markers(snippet) {
         match try_ellipsis_merge(original, snippet) {
             Ok(content) => {
-                return Ok(ApplyResult { content, strategy: Strategy::EllipsisMerge });
+                attempts.push(StrategyAttempt {
+                    strategy: Strategy::EllipsisMerge,
+                    success: true,
+                    reason: None,
+                });
+                return Ok(ApplyResult { content, strategy: Strategy::EllipsisMerge, attempts });
             }
             Err(e) => {
+                attempts.push(StrategyAttempt {
+                    strategy: Strategy::EllipsisMerge,
+                    success: false,
+                    reason: Some(e.to_string()),
+                });
                 tracing::debug!("ellipsis merge failed: {e}, trying fuzzy match");
             }
         }
     }
 
+    match try_rust_item_merge(original, snippet) {
+        Ok(content) => {
+            attempts.push(StrategyAttempt {
+                strategy: Strategy::AstMerge,
+                success: true,
+                reason: None,
+            });
+            return Ok(ApplyResult { content, strategy: Strategy::AstMerge, attempts });
+        }
+        Err(e) => {
+            attempts.push(StrategyAttempt {
+                strategy: Strategy::AstMerge,
+                success: false,
+                reason: Some(e.to_string()),
+            });
+            tracing::debug!("ast merge failed: {e}, trying full-file/fuzzy strategies");
+        }
+    }
+
+    if prefers_full_file_before_fuzzy(original, snippet) {
+        attempts.push(StrategyAttempt {
+            strategy: Strategy::FullFile,
+            success: true,
+            reason: None,
+        });
+        return Ok(ApplyResult {
+            content: snippet.to_string(),
+            strategy: Strategy::FullFile,
+            attempts,
+        });
+    }
+
     // Strategy 2: Line-level fuzzy match (snippet is a contiguous replacement block)
     match try_fuzzy_replace(original, snippet) {
         Ok(content) => {
-            return Ok(ApplyResult { content, strategy: Strategy::FuzzyMatch });
+            attempts.push(StrategyAttempt {
+                strategy: Strategy::FuzzyMatch,
+                success: true,
+                reason: None,
+            });
+            return Ok(ApplyResult { content, strategy: Strategy::FuzzyMatch, attempts });
         }
         Err(e) => {
+            attempts.push(StrategyAttempt {
+                strategy: Strategy::FuzzyMatch,
+                success: false,
+                reason: Some(e.to_string()),
+            });
             tracing::debug!("fuzzy match failed: {e}, falling back to full file");
         }
     }
@@ -70,7 +142,16 @@ pub fn apply_edit(original: &str, snippet: &str) -> Result<ApplyResult, ApplyErr
     // If the snippet looks like a complete file (similar line count or has
     // structural indicators like imports/mod declarations at the top), use it as-is.
     if looks_like_full_file(original, snippet) {
-        return Ok(ApplyResult { content: snippet.to_string(), strategy: Strategy::FullFile });
+        attempts.push(StrategyAttempt {
+            strategy: Strategy::FullFile,
+            success: true,
+            reason: None,
+        });
+        return Ok(ApplyResult {
+            content: snippet.to_string(),
+            strategy: Strategy::FullFile,
+            attempts,
+        });
     }
 
     Err(ApplyError::NoStrategyMatched)
@@ -79,12 +160,106 @@ pub fn apply_edit(original: &str, snippet: &str) -> Result<ApplyResult, ApplyErr
 /// Error type for apply operations.
 #[derive(Debug, thiserror::Error)]
 pub enum ApplyError {
+    /// AST merge could not safely map the snippet to top-level items.
+    #[error("{0}")]
+    AstMergeFailed(String),
     /// No context lines from the snippet could be matched in the original.
     #[error("could not match snippet context against the original file")]
     NoContextMatch,
     /// None of the strategies could apply the snippet.
     #[error("no strategy could apply this snippet to the original file")]
     NoStrategyMatched,
+}
+
+// ---------------------------------------------------------------------------
+// Strategy 1.5: Rust AST item merge
+// ---------------------------------------------------------------------------
+
+fn try_rust_item_merge(original: &str, snippet: &str) -> Result<String, ApplyError> {
+    let original_tree = parse_rust_tree(original)?;
+    let snippet_tree = parse_rust_tree(snippet)?;
+    let original_items = collect_rust_items(original_tree.root_node(), original.as_bytes());
+    let snippet_items = collect_rust_items(snippet_tree.root_node(), snippet.as_bytes());
+
+    if snippet_items.is_empty() {
+        return Err(ApplyError::AstMergeFailed(
+            "rust item merge requires snippet top-level items".to_string(),
+        ));
+    }
+
+    let original_by_key: HashMap<_, _> =
+        original_items.into_iter().map(|item| (item.key.clone(), item)).collect();
+
+    let mut replacements = Vec::new();
+    for snippet_item in snippet_items {
+        let Some(original_item) = original_by_key.get(&snippet_item.key) else {
+            return Err(ApplyError::AstMergeFailed(format!(
+                "rust item merge could not find `{}` in original file",
+                snippet_item.key
+            )));
+        };
+        replacements.push((original_item.start_byte, original_item.end_byte, snippet_item.text));
+    }
+
+    replacements.sort_by_key(|(start, _, _)| *start);
+    let mut merged = String::new();
+    let mut cursor = 0usize;
+    for (start, end, replacement) in replacements {
+        if start < cursor || end > original.len() {
+            return Err(ApplyError::AstMergeFailed(
+                "rust item merge produced overlapping replacement ranges".to_string(),
+            ));
+        }
+        merged.push_str(&original[cursor..start]);
+        merged.push_str(&replacement);
+        cursor = end;
+    }
+    merged.push_str(&original[cursor..]);
+    Ok(merged)
+}
+
+fn parse_rust_tree(source: &str) -> Result<tree_sitter::Tree, ApplyError> {
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&tree_sitter_rust::LANGUAGE.into()).map_err(|error| {
+        ApplyError::AstMergeFailed(format!("failed to load rust parser: {error}"))
+    })?;
+    parser
+        .parse(source, None)
+        .ok_or_else(|| ApplyError::AstMergeFailed("failed to parse rust source".to_string()))
+}
+
+fn collect_rust_items(node: tree_sitter::Node<'_>, source: &[u8]) -> Vec<RustItem> {
+    let mut items = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if let Some(item) = rust_item_from_node(child, source) {
+            items.push(item);
+        }
+    }
+    items
+}
+
+fn rust_item_from_node(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<RustItem> {
+    let key_node = match node.kind() {
+        "function_item" | "struct_item" | "trait_item" => node.child_by_field_name("name")?,
+        "impl_item" => node.child_by_field_name("type")?,
+        _ => return None,
+    };
+    let key = key_node.utf8_text(source).ok()?.trim().to_string();
+    let text = node.utf8_text(source).ok()?.to_string();
+    if key.is_empty() || text.trim().is_empty() {
+        return None;
+    }
+
+    Some(RustItem { key, start_byte: node.start_byte(), end_byte: node.end_byte(), text })
+}
+
+#[derive(Debug, Clone)]
+struct RustItem {
+    key: String,
+    start_byte: usize,
+    end_byte: usize,
+    text: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -378,21 +553,40 @@ fn looks_like_full_file(original: &str, snippet: &str) -> bool {
     }
 
     // If the snippet has structural markers at the top (imports, module declarations)
-    let first_lines: String = snippet.lines().take(5).collect::<Vec<_>>().join(" ");
-    let has_structure = first_lines.contains("use ")
-        || first_lines.contains("import ")
-        || first_lines.contains("from ")
-        || first_lines.contains("#include")
-        || first_lines.contains("package ")
-        || first_lines.contains("module ")
-        || first_lines.contains("#![")
-        || first_lines.contains("//!");
+    let has_structure = has_top_level_structure(snippet);
 
     if has_structure && snippet_lines > 10 {
         return true;
     }
 
     false
+}
+
+fn prefers_full_file_before_fuzzy(original: &str, snippet: &str) -> bool {
+    let orig_lines = original.lines().count();
+    let snippet_lines = snippet.lines().count();
+
+    if snippet_lines == 0 {
+        return false;
+    }
+
+    if has_top_level_structure(snippet) && snippet_lines >= 5 {
+        return true;
+    }
+
+    orig_lines > 0 && snippet_lines as f64 / orig_lines as f64 >= 0.9
+}
+
+fn has_top_level_structure(snippet: &str) -> bool {
+    let first_lines: String = snippet.lines().take(5).collect::<Vec<_>>().join(" ");
+    first_lines.contains("use ")
+        || first_lines.contains("import ")
+        || first_lines.contains("from ")
+        || first_lines.contains("#include")
+        || first_lines.contains("package ")
+        || first_lines.contains("module ")
+        || first_lines.contains("#![")
+        || first_lines.contains("//!")
 }
 
 #[cfg(test)]
@@ -444,6 +638,14 @@ fn main() {
 
         let result = apply_edit(original, snippet).unwrap();
         assert_eq!(result.strategy, Strategy::EllipsisMerge);
+        assert_eq!(
+            result.attempts,
+            vec![StrategyAttempt {
+                strategy: Strategy::EllipsisMerge,
+                success: true,
+                reason: None,
+            }]
+        );
         assert!(result.content.contains("let x = 10;"));
         assert!(result.content.contains("let y = 2;"));
         assert!(result.content.contains("let z = 3;"));
@@ -533,7 +735,8 @@ fn main() {
 }";
 
         let result = apply_edit(original, snippet).unwrap();
-        assert_eq!(result.strategy, Strategy::FuzzyMatch);
+        assert_eq!(result.strategy, Strategy::AstMerge);
+        assert_eq!(result.attempts.last().unwrap().strategy, Strategy::AstMerge);
         assert!(result.content.contains("let x = 100;"));
         assert!(result.content.contains("let z = 300;"));
         assert!(result.content.contains("fn other()"));
@@ -564,8 +767,63 @@ fn another_function() {
 
         let result = apply_edit(original, snippet).unwrap();
         assert_eq!(result.strategy, Strategy::FullFile);
+        assert_eq!(result.attempts.last().unwrap().strategy, Strategy::FullFile);
         assert!(result.content.contains("use std::io;"));
         assert!(result.content.contains("fn added_function()"));
+    }
+
+    #[test]
+    fn full_file_preferred_before_fuzzy_when_snippet_has_file_structure() {
+        let original = "\
+fn old_main() {
+    println!(\"old\");
+}
+
+fn stale_helper() {
+    println!(\"stale\");
+}";
+
+        let snippet = "\
+use std::io;
+
+fn new_main() {
+    println!(\"new\");
+}";
+
+        let result = apply_edit(original, snippet).unwrap();
+        assert_eq!(result.strategy, Strategy::FullFile);
+        assert_eq!(result.attempts.len(), 2);
+        assert_eq!(result.attempts[0].strategy, Strategy::AstMerge);
+        assert!(!result.attempts[0].success);
+        assert!(!result.content.contains("stale_helper"));
+    }
+
+    #[test]
+    fn rust_item_merge_replaces_only_matching_function_item() {
+        let original = "\
+fn alpha() {
+    println!(\"alpha\");
+}
+
+fn beta() {
+    println!(\"old\");
+}
+
+fn gamma() {
+    println!(\"gamma\");
+}";
+
+        let snippet = "\
+fn beta() {
+    println!(\"new\");
+}";
+
+        let result = apply_edit(original, snippet).unwrap();
+        assert_eq!(result.strategy, Strategy::AstMerge);
+        assert!(result.content.contains("println!(\"alpha\");"));
+        assert!(result.content.contains("println!(\"new\");"));
+        assert!(result.content.contains("println!(\"gamma\");"));
+        assert!(!result.content.contains("println!(\"old\");"));
     }
 
     #[test]

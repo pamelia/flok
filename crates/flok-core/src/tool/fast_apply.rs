@@ -4,12 +4,31 @@
 //! handles snippets with `// ... existing code ...` markers and fuzzy
 //! line matching. This is the preferred tool for multi-line code changes.
 
-use std::path::{Path, PathBuf};
-
+use super::path_security::resolve_write_path;
 use super::{PermissionLevel, Tool, ToolContext, ToolOutput};
 
 /// Apply code edits using lazy snippets with ellipsis markers.
 pub struct FastApplyTool;
+
+fn format_attempt_trace(result: &flok_apply::ApplyResult) -> String {
+    if result.attempts.len() <= 1 {
+        return String::new();
+    }
+
+    let mut parts = Vec::new();
+    for attempt in &result.attempts {
+        let label = if attempt.success {
+            format!("{} succeeded", attempt.strategy)
+        } else if let Some(reason) = &attempt.reason {
+            format!("{} failed ({reason})", attempt.strategy)
+        } else {
+            format!("{} failed", attempt.strategy)
+        };
+        parts.push(label);
+    }
+
+    format!(" [attempts: {}]", parts.join(" -> "))
+}
 
 #[async_trait::async_trait]
 impl Tool for FastApplyTool {
@@ -63,7 +82,7 @@ impl Tool for FastApplyTool {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("missing required parameter: snippet"))?;
 
-        let resolved = match resolve_path(&ctx.project_root, file_path) {
+        let resolved = match resolve_write_path(&ctx.project_root, file_path) {
             Ok(path) => path,
             Err(error) => return Ok(ToolOutput::error(error.to_string())),
         };
@@ -103,8 +122,9 @@ impl Tool for FastApplyTool {
                 }
                 let lines = result.content.lines().count();
                 Ok(ToolOutput::success(format!(
-                    "Applied edit to {file_path} ({lines} lines) [strategy: {}]",
-                    result.strategy
+                    "Applied edit to {file_path} ({lines} lines) [strategy: {}]{}",
+                    result.strategy,
+                    format_attempt_trace(&result),
                 )))
             }
             Err(e) => Ok(ToolOutput::error(format!(
@@ -114,27 +134,6 @@ impl Tool for FastApplyTool {
             ))),
         }
     }
-}
-
-fn resolve_path(project_root: &Path, file_path: &str) -> anyhow::Result<PathBuf> {
-    let project_root =
-        std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
-    let path = Path::new(file_path);
-    let resolved = if path.is_absolute() { path.to_path_buf() } else { project_root.join(path) };
-
-    if !crate::permission::path::is_within_project(&resolved, &project_root) {
-        anyhow::bail!("Path escapes project root: {}", resolved.display());
-    }
-
-    if let Some(parent) = resolved.parent() {
-        if let Ok(canonical_parent) = std::fs::canonicalize(parent) {
-            if !canonical_parent.starts_with(&project_root) {
-                anyhow::bail!("Path escapes project root via symlink: {}", resolved.display());
-            }
-        }
-    }
-
-    Ok(resolved)
 }
 
 #[cfg(test)]
@@ -194,6 +193,31 @@ mod tests {
         assert!(content.contains("let y = 2;"));
     }
 
+    #[test]
+    fn format_attempt_trace_reports_failures_before_success() {
+        let trace = format_attempt_trace(&flok_apply::ApplyResult {
+            content: "fn main() {}".to_string(),
+            strategy: flok_apply::Strategy::FullFile,
+            attempts: vec![
+                flok_apply::StrategyAttempt {
+                    strategy: flok_apply::Strategy::EllipsisMerge,
+                    success: false,
+                    reason: Some(
+                        "could not match snippet context against the original file".into(),
+                    ),
+                },
+                flok_apply::StrategyAttempt {
+                    strategy: flok_apply::Strategy::FullFile,
+                    success: true,
+                    reason: None,
+                },
+            ],
+        });
+
+        assert!(trace.contains("ellipsis-merge failed"));
+        assert!(trace.contains("full-file succeeded"));
+    }
+
     #[tokio::test]
     async fn fast_apply_unmatched_returns_error_message() {
         let dir = tempfile::tempdir().unwrap();
@@ -211,5 +235,20 @@ mod tests {
         let result = FastApplyTool.execute(args, &ctx).await.unwrap();
         assert!(result.is_error, "expected error but got: {}", result.content);
         assert!(result.content.contains("Failed to apply"));
+    }
+
+    #[tokio::test]
+    async fn fast_apply_blocks_dotflok_internal_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolContext::test(dir.path().to_path_buf());
+
+        let args = serde_json::json!({
+            "file_path": ".flok/blocked.rs",
+            "snippet": "fn main() {}"
+        });
+
+        let result = FastApplyTool.execute(args, &ctx).await.unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains(".flok internals"));
     }
 }

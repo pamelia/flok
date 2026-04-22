@@ -12,6 +12,8 @@ workspace = true
 [dependencies]
 thiserror = { workspace = true }
 tracing = { workspace = true }
+tree-sitter = { workspace = true }
+tree-sitter-rust = { workspace = true }
 
 [dev-dependencies]
 insta = { workspace = true }

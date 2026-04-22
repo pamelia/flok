@@ -12,6 +12,7 @@ pub mod compaction;
 pub mod compress;
 pub mod config;
 pub mod lsp;
+pub mod mcp;
 pub mod permission;
 pub mod plan;
 pub mod provider;

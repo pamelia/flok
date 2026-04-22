@@ -59,6 +59,12 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: AuthCommand,
     },
+
+    /// Manage MCP server configuration.
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -68,6 +74,43 @@ pub(crate) enum AuthCommand {
         /// Provider to authenticate with. If omitted, you'll be prompted to choose.
         #[arg(long)]
         provider: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum McpCommand {
+    /// Add or update an MCP server entry in user config.
+    Add {
+        /// Logical MCP server name, e.g. `github`.
+        name: String,
+
+        /// Remote MCP endpoint URL.
+        #[arg(long, conflicts_with = "command", required_unless_present = "command")]
+        url: Option<String>,
+
+        /// Stdio command for a local MCP server.
+        #[arg(long, conflicts_with = "url", required_unless_present = "url")]
+        command: Option<String>,
+
+        /// Repeated argument for `--command` stdio servers.
+        #[arg(long = "arg")]
+        args: Vec<String>,
+
+        /// Working directory for stdio MCP servers.
+        #[arg(long)]
+        cwd: Option<std::path::PathBuf>,
+
+        /// Env var holding a bearer token for remote MCP servers.
+        #[arg(long)]
+        bearer_token_env_var: Option<String>,
+
+        /// Per-server tool timeout in seconds.
+        #[arg(long)]
+        timeout_seconds: Option<u64>,
+
+        /// Add the entry in disabled state.
+        #[arg(long)]
+        disabled: bool,
     },
 }
 
@@ -119,5 +162,31 @@ mod tests {
     fn parse_session_flag() {
         let args = Args::try_parse_from(["flok", "--session", "abc123"]).unwrap();
         assert_eq!(args.session.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn parse_mcp_add_remote_subcommand() {
+        let args = Args::try_parse_from([
+            "flok",
+            "mcp",
+            "add",
+            "github",
+            "--url",
+            "https://api.githubcopilot.com/mcp/",
+            "--bearer-token-env-var",
+            "GITHUB_PAT_TOKEN",
+        ])
+        .unwrap();
+
+        match args.command {
+            Some(Command::Mcp {
+                command: McpCommand::Add { name, url, bearer_token_env_var, .. },
+            }) => {
+                assert_eq!(name, "github");
+                assert_eq!(url.as_deref(), Some("https://api.githubcopilot.com/mcp/"));
+                assert_eq!(bearer_token_env_var.as_deref(), Some("GITHUB_PAT_TOKEN"));
+            }
+            other => panic!("unexpected command parse: {other:?}"),
+        }
     }
 }

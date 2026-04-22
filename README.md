@@ -58,6 +58,7 @@ AI-assisted coding workflows. Single binary, no runtime dependencies.
 - **Worktree isolation** — sub-agents get isolated git worktrees for concurrent work without conflicts
 - **Execution plans** — structured multi-step plans with DAG dependencies, step-level checkpoints, and rollback
 - **Automatic verification** — detects project language and runs build/test after file changes; retries on failure
+- **MCP integration** — connect local stdio MCP servers and remote HTTP MCP servers without recompiling flok
 - **Token counting & cost tracking** — real-time cost estimation with tiktoken-rs, cache-aware pricing
 - **Context window management** — three-tier compression (tool output filtering, history compression, recency-based pruning)
 - **Output compression** — shell output deduplication, progress bar stripping, command-specific smart filters
@@ -157,7 +158,33 @@ flok sessions -n 50      # List more sessions
 flok version             # Show version info
 flok auth login          # Save an API key (interactive provider picker)
 flok auth login --provider anthropic   # Save a specific provider's key
+flok mcp add github --url https://api.githubcopilot.com/mcp/ --bearer-token-env-var GITHUB_PAT_TOKEN
 ```
+
+### MCP Servers
+
+Flok can load external MCP tools from both local stdio servers and remote HTTP MCP endpoints.
+
+```bash
+# Remote MCP server
+export GITHUB_PAT_TOKEN=ghp_...
+flok mcp add github --url https://api.githubcopilot.com/mcp/ --bearer-token-env-var GITHUB_PAT_TOKEN
+
+# Local stdio MCP server
+flok mcp add filesystem --command npx --arg -y --arg @modelcontextprotocol/server-filesystem --arg .
+```
+
+After saving a new MCP server, restart `flok` to pick up new or changed MCP tools.
+
+Inside the TUI:
+
+- `/mcp list` shows configured MCP servers
+- `/mcp add <name> --url <url>` adds a remote MCP server
+- `/mcp add <name> --command <command>` adds a local stdio MCP server
+
+MCP tools are exposed under namespaced names like `github_get_me` or `filesystem_read_file` so they do not shadow built-in tools.
+
+See [docs/mcp.md](./docs/mcp.md) for setup details and current limitations.
 
 ### TUI Key Bindings
 
@@ -223,6 +250,8 @@ flok auth login --provider anthropic   # Save a specific provider's key
 | `/build` | Switch to build mode |
 | `/sidebar` | Toggle sidebar |
 | `/sessions` | List past sessions |
+| `/mcp`, `/mcp list` | List configured MCP servers |
+| `/mcp add ...` | Add a remote or stdio MCP server to config |
 | `/help` | Show available commands |
 | `/quit`, `/exit`, `/q` | Exit |
 

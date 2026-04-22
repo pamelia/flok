@@ -24,6 +24,7 @@ ratatui-macros = "0.6"
 textwrap = "0.16"
 pulldown-cmark = "0.12"
 unicode-segmentation = "1"
+rattles = "0.3.1"
 
 [dev-dependencies]
 insta = { workspace = true }

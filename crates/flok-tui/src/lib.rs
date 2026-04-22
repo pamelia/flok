@@ -12,6 +12,7 @@ mod overlays;
 mod run;
 mod selection;
 mod sidebar;
+mod spinner;
 mod stream;
 #[doc(hidden)]
 pub mod test_support;

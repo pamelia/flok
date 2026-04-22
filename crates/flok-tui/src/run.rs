@@ -8,7 +8,7 @@ pub async fn run_app(channels: TuiChannels) -> Result<()> {
     local
         .run_until(async move {
             let (tx, rx) = mpsc::unbounded_channel::<app_event::AppEvent>();
-            let mut tui = tui::Tui::new(tx.clone())?;
+            let mut tui = tui::Tui::new(tx.clone(), channels.alternate_screen)?;
             let mut app = app::App::new(channels, tx, rx);
             app.run(&mut tui).await
         })

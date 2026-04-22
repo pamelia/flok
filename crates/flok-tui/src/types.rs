@@ -129,4 +129,5 @@ pub struct TuiChannels {
     pub todo_list: flok_core::tool::TodoList,
     pub plan_mode: flok_core::session::PlanMode,
     pub model_name: String,
+    pub alternate_screen: bool,
 }

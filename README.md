@@ -34,6 +34,7 @@ AI-assisted coding workflows. Single binary, no runtime dependencies.
 
 **Terminal UI**
 - **Rich terminal UI** — ratatui-based TUI with sidebar stats, markdown rendering, dark theme
+- **Scrollback-friendly inline mode** — auto-disables alternate screen in Zellij; `--no-alt-screen` is also available
 - **Command palette** (`Ctrl+K`) and model picker (`Ctrl+M`)
 - **Text selection & copy** — click-drag, double-click word, triple-click line, auto-copy to clipboard
 - **Scrolling** — mouse wheel per-panel, keyboard scroll (Page Up/Down)
@@ -133,6 +134,9 @@ flok -d /path/to/project
 
 # Start in plan mode (read-only)
 flok --plan
+
+# Preserve terminal scrollback (inline mode)
+flok --no-alt-screen
 
 # Resume a previous session
 flok --resume <SESSION_ID>

@@ -56,6 +56,7 @@ const MAX_VERIFICATION_BONUS_RETRIES: usize = 1;
 fn build_system_prompt(
     project_root: &std::path::Path,
     provider_registry: &crate::provider::ProviderRegistry,
+    auto_skills: &[crate::skills::AutoSkillMatch],
 ) -> String {
     let mut prompt = String::from(
         r"You are flok, an expert AI coding agent for the terminal.
@@ -275,6 +276,23 @@ When referencing specific functions or pieces of code include the pattern `file_
                 if crate::skills::get_builtin_skill(name).is_none() {
                     let _ = writeln!(prompt, "- **{name}** (project-local)");
                 }
+            }
+        }
+    }
+
+    if !auto_skills.is_empty() {
+        let _ = writeln!(prompt, "\n# Auto-Loaded Skills For This Turn\n");
+        let _ = writeln!(
+            prompt,
+            "The current user request strongly matches these workflows. Apply them directly for this turn without needing to call the `skill` tool first."
+        );
+        for matched in auto_skills {
+            if let Some(skill) = crate::skills::get_builtin_skill(matched.name) {
+                let _ = writeln!(
+                    prompt,
+                    "\n## Skill: {} ({})\n\n{}",
+                    skill.name, matched.reason, skill.content
+                );
             }
         }
     }
@@ -1155,6 +1173,7 @@ impl SessionEngine {
 
         // Run the prompt loop
         let mut rounds = 0;
+        let auto_skills = crate::skills::detect_builtin_skills(user_text);
         let mut verification_retries = 0usize;
         let mut verification_bonus_retry_granted = false;
         let mut verification_skipped_rounds_since_failure = 0usize;
@@ -1209,8 +1228,11 @@ impl SessionEngine {
                     step: StepMetadata::routing(&self.model_id, &active_model_id, &reason),
                 });
             }
-            let system =
-                build_system_prompt(&self.state.project_root, &self.state.provider_registry);
+            let system = build_system_prompt(
+                &self.state.project_root,
+                &self.state.provider_registry,
+                &auto_skills,
+            );
 
             // Pre-flight token count: estimate context usage
             let estimated_tokens = estimate_message_tokens(&messages, &system, &token_counter);
@@ -4374,11 +4396,30 @@ edition = "2021"
         );
         provider_registry.insert("openai", openai, Some("openai/gpt-5.4".into()), 3);
 
-        let prompt = build_system_prompt(std::path::Path::new("/tmp/project"), &provider_registry);
+        let prompt =
+            build_system_prompt(std::path::Path::new("/tmp/project"), &provider_registry, &[]);
 
         assert!(prompt.contains("## Available Providers"));
         assert!(prompt.contains("- anthropic (default model: opus-4.7)"));
         assert!(prompt.contains("- openai (default model: gpt-5.4)"));
         assert!(prompt.contains("task` tool's `model` parameter"));
+    }
+
+    #[test]
+    fn build_system_prompt_auto_loads_detected_code_review_skill() {
+        let provider_registry = ProviderRegistry::new();
+        let auto_skills = crate::skills::detect_builtin_skills(
+            "please review my PR https://github.com/o/r/pull/1",
+        );
+
+        let prompt = build_system_prompt(
+            std::path::Path::new("/tmp/project"),
+            &provider_registry,
+            &auto_skills,
+        );
+
+        assert!(prompt.contains("# Auto-Loaded Skills For This Turn"));
+        assert!(prompt.contains("Skill: code-review"));
+        assert!(prompt.contains("Code Review Skill"));
     }
 }

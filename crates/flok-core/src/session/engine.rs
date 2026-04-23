@@ -691,7 +691,11 @@ impl SessionEngine {
                     .iter()
                     .find(|candidate| candidate.id == step_id)
                     .cloned()
-                    .expect("running step must exist in plan");
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "step '{step_id}' not found in plan — step was marked Running but is absent from plan.steps"
+                        )
+                    })?;
                 let prompt = build_plan_step_prompt(&plan, &step);
 
                 match self.send_message(&prompt).await {

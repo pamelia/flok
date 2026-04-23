@@ -16,11 +16,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context};
+
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::{Client, StatusCode};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{oneshot, Mutex};
 
@@ -29,6 +31,16 @@ use crate::tool::{PermissionLevel, Tool, ToolContext, ToolOutput, ToolRegistry};
 
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 const NON_MATCHING_EVENT_ERROR: &str = "non-matching MCP event";
+
+/// Error raised when an MCP server advertises a deprecated HTTP+SSE mode
+/// that flok does not support, making it impossible to continue processing.
+#[derive(Debug, Error)]
+#[error("MCP server '{server}' uses deprecated HTTP+SSE mode '{event_type}' for method '{method}' — this mode is not supported")]
+pub struct UnsupportedMcpMode {
+    pub server: String,
+    pub method: String,
+    pub event_type: String,
+}
 
 type DynReader = Box<dyn AsyncRead + Send + Unpin>;
 type DynWriter = Box<dyn AsyncWrite + Send + Unpin>;
@@ -762,12 +774,11 @@ fn finalize_sse_event(
     }
 
     if event_type == "endpoint" {
-        tracing::warn!(
-            server = %server_name,
-            method = %method,
-            "MCP server advertised deprecated HTTP+SSE endpoint; fallback is not implemented"
-        );
-        return Ok(None);
+        return Err(anyhow::anyhow!(UnsupportedMcpMode {
+            server: server_name.to_string(),
+            method: method.to_string(),
+            event_type: event_type.to_string(),
+        }));
     }
 
     let data = data_lines.join("\n");
@@ -1134,5 +1145,26 @@ mod tests {
             render_tool_result(&[], Some(&json!({"repositories": ["repo-a", "repo-b"]})));
         assert!(rendered.contains("repo-a"));
         assert!(rendered.contains("repositories"));
+    }
+
+    #[test]
+    fn parse_sse_response_returns_error_on_deprecated_endpoint_event() {
+        let result = parse_sse_response(
+            "github",
+            "tools/call",
+            42,
+            concat!("event: endpoint\n", "data: {\"url\":\"https://some-server/stream\"}\n", "\n"),
+        );
+        let err = result.unwrap_err();
+        let err_msg = err.to_string();
+        assert!(err_msg.contains("HTTP+SSE"), "expected HTTP+SSE in error, got: {err_msg}");
+        assert!(err_msg.contains("github"), "expected server name in error, got: {err_msg}");
+        assert!(err_msg.contains("endpoint"), "expected event type in error, got: {err_msg}");
+    }
+
+    #[test]
+    fn parse_jsonrpc_response_accepts_empty_body_as_error() {
+        let err = parse_jsonrpc_response("initialize", 1, "").unwrap_err();
+        assert!(err.to_string().contains("empty MCP response body"));
     }
 }

@@ -115,6 +115,18 @@
 # complexity_threshold = 4                  # Min complexity score before upgrade
 
 # ---------------------------------------------------------------------------
+# TUI
+# ---------------------------------------------------------------------------
+#
+# Controls whether flok uses the terminal's alternate screen buffer.
+# - auto   (default): disable alt-screen in Zellij, enable elsewhere
+# - always: always use fullscreen alt-screen mode
+# - never: always run inline, preserving terminal scrollback
+
+[tui]
+# alternate_screen = "auto"
+
+# ---------------------------------------------------------------------------
 # LSP Integration
 # ---------------------------------------------------------------------------
 #

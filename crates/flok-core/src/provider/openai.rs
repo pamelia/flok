@@ -2,6 +2,8 @@
 //!
 //! Implements streaming via the Chat Completions API with SSE.
 
+use std::collections::HashSet;
+
 use futures::StreamExt;
 use reqwest_eventsource::{Event, EventSource};
 use secrecy::{ExposeSecret, SecretString};
@@ -33,6 +35,7 @@ impl OpenAiProvider {
     /// Build the `OpenAI` API request body.
     fn build_request_body(request: &CompletionRequest) -> OpenAiRequest {
         let mut messages: Vec<OpenAiMessage> = Vec::new();
+        let mut pending_tool_call_ids: HashSet<String> = HashSet::new();
 
         // System message
         if !request.system.is_empty() {
@@ -51,6 +54,7 @@ impl OpenAiProvider {
                     // Collect text and tool results
                     let mut text_parts = String::new();
                     let mut tool_results: Vec<OpenAiMessage> = Vec::new();
+                    let mut orphaned_tool_results: Vec<String> = Vec::new();
 
                     for c in &msg.content {
                         match c {
@@ -85,15 +89,31 @@ impl OpenAiProvider {
                                 text_parts.push_str(&step.render_for_prompt());
                             }
                             MessageContent::ToolResult { tool_use_id, content, .. } => {
-                                tool_results.push(OpenAiMessage {
-                                    role: "tool".into(),
-                                    content: Some(content.clone()),
-                                    tool_calls: None,
-                                    tool_call_id: Some(tool_use_id.clone()),
-                                });
+                                if pending_tool_call_ids.remove(tool_use_id) {
+                                    tool_results.push(OpenAiMessage {
+                                        role: "tool".into(),
+                                        content: Some(content.clone()),
+                                        tool_calls: None,
+                                        tool_call_id: Some(tool_use_id.clone()),
+                                    });
+                                } else {
+                                    orphaned_tool_results
+                                        .push(format!("Tool result ({tool_use_id}): {content}"));
+                                }
                             }
                             MessageContent::ToolUse { .. } | MessageContent::Thinking { .. } => {}
                         }
+                    }
+
+                    if !orphaned_tool_results.is_empty() {
+                        if !text_parts.is_empty() {
+                            text_parts.push('\n');
+                        }
+                        text_parts.push_str(&orphaned_tool_results.join("\n"));
+                    }
+
+                    if !tool_results.is_empty() {
+                        messages.extend(tool_results);
                     }
 
                     if !text_parts.is_empty() {
@@ -104,8 +124,7 @@ impl OpenAiProvider {
                             tool_call_id: None,
                         });
                     }
-
-                    messages.extend(tool_results);
+                    pending_tool_call_ids.clear();
                 }
                 "assistant" => {
                     let mut text = String::new();
@@ -149,8 +168,15 @@ impl OpenAiProvider {
                         tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls) },
                         tool_call_id: None,
                     });
+                    pending_tool_call_ids = messages
+                        .last()
+                        .and_then(|message| message.tool_calls.as_ref())
+                        .map(|calls| calls.iter().map(|call| call.id.clone()).collect())
+                        .unwrap_or_default();
                 }
-                _ => {}
+                _ => {
+                    pending_tool_call_ids.clear();
+                }
             }
         }
 
@@ -502,6 +528,71 @@ mod tests {
         assert!(json.contains("gpt-5.4"));
         assert!(json.contains("function"));
         assert!(!json.contains("reasoning_effort"));
+    }
+
+    #[test]
+    fn build_request_body_emits_tool_results_before_follow_up_user_text() {
+        let request = CompletionRequest {
+            model: "openai/gpt-5.4".into(),
+            reasoning_effort: None,
+            system: String::new(),
+            messages: vec![
+                super::super::types::Message {
+                    role: "assistant".into(),
+                    content: vec![MessageContent::ToolUse {
+                        id: "call_123".into(),
+                        name: "read".into(),
+                        input: serde_json::json!({"file_path": "src/lib.rs"}),
+                    }],
+                },
+                super::super::types::Message {
+                    role: "user".into(),
+                    content: vec![
+                        MessageContent::ToolResult {
+                            tool_use_id: "call_123".into(),
+                            content: "file contents".into(),
+                            is_error: false,
+                        },
+                        MessageContent::Text { text: "Please continue the review.".into() },
+                    ],
+                },
+            ],
+            tools: Vec::new(),
+            max_tokens: 4096,
+        };
+
+        let body = OpenAiProvider::build_request_body(&request);
+        assert_eq!(body.messages.len(), 3);
+        assert_eq!(body.messages[0].role, "assistant");
+        assert_eq!(body.messages[1].role, "tool");
+        assert_eq!(body.messages[1].tool_call_id.as_deref(), Some("call_123"));
+        assert_eq!(body.messages[2].role, "user");
+        assert_eq!(body.messages[2].content.as_deref(), Some("Please continue the review."));
+    }
+
+    #[test]
+    fn build_request_body_folds_orphaned_tool_results_into_user_text() {
+        let request = CompletionRequest {
+            model: "openai/gpt-5.4".into(),
+            reasoning_effort: None,
+            system: String::new(),
+            messages: vec![super::super::types::Message {
+                role: "user".into(),
+                content: vec![MessageContent::ToolResult {
+                    tool_use_id: "missing_call".into(),
+                    content: "background reviewer finished".into(),
+                    is_error: false,
+                }],
+            }],
+            tools: Vec::new(),
+            max_tokens: 4096,
+        };
+
+        let body = OpenAiProvider::build_request_body(&request);
+        assert_eq!(body.messages.len(), 1);
+        assert_eq!(body.messages[0].role, "user");
+        let content = body.messages[0].content.as_deref().unwrap_or_default();
+        assert!(content.contains("Tool result (missing_call): background reviewer finished"));
     }
 
     #[test]

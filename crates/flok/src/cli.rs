@@ -33,6 +33,12 @@ pub(crate) struct Args {
     /// Enable debug logging to /tmp/flok.log.
     #[arg(long, global = true)]
     pub debug: bool,
+
+    /// Disable alternate screen mode for the TUI.
+    ///
+    /// Runs inline in the normal terminal buffer, which preserves scrollback.
+    #[arg(long, global = true)]
+    pub no_alt_screen: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -132,6 +138,7 @@ mod tests {
         assert!(args.prompt.is_none());
         assert!(args.model.is_none());
         assert!(args.command.is_none());
+        assert!(!args.no_alt_screen);
     }
 
     #[test]
@@ -162,6 +169,12 @@ mod tests {
     fn parse_session_flag() {
         let args = Args::try_parse_from(["flok", "--session", "abc123"]).unwrap();
         assert_eq!(args.session.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn parse_no_alt_screen_flag() {
+        let args = Args::try_parse_from(["flok", "--no-alt-screen"]).unwrap();
+        assert!(args.no_alt_screen);
     }
 
     #[test]

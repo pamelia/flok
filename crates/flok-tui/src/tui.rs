@@ -6,6 +6,7 @@
 //! event loop.
 
 use std::io::{stdout, Stdout};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Once;
 
 use anyhow::{Context, Result};
@@ -17,7 +18,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use ratatui::{backend::CrosstermBackend, Frame, Terminal};
+use ratatui::{backend::CrosstermBackend, Frame, Terminal, TerminalOptions, Viewport};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
@@ -26,6 +27,7 @@ use crate::app_event::AppEvent;
 
 /// Ensures the panic hook is installed exactly once across all `Tui` instances.
 static PANIC_HOOK: Once = Once::new();
+static ALT_SCREEN_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// Owning wrapper for the ratatui terminal plus the background forwarder task
 /// that translates crossterm input events into `AppEvent`s.
@@ -40,15 +42,34 @@ impl Tui {
     /// Enter the alternate screen, enable raw mode, mouse capture, and bracketed
     /// paste, then spawn the crossterm `EventStream` → `AppEvent` forwarder on
     /// the current `tokio::task::LocalSet`.
-    pub(crate) fn new(app_event_tx: mpsc::UnboundedSender<AppEvent>) -> Result<Self> {
+    pub(crate) fn new(
+        app_event_tx: mpsc::UnboundedSender<AppEvent>,
+        alternate_screen: bool,
+    ) -> Result<Self> {
         install_panic_hook();
 
         enable_raw_mode().context("enable raw mode")?;
-        execute!(stdout(), EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste,)
-            .context("enter alternate screen / enable mouse capture / bracketed paste")?;
+        if alternate_screen {
+            execute!(stdout(), EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste,)
+                .context("enter alternate screen / enable mouse capture / bracketed paste")?;
+            ALT_SCREEN_ACTIVE.store(true, Ordering::Relaxed);
+        } else {
+            execute!(stdout(), EnableMouseCapture, EnableBracketedPaste,)
+                .context("enable mouse capture / bracketed paste")?;
+            ALT_SCREEN_ACTIVE.store(false, Ordering::Relaxed);
+        }
 
         let backend = CrosstermBackend::new(stdout());
-        let terminal = Terminal::new(backend).context("construct ratatui terminal")?;
+        let terminal = if alternate_screen {
+            Terminal::new(backend)
+        } else {
+            let (_, height) = crossterm::terminal::size().context("query terminal size")?;
+            Terminal::with_options(
+                backend,
+                TerminalOptions { viewport: Viewport::Inline(height.max(1)) },
+            )
+        }
+        .context("construct ratatui terminal")?;
 
         let event_task = tokio::task::spawn_local(forward_events(app_event_tx));
 
@@ -74,8 +95,16 @@ impl Tui {
         // Best-effort cleanup: ignore individual failures so that later steps
         // still run. A partially-initialised terminal (e.g. raw mode enabled
         // but mouse capture not yet armed) must still end up usable.
-        let _ =
-            execute!(stdout(), DisableBracketedPaste, DisableMouseCapture, LeaveAlternateScreen,);
+        if ALT_SCREEN_ACTIVE.swap(false, Ordering::Relaxed) {
+            let _ = execute!(
+                stdout(),
+                DisableBracketedPaste,
+                DisableMouseCapture,
+                LeaveAlternateScreen,
+            );
+        } else {
+            let _ = execute!(stdout(), DisableBracketedPaste, DisableMouseCapture,);
+        }
         let _ = disable_raw_mode();
         Ok(())
     }

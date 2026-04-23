@@ -316,6 +316,7 @@ async fn run(args: cli::Args) -> Result<()> {
         model_id,
         bus,
         args.session,
+        args.no_alt_screen,
         perm_rx,
         question_rx,
         todo_list,
@@ -323,6 +324,33 @@ async fn run(args: cli::Args) -> Result<()> {
         Arc::clone(&lsp),
     )
     .await
+}
+
+fn is_running_in_zellij() -> bool {
+    std::env::var_os("ZELLIJ").is_some()
+}
+
+fn determine_alt_screen_mode(
+    no_alt_screen: bool,
+    configured: flok_core::config::AltScreenMode,
+) -> bool {
+    determine_alt_screen_mode_for_env(no_alt_screen, configured, is_running_in_zellij())
+}
+
+fn determine_alt_screen_mode_for_env(
+    no_alt_screen: bool,
+    configured: flok_core::config::AltScreenMode,
+    is_zellij: bool,
+) -> bool {
+    if no_alt_screen {
+        return false;
+    }
+
+    match configured {
+        flok_core::config::AltScreenMode::Always => true,
+        flok_core::config::AltScreenMode::Never => false,
+        flok_core::config::AltScreenMode::Auto => !is_zellij,
+    }
 }
 
 /// Run in non-interactive mode: send a single prompt and print the response.
@@ -354,6 +382,7 @@ async fn run_interactive(
     model_id: String,
     bus: Bus,
     resume_session: Option<String>,
+    no_alt_screen: bool,
     perm_rx: mpsc::UnboundedReceiver<flok_core::tool::PermissionRequest>,
     question_rx: mpsc::UnboundedReceiver<flok_core::tool::QuestionRequest>,
     todo_list: flok_core::tool::TodoList,
@@ -365,6 +394,8 @@ async fn run_interactive(
     let bus_rx = bus.subscribe();
 
     let display_model = flok_core::provider::ModelRegistry::model_name(&model_id).to_string();
+    let alternate_screen =
+        determine_alt_screen_mode(no_alt_screen, state.config.current().tui.alternate_screen);
     let channels = flok_tui::types::TuiChannels {
         cmd_tx: cmd_tx.clone(),
         ui_rx,
@@ -374,6 +405,7 @@ async fn run_interactive(
         todo_list,
         plan_mode,
         model_name: display_model,
+        alternate_screen,
     };
 
     // Create/resume session engine
@@ -1325,6 +1357,43 @@ mod credential_tests {
         assert!(registry.semaphore("anthropic").is_some());
         assert!(registry.semaphore("openai").is_some());
         assert!(registry.semaphore("minimax").is_none());
+    }
+
+    #[test]
+    fn determine_alt_screen_mode_cli_override_wins() {
+        assert!(!determine_alt_screen_mode_for_env(
+            true,
+            flok_core::config::AltScreenMode::Always,
+            false,
+        ));
+    }
+
+    #[test]
+    fn determine_alt_screen_mode_auto_disables_alt_screen_in_zellij() {
+        assert!(!determine_alt_screen_mode_for_env(
+            false,
+            flok_core::config::AltScreenMode::Auto,
+            true,
+        ));
+        assert!(determine_alt_screen_mode_for_env(
+            false,
+            flok_core::config::AltScreenMode::Auto,
+            false,
+        ));
+    }
+
+    #[test]
+    fn determine_alt_screen_mode_respects_explicit_config() {
+        assert!(determine_alt_screen_mode_for_env(
+            false,
+            flok_core::config::AltScreenMode::Always,
+            true,
+        ));
+        assert!(!determine_alt_screen_mode_for_env(
+            false,
+            flok_core::config::AltScreenMode::Never,
+            false,
+        ));
     }
 
     #[cfg(unix)]

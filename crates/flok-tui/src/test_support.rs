@@ -66,6 +66,7 @@ impl TestAppHarness {
             todo_list: TodoList::new(),
             plan_mode: PlanMode::new(),
             model_name: "test-model".to_string(),
+            alternate_screen: false,
         };
         let (app_tx, app_rx) = mpsc::unbounded_channel();
         let mut app = App::new(channels, app_tx, app_rx);
@@ -227,6 +228,7 @@ pub async fn run_app_perf_script(
         todo_list: TodoList::new(),
         plan_mode: PlanMode::new(),
         model_name: "test-model".to_string(),
+        alternate_screen: false,
     };
     let (app_tx, app_rx) = mpsc::unbounded_channel();
     let mut app = App::new(channels, app_tx.clone(), app_rx);

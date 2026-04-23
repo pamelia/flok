@@ -38,6 +38,8 @@ pub struct FlokConfig {
     /// Supports both `[mcp_servers.<name>]` and the legacy alias `[mcp.<name>]`.
     #[serde(alias = "mcp")]
     pub mcp_servers: HashMap<String, McpServerConfig>,
+    /// TUI runtime behavior.
+    pub tui: TuiConfig,
     pub lsp: LspConfig,
     /// Git worktree isolation settings.
     pub worktree: WorktreeConfig,
@@ -68,6 +70,36 @@ pub struct FlokConfig {
     pub intelligent_routing: IntelligentRoutingConfig,
     /// Tool output compression configuration.
     pub output_compression: OutputCompressionConfig,
+}
+
+/// Controls whether the TUI uses the terminal's alternate screen buffer.
+///
+/// `auto` preserves scrollback inside Zellij by avoiding the alternate screen there,
+/// while keeping the fullscreen experience elsewhere.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AltScreenMode {
+    /// Automatically disable alternate screen inside Zellij, enable elsewhere.
+    #[default]
+    Auto,
+    /// Always use the alternate screen buffer.
+    Always,
+    /// Never use the alternate screen buffer.
+    Never,
+}
+
+/// TUI-specific configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct TuiConfig {
+    /// Alternate-screen behavior for interactive mode.
+    pub alternate_screen: AltScreenMode,
+}
+
+impl Default for TuiConfig {
+    fn default() -> Self {
+        Self { alternate_screen: AltScreenMode::Auto }
+    }
 }
 
 /// Configuration for a single MCP server.
@@ -659,6 +691,7 @@ fn merge_config(target: &mut FlokConfig, source: &FlokConfig) {
             entry.bearer_token_env_var.clone_from(&value.bearer_token_env_var);
         }
     }
+    target.tui = source.tui.clone();
     target.lsp = source.lsp.clone();
     // Worktree config: source overrides target entirely if present in source file
     // (serde default handles missing fields; if explicitly set in source, override)
@@ -741,6 +774,7 @@ mod tests {
         assert!(config.provider.is_empty());
         assert!(config.reasoning_effort.is_none());
         assert!(config.mcp_servers.is_empty());
+        assert_eq!(config.tui.alternate_screen, AltScreenMode::Auto);
         assert!(config.lsp.enabled);
         assert_eq!(config.lsp.rust.command, "rust-analyzer");
         assert_eq!(config.lsp.javascript.command, "typescript-language-server");
@@ -819,6 +853,17 @@ mod tests {
         assert_eq!(config.lsp.go.args, vec!["serve"]);
         assert_eq!(config.lsp.java.command, "custom-jdtls");
         assert_eq!(config.lsp.java.args, vec!["--data", ".flok/jdtls-workspace"]);
+    }
+
+    #[test]
+    fn parse_tui_config() {
+        let toml_str = r#"
+            [tui]
+            alternate_screen = "never"
+        "#;
+
+        let config: FlokConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.tui.alternate_screen, AltScreenMode::Never);
     }
 
     #[test]
@@ -999,6 +1044,21 @@ mod tests {
             base.provider["anthropic"].api_key.as_ref().map(SecretString::expose_secret),
             Some("key-123"),
         );
+    }
+
+    #[test]
+    fn merge_tui_overlay_overrides_alt_screen_mode() {
+        let mut base = FlokConfig {
+            tui: TuiConfig { alternate_screen: AltScreenMode::Always },
+            ..Default::default()
+        };
+        let overlay = FlokConfig {
+            tui: TuiConfig { alternate_screen: AltScreenMode::Never },
+            ..Default::default()
+        };
+
+        merge_config(&mut base, &overlay);
+        assert_eq!(base.tui.alternate_screen, AltScreenMode::Never);
     }
 
     #[test]

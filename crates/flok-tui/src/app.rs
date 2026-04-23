@@ -1493,6 +1493,7 @@ mod tests {
             todo_list: TodoList::new(),
             plan_mode: PlanMode::new(),
             model_name: String::from("test-model"),
+            alternate_screen: true,
         };
 
         (channels, cmd_rx)
@@ -1539,6 +1540,7 @@ mod tests {
             todo_list: TodoList::new(),
             plan_mode: PlanMode::new(),
             model_name: String::from("test-model"),
+            alternate_screen: true,
         };
         let (tx, rx) = mpsc::unbounded_channel::<AppEvent>();
         let mut app = App::new(channels, tx.clone(), rx);

@@ -21,6 +21,7 @@ pub(crate) const SLASH_COMMANDS: &[&str] = &[
     "show-plan",
     "approve",
     "execute-plan",
+    "rollback-plan",
     "plan",
     "build",
     "sidebar",
@@ -233,6 +234,7 @@ mod tests {
         assert!(popup.filtered.contains(&"plans"));
         assert!(popup.filtered.contains(&"show-plan"));
         assert!(popup.filtered.contains(&"execute-plan"));
+        assert!(popup.filtered.contains(&"rollback-plan"));
     }
 
     #[test]

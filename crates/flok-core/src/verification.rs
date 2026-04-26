@@ -7,6 +7,9 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+
 const VERIFICATION_TIMEOUT: Duration = Duration::from_secs(180);
 const OUTPUT_LIMIT: usize = 8_000;
 
@@ -37,6 +40,125 @@ impl VerificationCommand {
 pub struct VerificationPreference {
     command: VerificationCommand,
     scope_files: Vec<String>,
+}
+
+/// Policy used when verification gates a runtime action.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VerificationPolicy {
+    pub level: VerificationLevel,
+    pub require_for_completion: bool,
+    pub max_repair_attempts: u32,
+}
+
+impl Default for VerificationPolicy {
+    fn default() -> Self {
+        Self {
+            level: VerificationLevel::Targeted,
+            require_for_completion: true,
+            max_repair_attempts: 1,
+        }
+    }
+}
+
+/// Verification strictness level.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationLevel {
+    Sanity,
+    Targeted,
+    RepoDefault,
+    Full,
+}
+
+/// Why verification stopped for a step or action.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationStopReason {
+    Passed,
+    Failed,
+    SkippedNoCommand,
+    SkippedNoChanges,
+    RepairBudgetExhausted,
+}
+
+/// Whether a failure is primarily style/lint or correctness breaking.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationFailureImpact {
+    Style,
+    Correctness,
+    Unknown,
+}
+
+/// Durable verification history attached to plan run steps.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VerificationRecord {
+    pub level: VerificationLevel,
+    pub command: Option<String>,
+    pub scope_files: Vec<String>,
+    pub success: Option<bool>,
+    pub exit_code: Option<i32>,
+    pub duration_ms: u128,
+    pub stop_reason: VerificationStopReason,
+    pub failure_kind: Option<VerificationFailureKind>,
+    pub failure_impact: Option<VerificationFailureImpact>,
+    pub summary: String,
+    pub recorded_at: DateTime<Utc>,
+}
+
+impl VerificationRecord {
+    /// Create a durable record from a completed command report.
+    #[must_use]
+    pub fn from_report(
+        level: VerificationLevel,
+        scope_files: Vec<String>,
+        duration: Duration,
+        report: &VerificationReport,
+    ) -> Self {
+        let failure_summary = report.failure_summary();
+        let failure_kind = failure_summary.as_ref().map(|summary| summary.kind.clone());
+        let failure_impact = failure_kind.as_ref().map(VerificationFailureImpact::from_kind);
+        Self {
+            level,
+            command: Some(report.command.clone()),
+            scope_files,
+            success: Some(report.success),
+            exit_code: report.exit_code,
+            duration_ms: duration.as_millis(),
+            stop_reason: if report.success {
+                VerificationStopReason::Passed
+            } else {
+                VerificationStopReason::Failed
+            },
+            failure_kind,
+            failure_impact,
+            summary: report.summary(),
+            recorded_at: Utc::now(),
+        }
+    }
+
+    /// Create a durable skipped-verification record.
+    #[must_use]
+    pub fn skipped(
+        level: VerificationLevel,
+        scope_files: Vec<String>,
+        stop_reason: VerificationStopReason,
+        summary: impl Into<String>,
+    ) -> Self {
+        Self {
+            level,
+            command: None,
+            scope_files,
+            success: None,
+            exit_code: None,
+            duration_ms: 0,
+            stop_reason,
+            failure_kind: None,
+            failure_impact: None,
+            summary: summary.into(),
+            recorded_at: Utc::now(),
+        }
+    }
 }
 
 /// Whether retry edits can be mapped to the failing verification scope.
@@ -97,7 +219,8 @@ impl VerificationPreference {
 }
 
 /// Coarse failure class for verification retries.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum VerificationFailureKind {
     CommandStart,
     Timeout,
@@ -105,6 +228,18 @@ pub enum VerificationFailureKind {
     Test,
     Lint,
     Unknown,
+}
+
+impl VerificationFailureImpact {
+    fn from_kind(kind: &VerificationFailureKind) -> Self {
+        match kind {
+            VerificationFailureKind::Lint => Self::Style,
+            VerificationFailureKind::Build | VerificationFailureKind::Test => Self::Correctness,
+            VerificationFailureKind::CommandStart
+            | VerificationFailureKind::Timeout
+            | VerificationFailureKind::Unknown => Self::Unknown,
+        }
+    }
 }
 
 impl VerificationFailureKind {

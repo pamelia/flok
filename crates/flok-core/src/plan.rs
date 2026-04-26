@@ -10,6 +10,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
+use crate::verification::VerificationRecord;
+
 /// Unique identifier for an execution plan.
 pub type PlanId = String;
 
@@ -124,6 +126,8 @@ pub struct PlanRunStep {
     pub step_id: StepId,
     pub status: StepStatus,
     pub checkpoint: Option<Checkpoint>,
+    #[serde(default)]
+    pub verification_records: Vec<VerificationRecord>,
     pub started_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
     pub retry_count: u32,
@@ -209,6 +213,7 @@ pub struct PlanPatch {
     pub checkpoint: Option<Checkpoint>,
     pub run_status: Option<PlanRunStatus>,
     pub failure: Option<PlanFailure>,
+    pub verification_record: Option<VerificationRecord>,
 }
 
 /// Errors returned by plan persistence and validation.
@@ -349,7 +354,10 @@ impl PlanStore {
             }
         }
 
-        if patch.step_status.is_some() || patch.checkpoint.is_some() {
+        if patch.step_status.is_some()
+            || patch.checkpoint.is_some()
+            || patch.verification_record.is_some()
+        {
             let Some(step_id) = patch.step_id else {
                 return Err(PlanError::Validation(
                     "step_id is required when updating a step".to_string(),
@@ -401,6 +409,9 @@ impl PlanStore {
                 }
                 if let Some(checkpoint) = updated_checkpoint {
                     run_step.checkpoint = Some(checkpoint);
+                }
+                if let Some(record) = patch.verification_record {
+                    run_step.verification_records.push(record);
                 }
             }
         }
@@ -488,6 +499,7 @@ impl ExecutionPlan {
                     step_id: step.id.clone(),
                     status: step.status.clone(),
                     checkpoint: step.checkpoint.clone(),
+                    verification_records: Vec::new(),
                     started_at: None,
                     completed_at: None,
                     retry_count: 0,

@@ -30,7 +30,7 @@ use crate::token::TokenCounter;
 use crate::verification::{
     detect_command_with_preference as detect_verification_command,
     run_command as run_verification_command, RetryChangeRelevance, VerificationFailureSummary,
-    VerificationPreference,
+    VerificationPolicy, VerificationPreference, VerificationRecord, VerificationStopReason,
 };
 
 /// Maximum number of tool-call rounds before we stop (doom loop protection).
@@ -747,6 +747,43 @@ impl SessionEngine {
 
                 match self.send_message(&prompt).await {
                     Ok(SendMessageResult::Complete(_)) => {
+                        let verification = verify_plan_step(
+                            &self.state.project_root,
+                            &self.state.bus,
+                            &self.session_id,
+                            &step,
+                            &VerificationPolicy::default(),
+                        )
+                        .await?;
+                        plan = store.apply_patch(
+                            &plan.id,
+                            PlanPatch {
+                                step_id: Some(step_id.clone()),
+                                verification_record: Some(verification.record.clone()),
+                                ..PlanPatch::default()
+                            },
+                        )?;
+                        if !verification.allows_completion() {
+                            let rollback_detail = rollback_plan_step(&self.state.snapshot, &step)
+                                .await
+                                .unwrap_or_else(|rollback_error| {
+                                    format!(
+                                        "rollback failed after verification failure: {rollback_error}"
+                                    )
+                                });
+                            mark_failed_plan(
+                                &store,
+                                &plan,
+                                &step.id,
+                                &verification.record.summary,
+                                &rollback_detail,
+                            )?;
+                            anyhow::bail!(
+                                "plan execution failed verification at step '{}': {}",
+                                step.title,
+                                verification.record.summary
+                            );
+                        }
                         plan = store.apply_patch(
                             &plan.id,
                             PlanPatch {
@@ -2441,6 +2478,29 @@ fn format_plan_details(plan: &ExecutionPlan, store: &PlanStore) -> String {
             let _ = writeln!(text, "- {} -> {}", dependency.prerequisite, dependency.dependent);
         }
     }
+    if let Some(run) = plan
+        .active_run_id
+        .as_ref()
+        .and_then(|active_run_id| plan.runs.iter().find(|run| run.id == *active_run_id))
+    {
+        let _ = writeln!(text, "\nLatest verification:");
+        for run_step in &run.steps {
+            let Some(record) = run_step.verification_records.last() else {
+                continue;
+            };
+            let command = record.command.as_deref().map_or("<skipped>", std::convert::identity);
+            let status = match record.success {
+                Some(true) => "passed",
+                Some(false) => "failed",
+                None => "skipped",
+            };
+            let _ = writeln!(
+                text,
+                "- {}: {} ({:?}) command={}",
+                run_step.step_id, status, record.stop_reason, command
+            );
+        }
+    }
     text.trim_end().to_string()
 }
 
@@ -2534,6 +2594,70 @@ fn prepare_plan_for_execution(
     }
 
     Ok((updated, resumed_steps))
+}
+
+struct PlanStepVerification {
+    record: VerificationRecord,
+    required: bool,
+}
+
+impl PlanStepVerification {
+    fn allows_completion(&self) -> bool {
+        if !self.required {
+            return true;
+        }
+
+        matches!(
+            self.record.stop_reason,
+            VerificationStopReason::Passed
+                | VerificationStopReason::SkippedNoCommand
+                | VerificationStopReason::SkippedNoChanges
+        )
+    }
+}
+
+async fn verify_plan_step(
+    project_root: &std::path::Path,
+    bus: &crate::bus::Bus,
+    session_id: &str,
+    step: &crate::plan::PlanStep,
+    policy: &VerificationPolicy,
+) -> anyhow::Result<PlanStepVerification> {
+    let scope_files =
+        step.affected_files.iter().map(|path| path.display().to_string()).collect::<Vec<_>>();
+
+    let Some(command) = detect_verification_command(project_root, &scope_files, None) else {
+        return Ok(PlanStepVerification {
+            record: VerificationRecord::skipped(
+                policy.level,
+                scope_files,
+                VerificationStopReason::SkippedNoCommand,
+                "Plan step verification skipped: no repo-appropriate verification command was detected.",
+            ),
+            required: policy.require_for_completion,
+        });
+    };
+
+    let command_text = command.display();
+    bus.send(BusEvent::VerificationStarted {
+        session_id: session_id.to_string(),
+        command: command_text,
+    });
+    let started = std::time::Instant::now();
+    let report = run_verification_command(project_root, &command).await?;
+    let duration = started.elapsed();
+    let summary = report.summary();
+    bus.send(BusEvent::VerificationCompleted {
+        session_id: session_id.to_string(),
+        command: report.command.clone(),
+        success: report.success,
+        summary,
+    });
+
+    Ok(PlanStepVerification {
+        record: VerificationRecord::from_report(policy.level, scope_files, duration, &report),
+        required: policy.require_for_completion,
+    })
 }
 
 fn resolve_rollback_step(
@@ -3693,6 +3817,99 @@ edition = "2021"
         assert!(matches!(loaded.status, PlanStatus::RolledBack));
         assert!(matches!(loaded.steps[0].status, StepStatus::RolledBack));
         assert!(matches!(loaded.steps[1].status, StepStatus::Pending));
+    }
+
+    #[tokio::test]
+    async fn execute_plan_records_passing_step_verification_before_completion() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        std::fs::write(
+            temp_dir.path().join("Cargo.toml"),
+            "[package]\nname = \"verify-pass\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("write manifest");
+        std::fs::create_dir_all(temp_dir.path().join("src")).expect("mkdir src");
+        std::fs::write(temp_dir.path().join("src/lib.rs"), "pub fn answer() -> u8 { 42 }\n")
+            .expect("write lib");
+
+        let provider = Arc::new(MockProvider::new());
+        provider.push_turn(MockTurn::Text("implemented verified step".into()));
+
+        let mut engine = test_engine_with_tools(&temp_dir, &provider, ToolRegistry::new());
+        let store = engine.plan_store();
+        let created = store
+            .create_plan(NewExecutionPlan {
+                session_id: engine.session_id().to_string(),
+                title: "Verified pass".to_string(),
+                description: String::new(),
+                steps: vec![NewPlanStep {
+                    id: Some("step-1".to_string()),
+                    title: "Check code".to_string(),
+                    description: String::new(),
+                    affected_files: vec![std::path::PathBuf::from("src/lib.rs")],
+                    agent_type: "build".to_string(),
+                    estimated_tokens: None,
+                }],
+                dependencies: Vec::new(),
+            })
+            .expect("create plan");
+
+        engine.approve_plan(Some(&created.id)).expect("approve");
+        engine.execute_plan(Some(&created.id)).await.expect("execute");
+        let loaded = store.load_plan(&created.id).expect("reload");
+        let run = loaded.runs.last().expect("run");
+        let records = &run.steps[0].verification_records;
+
+        assert!(matches!(loaded.status, PlanStatus::Completed));
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].success, Some(true));
+        assert!(records[0].command.as_deref().is_some_and(|cmd| cmd.contains("cargo check")));
+    }
+
+    #[tokio::test]
+    async fn execute_plan_fails_step_when_required_verification_is_red() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        std::fs::write(
+            temp_dir.path().join("Cargo.toml"),
+            "[package]\nname = \"verify-fail\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("write manifest");
+        std::fs::create_dir_all(temp_dir.path().join("src")).expect("mkdir src");
+        std::fs::write(temp_dir.path().join("src/lib.rs"), "pub fn broken( -> u8 { 42 }\n")
+            .expect("write invalid lib");
+
+        let provider = Arc::new(MockProvider::new());
+        provider.push_turn(MockTurn::Text("implemented broken step".into()));
+
+        let mut engine = test_engine_with_tools(&temp_dir, &provider, ToolRegistry::new());
+        let store = engine.plan_store();
+        let created = store
+            .create_plan(NewExecutionPlan {
+                session_id: engine.session_id().to_string(),
+                title: "Verified fail".to_string(),
+                description: String::new(),
+                steps: vec![NewPlanStep {
+                    id: Some("step-1".to_string()),
+                    title: "Check broken code".to_string(),
+                    description: String::new(),
+                    affected_files: vec![std::path::PathBuf::from("src/lib.rs")],
+                    agent_type: "build".to_string(),
+                    estimated_tokens: None,
+                }],
+                dependencies: Vec::new(),
+            })
+            .expect("create plan");
+
+        engine.approve_plan(Some(&created.id)).expect("approve");
+        let error = engine.execute_plan(Some(&created.id)).await.expect_err("verification fails");
+        let loaded = store.load_plan(&created.id).expect("reload");
+        let run = loaded.runs.last().expect("run");
+        let records = &run.steps[0].verification_records;
+
+        assert!(error.to_string().contains("failed verification"));
+        assert!(matches!(loaded.status, PlanStatus::Failed));
+        assert!(matches!(loaded.steps[0].status, StepStatus::Failed(_)));
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].success, Some(false));
     }
 
     #[tokio::test]

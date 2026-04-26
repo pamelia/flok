@@ -1,11 +1,11 @@
 //! The `plan` tool — writes structured plan output.
 //!
 //! Available in plan mode only. Writes a structured markdown plan
-//! to `.flok/plan.md` in the project root.
+//! under flok's generated per-project state directory.
 
 use super::{Tool, ToolContext, ToolOutput};
 
-/// Write a structured plan to `.flok/plan.md`.
+/// Write a structured plan to flok's generated state directory.
 pub struct PlanTool;
 
 #[async_trait::async_trait]
@@ -15,7 +15,7 @@ impl Tool for PlanTool {
     }
 
     fn description(&self) -> &'static str {
-        "Write a structured plan to .flok/plan.md. Use this in plan mode to document \
+        "Write a structured plan to flok's generated state directory. Use this in plan mode to document \
          your analysis and proposed changes before switching to build mode."
     }
 
@@ -37,12 +37,12 @@ impl Tool for PlanTool {
     }
 
     fn permission_level(&self) -> super::PermissionLevel {
-        // Plan tool is safe — it only writes to .flok/plan.md
+        // Plan tool is safe — it only writes to flok-managed internal state.
         super::PermissionLevel::Safe
     }
 
     fn describe_invocation(&self, _args: &serde_json::Value) -> String {
-        "plan: write to .flok/plan.md".to_string()
+        "plan: write to flok internal plan state".to_string()
     }
 
     async fn execute(
@@ -55,7 +55,7 @@ impl Tool for PlanTool {
             .ok_or_else(|| anyhow::anyhow!("missing required parameter: content"))?;
         let append = args["append"].as_bool().unwrap_or(false);
 
-        let plan_dir = ctx.project_root.join(".flok");
+        let plan_dir = crate::config::project_state_dir(&ctx.project_root);
         let plan_file = plan_dir.join("plan.md");
 
         tokio::fs::create_dir_all(&plan_dir).await?;
@@ -72,13 +72,13 @@ impl Tool for PlanTool {
             existing.push_str(content);
             tokio::fs::write(&plan_file, &existing).await?;
             Ok(ToolOutput::success(format!(
-                "Plan appended to .flok/plan.md ({} chars total)",
+                "Plan appended to internal plan state ({} chars total)",
                 existing.len()
             )))
         } else {
             tokio::fs::write(&plan_file, content).await?;
             Ok(ToolOutput::success(format!(
-                "Plan written to .flok/plan.md ({} chars)",
+                "Plan written to internal plan state ({} chars)",
                 content.len()
             )))
         }
@@ -106,7 +106,9 @@ mod tests {
             .unwrap();
         assert!(!result.is_error);
 
-        let content = std::fs::read_to_string(dir.path().join(".flok/plan.md")).unwrap();
+        let content =
+            std::fs::read_to_string(crate::config::project_state_dir(dir.path()).join("plan.md"))
+                .unwrap();
         assert!(content.contains("# Plan"));
     }
 
@@ -119,7 +121,9 @@ mod tests {
         tool.execute(serde_json::json!({"content": "Step 1"}), &ctx).await.unwrap();
         tool.execute(serde_json::json!({"content": "Step 2", "append": true}), &ctx).await.unwrap();
 
-        let content = std::fs::read_to_string(dir.path().join(".flok/plan.md")).unwrap();
+        let content =
+            std::fs::read_to_string(crate::config::project_state_dir(dir.path()).join("plan.md"))
+                .unwrap();
         assert!(content.contains("Step 1"));
         assert!(content.contains("Step 2"));
     }

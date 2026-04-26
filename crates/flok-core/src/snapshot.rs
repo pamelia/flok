@@ -12,7 +12,7 @@
 //! ## Shadow repo location
 //!
 //! ```text
-//! <data_dir>/flok/snapshot/<project_id>/<sha1(worktree)>/
+//! ~/.flok/snapshot/<project_id>/<sha1(worktree)>/
 //! ```
 //!
 //! The shadow repo uses `--git-dir` and `--work-tree` flags so it never
@@ -89,20 +89,11 @@ impl SnapshotManager {
     /// `worktree` is the absolute path to the workspace root.
     ///
     /// The shadow git repo will be created at:
-    /// `<data_dir>/flok/snapshot/<project_id>/<hash(worktree)>/`
+    /// `~/.flok/snapshot/<project_id>/<hash(worktree)>/`
     pub fn new(project_id: &str, worktree: PathBuf) -> Self {
         let worktree_hash = hash_path(&worktree);
-        let fallback_base = worktree.join(".flok").join("snapshot").join(project_id);
-        let snapshot_base = if cfg!(test) {
-            let _ = std::fs::create_dir_all(&fallback_base);
-            fallback_base
-        } else {
-            select_writable_storage_dir(
-                directories::BaseDirs::new()
-                    .map(|dirs| dirs.data_dir().join("flok").join("snapshot").join(project_id)),
-                fallback_base,
-            )
-        };
+        let snapshot_base = crate::config::flok_state_root().join("snapshot").join(project_id);
+        let _ = std::fs::create_dir_all(&snapshot_base);
         let gitdir = snapshot_base.join(worktree_hash);
 
         // Only enable if the worktree has a .git directory (is a git project)
@@ -637,22 +628,6 @@ impl SnapshotManager {
             stderr: String::from_utf8_lossy(&output.stderr).to_string(),
         })
     }
-}
-
-fn select_writable_storage_dir(primary: Option<PathBuf>, fallback: PathBuf) -> PathBuf {
-    if let Some(primary) = primary {
-        if std::fs::create_dir_all(&primary).is_ok() {
-            return primary;
-        }
-        tracing::warn!(
-            path = %primary.display(),
-            fallback = %fallback.display(),
-            "snapshot storage directory unavailable, using project-local fallback"
-        );
-    }
-
-    let _ = std::fs::create_dir_all(&fallback);
-    fallback
 }
 
 impl std::fmt::Debug for SnapshotManager {

@@ -11,7 +11,7 @@ use crate::plan::{
 
 use super::{Tool, ToolContext, ToolOutput};
 
-/// Create a structured execution plan persisted to `.flok/plans/<plan_id>.json`.
+/// Create a structured execution plan persisted to flok's generated state directory.
 pub struct PlanCreateTool;
 
 /// Update plan-level or step-level status for an existing plan.
@@ -63,7 +63,7 @@ impl Tool for PlanCreateTool {
     }
 
     fn description(&self) -> &'static str {
-        "Create a typed execution plan and persist it under .flok/plans/<plan_id>.json. \
+        "Create a typed execution plan and persist it under flok's generated per-project state directory. \
          Use this in plan mode when a task is complex enough to require explicit steps, \
          dependencies, and later approval/execution."
     }
@@ -295,7 +295,7 @@ mod tests {
 
         assert!(!result.is_error);
         assert!(result.content.contains("Plan file:"));
-        assert!(ctx.project_root.join(".flok/plans").exists());
+        assert!(crate::config::project_state_dir(&ctx.project_root).join("plans").exists());
     }
 
     #[tokio::test]

@@ -54,7 +54,7 @@ pub enum MergeResult {
 pub struct WorktreeManager {
     /// The main project root (where `.git` lives).
     project_root: PathBuf,
-    /// Base directory for worktrees: `$XDG_STATE_HOME/flok/worktrees/{project_id}/`.
+    /// Base directory for worktrees: `~/.flok/worktrees/{project_id}/`.
     worktree_base: PathBuf,
     /// Serializes merge operations to prevent concurrent merges.
     merge_lock: Mutex<()>,
@@ -65,21 +65,12 @@ pub struct WorktreeManager {
 impl WorktreeManager {
     /// Create a new worktree manager.
     ///
-    /// Worktrees are stored under `$XDG_STATE_HOME/flok/worktrees/{project_id}/`.
+    /// Worktrees are stored under `~/.flok/worktrees/{project_id}/`.
     /// Disabled if the project root does not contain a `.git` directory.
     pub fn new(project_id: &str, project_root: PathBuf) -> Self {
         let enabled = project_root.join(".git").exists();
-        let fallback_base = project_root.join(".flok").join("worktrees").join(project_id);
-        let state_base = if cfg!(test) {
-            let _ = std::fs::create_dir_all(&fallback_base);
-            fallback_base
-        } else {
-            select_writable_storage_dir(
-                directories::BaseDirs::new()
-                    .map(|dirs| dirs.data_dir().join("flok").join("worktrees").join(project_id)),
-                fallback_base,
-            )
-        };
+        let state_base = crate::config::flok_state_root().join("worktrees").join(project_id);
+        let _ = std::fs::create_dir_all(&state_base);
 
         Self { project_root, worktree_base: state_base, merge_lock: Mutex::new(()), enabled }
     }
@@ -326,22 +317,6 @@ impl WorktreeManager {
         tracing::debug!(session_id, "worktree removed");
         Ok(())
     }
-}
-
-fn select_writable_storage_dir(primary: Option<PathBuf>, fallback: PathBuf) -> PathBuf {
-    if let Some(primary) = primary {
-        if std::fs::create_dir_all(&primary).is_ok() {
-            return primary;
-        }
-        tracing::warn!(
-            path = %primary.display(),
-            fallback = %fallback.display(),
-            "worktree storage directory unavailable, using project-local fallback"
-        );
-    }
-
-    let _ = std::fs::create_dir_all(&fallback);
-    fallback
 }
 
 impl std::fmt::Debug for WorktreeManager {

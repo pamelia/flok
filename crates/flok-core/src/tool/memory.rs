@@ -1,7 +1,7 @@
 //! The `agent_memory` tool — read/write persistent per-agent memory.
 //!
-//! Memory is stored in `.flok/memory/<agent>.md` files. Each agent has
-//! independent memory scoped to the project.
+//! Memory is stored under flok's generated per-project state directory. Each
+//! agent has independent memory scoped to the project.
 
 use std::path::PathBuf;
 
@@ -49,7 +49,7 @@ impl Tool for AgentMemoryTool {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("missing required parameter: operation"))?;
 
-        let memory_dir = ctx.project_root.join(".flok").join("memory");
+        let memory_dir = crate::config::project_state_dir(&ctx.project_root).join("memory");
         let memory_file = memory_dir.join(format!("{}.md", ctx.agent));
 
         match operation {

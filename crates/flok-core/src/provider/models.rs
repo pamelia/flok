@@ -112,6 +112,39 @@ impl ModelRegistry {
             },
             // OpenAI — current models
             ModelInfo {
+                id: "openai/gpt-5.5",
+                provider: "openai",
+                display_name: "GPT-5.5",
+                context_window: 1_050_000,
+                max_output_tokens: 128_000,
+                input_cost_per_m: 2.50,
+                output_cost_per_m: 15.00,
+                supports_tools: true,
+                supports_streaming: true,
+            },
+            ModelInfo {
+                id: "openai/gpt-5.5-mini",
+                provider: "openai",
+                display_name: "GPT-5.5 Mini",
+                context_window: 400_000,
+                max_output_tokens: 128_000,
+                input_cost_per_m: 0.75,
+                output_cost_per_m: 4.50,
+                supports_tools: true,
+                supports_streaming: true,
+            },
+            ModelInfo {
+                id: "openai/gpt-5.5-nano",
+                provider: "openai",
+                display_name: "GPT-5.5 Nano",
+                context_window: 400_000,
+                max_output_tokens: 128_000,
+                input_cost_per_m: 0.20,
+                output_cost_per_m: 1.25,
+                supports_tools: true,
+                supports_streaming: true,
+            },
+            ModelInfo {
                 id: "openai/gpt-5.4",
                 provider: "openai",
                 display_name: "GPT-5.4",
@@ -236,7 +269,7 @@ impl ModelRegistry {
     ///
     /// Accepts:
     /// - Full ID: `"anthropic/claude-sonnet-4-20250514"` (returned as-is)
-    /// - Short names: `"sonnet"`, `"opus"`, `"haiku"`, `"gpt-5.4"`, `"mini"`, `"nano"`
+    /// - Short names: `"sonnet"`, `"opus"`, `"haiku"`, `"gpt-5.5"`, `"mini"`, `"nano"`
     /// - Partial names: `"claude-sonnet-4"`, `"claude-opus-4"`
     ///
     /// Returns the full model ID, or the input unchanged if no match.
@@ -264,11 +297,18 @@ impl ModelRegistry {
             // Anthropic — legacy versions
             "sonnet-4" | "claude-sonnet-4" | "sonnet-4.0" => "anthropic/claude-sonnet-4-20250514",
             "opus-4" | "claude-opus-4" | "opus-4.0" => "anthropic/claude-opus-4-20250514",
+            "gpt-5.5" | "gpt5.5" | "5.5" | "chatgpt-5.5" | "chatgpt5.5" => "openai/gpt-5.5",
+            "gpt-5.5-mini" | "gpt5.5-mini" | "5.5-mini" | "mini" | "chatgpt-5.5-mini" => {
+                "openai/gpt-5.5-mini"
+            }
+            "gpt-5.5-nano" | "gpt5.5-nano" | "5.5-nano" | "nano" | "chatgpt-5.5-nano" => {
+                "openai/gpt-5.5-nano"
+            }
             "gpt-5.4" | "gpt5.4" | "5.4" | "chatgpt-5.4" | "chatgpt5.4" => "openai/gpt-5.4",
-            "gpt-5.4-mini" | "gpt5.4-mini" | "5.4-mini" | "mini" | "chatgpt-5.4-mini" => {
+            "gpt-5.4-mini" | "gpt5.4-mini" | "5.4-mini" | "chatgpt-5.4-mini" => {
                 "openai/gpt-5.4-mini"
             }
-            "gpt-5.4-nano" | "gpt5.4-nano" | "5.4-nano" | "nano" | "chatgpt-5.4-nano" => {
+            "gpt-5.4-nano" | "gpt5.4-nano" | "5.4-nano" | "chatgpt-5.4-nano" => {
                 "openai/gpt-5.4-nano"
             }
             "gpt-4.1" | "gpt4.1" | "4.1" => "openai/gpt-4.1",
@@ -387,8 +427,8 @@ mod tests {
     #[test]
     fn lookup_openai_gpt_5_4() {
         let registry = ModelRegistry::builtin();
-        let model = registry.get("openai/gpt-5.4").unwrap();
-        assert_eq!(model.display_name, "GPT-5.4");
+        let model = registry.get("openai/gpt-5.5").unwrap();
+        assert_eq!(model.display_name, "GPT-5.5");
         assert_eq!(model.context_window, 1_050_000);
         assert_eq!(model.max_output_tokens, 128_000);
         assert!(model.supports_tools);
@@ -397,10 +437,18 @@ mod tests {
 
     #[test]
     fn resolve_openai_current_shorthands() {
+        assert_eq!(ModelRegistry::resolve("gpt-5.5"), "openai/gpt-5.5");
+        assert_eq!(ModelRegistry::resolve("chatgpt-5.5"), "openai/gpt-5.5");
+        assert_eq!(ModelRegistry::resolve("mini"), "openai/gpt-5.5-mini");
+        assert_eq!(ModelRegistry::resolve("nano"), "openai/gpt-5.5-nano");
         assert_eq!(ModelRegistry::resolve("gpt-5.4"), "openai/gpt-5.4");
         assert_eq!(ModelRegistry::resolve("chatgpt-5.4"), "openai/gpt-5.4");
-        assert_eq!(ModelRegistry::resolve("mini"), "openai/gpt-5.4-mini");
-        assert_eq!(ModelRegistry::resolve("nano"), "openai/gpt-5.4-nano");
+    }
+
+    #[test]
+    fn resolve_openai_previous_generation_variants() {
+        assert_eq!(ModelRegistry::resolve("gpt-5.4-mini"), "openai/gpt-5.4-mini");
+        assert_eq!(ModelRegistry::resolve("gpt-5.4-nano"), "openai/gpt-5.4-nano");
     }
 
     #[test]

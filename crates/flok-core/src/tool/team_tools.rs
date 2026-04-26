@@ -57,7 +57,7 @@ impl Tool for TeamCreateTool {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("missing required parameter: name"))?;
 
-        let team = self.registry.create_team(name);
+        let team = self.registry.create_team(name)?;
         tracing::info!(team_id = %team.id, name, "created team");
 
         self.bus.send(crate::bus::BusEvent::TeamCreated {
@@ -123,7 +123,7 @@ impl Tool for TeamDeleteTool {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("missing required parameter: team_id"))?;
 
-        if self.registry.delete(team_id) {
+        if self.registry.delete(team_id)? {
             tracing::info!(team_id, "disbanded team");
             Ok(ToolOutput::success(format!("Team {team_id} disbanded.")))
         } else {
@@ -219,7 +219,7 @@ impl Tool for TeamTaskTool {
                     .as_str()
                     .ok_or_else(|| anyhow::anyhow!("missing required parameter: subject"))?;
                 let description = args["description"].as_str().unwrap_or("");
-                let task = team.create_task(subject.into(), description.into()).await;
+                let task = team.create_task(subject.into(), description.into()).await?;
                 Ok(ToolOutput::success(serde_json::to_string_pretty(&task).unwrap_or_default()))
             }
             "update" => {
@@ -368,7 +368,7 @@ mod tests {
     #[tokio::test]
     async fn team_task_create_and_list() {
         let registry = TeamRegistry::new();
-        let team = registry.create_team("test");
+        let team = registry.create_team("test").unwrap();
         let team_id = team.id.clone();
 
         let tool = TeamTaskTool::new(registry);
@@ -407,7 +407,7 @@ mod tests {
     #[tokio::test]
     async fn send_message_to_lead() {
         let registry = TeamRegistry::new();
-        let team = registry.create_team("msg-test");
+        let team = registry.create_team("msg-test").unwrap();
         let team_id = team.id.clone();
 
         let tool = SendMessageTool::new(registry.clone());
@@ -440,7 +440,7 @@ mod tests {
     #[tokio::test]
     async fn team_delete_works() {
         let registry = TeamRegistry::new();
-        let team = registry.create_team("ephemeral");
+        let team = registry.create_team("ephemeral").unwrap();
         let team_id = team.id.clone();
 
         let tool = TeamDeleteTool::new(registry.clone());

@@ -219,6 +219,7 @@ fn strongest_configured_model(
 
 fn model_rank(model_id: &str) -> u32 {
     match model_id {
+        "openai/gpt-5.5" => 102,
         "openai/gpt-5.4" | "anthropic/claude-opus-4-7" => 100,
         "anthropic/claude-opus-4-6" => 95,
         "google/gemini-2.5-pro" => 92,
@@ -226,8 +227,10 @@ fn model_rank(model_id: &str) -> u32 {
         "openai/gpt-4.1" => 82,
         "minimax/MiniMax-M2.7" => 78,
         "google/gemini-2.5-flash" => 65,
+        "openai/gpt-5.5-mini" => 62,
         "openai/gpt-5.4-mini" | "openai/gpt-4.1-mini" => 60,
         "anthropic/claude-haiku-4-5-20251001" => 40,
+        "openai/gpt-5.5-nano" => 32,
         "openai/gpt-5.4-nano" => 30,
         _ => 50,
     }

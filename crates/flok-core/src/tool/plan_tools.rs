@@ -177,7 +177,7 @@ impl Tool for PlanUpdateTool {
                 },
                 "status": {
                     "type": "string",
-                    "enum": ["draft", "approved", "executing", "completed", "failed", "cancelled"]
+                    "enum": ["draft", "approved", "executing", "paused", "completed", "failed", "cancelled", "rolled_back"]
                 },
                 "step_id": {
                     "type": "string",
@@ -227,6 +227,7 @@ impl Tool for PlanUpdateTool {
                     .map(|status| parse_step_status(status, parsed.error.as_deref()))
                     .transpose()?,
                 checkpoint,
+                ..PlanPatch::default()
             },
         )?;
 
@@ -243,9 +244,11 @@ fn parse_plan_status(value: &str) -> anyhow::Result<PlanStatus> {
         "draft" => Ok(PlanStatus::Draft),
         "approved" => Ok(PlanStatus::Approved),
         "executing" => Ok(PlanStatus::Executing),
+        "paused" => Ok(PlanStatus::Paused),
         "completed" => Ok(PlanStatus::Completed),
         "failed" => Ok(PlanStatus::Failed),
         "cancelled" => Ok(PlanStatus::Cancelled),
+        "rolled_back" => Ok(PlanStatus::RolledBack),
         other => Err(anyhow::anyhow!("invalid plan status '{other}'")),
     }
 }

@@ -33,6 +33,10 @@ pub struct ExecutionPlan {
     pub steps: Vec<PlanStep>,
     pub dependencies: Vec<Dependency>,
     pub status: PlanStatus,
+    #[serde(default)]
+    pub active_run_id: Option<String>,
+    #[serde(default)]
+    pub runs: Vec<PlanRun>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -44,10 +48,20 @@ pub struct PlanStep {
     pub title: String,
     pub description: String,
     pub affected_files: Vec<PathBuf>,
+    #[serde(default)]
+    pub planned_file_hashes: Vec<PlanFileHash>,
     pub agent_type: String,
     pub estimated_tokens: Option<u64>,
     pub status: StepStatus,
     pub checkpoint: Option<Checkpoint>,
+}
+
+/// File content fingerprint captured when a plan is created.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlanFileHash {
+    pub path: PathBuf,
+    pub hash: Option<String>,
+    pub existed: bool,
 }
 
 /// Top-level plan lifecycle.
@@ -57,9 +71,11 @@ pub enum PlanStatus {
     Draft,
     Approved,
     Executing,
+    Paused,
     Completed,
     Failed,
     Cancelled,
+    RolledBack,
 }
 
 /// Per-step lifecycle.
@@ -72,6 +88,71 @@ pub enum StepStatus {
     Failed(String),
     Skipped,
     RolledBack,
+}
+
+/// Durable runtime state for an approved plan execution.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlanRun {
+    pub id: String,
+    pub status: PlanRunStatus,
+    pub steps: Vec<PlanRunStep>,
+    pub resume_point: Option<PlanResumePoint>,
+    pub failure: Option<PlanFailure>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+/// Durable plan execution lifecycle.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanRunStatus {
+    Draft,
+    Approved,
+    Executing,
+    Paused,
+    Failed,
+    Completed,
+    Cancelled,
+    RolledBack,
+}
+
+/// Durable execution metadata for a single step within a run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlanRunStep {
+    pub step_id: StepId,
+    pub status: StepStatus,
+    pub checkpoint: Option<Checkpoint>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub retry_count: u32,
+    pub failure: Option<PlanFailure>,
+}
+
+/// The current durable point from which a run can be resumed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlanResumePoint {
+    pub ready_step_ids: Vec<StepId>,
+    pub blocked_step_ids: Vec<StepId>,
+}
+
+/// Structured failure data stored with plan runs and run steps.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlanFailure {
+    pub step_id: Option<StepId>,
+    pub reason: String,
+    pub recorded_at: DateTime<Utc>,
+}
+
+/// File that changed after the plan was created.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StalePlanFile {
+    pub path: PathBuf,
+    pub planned_hash: Option<String>,
+    pub current_hash: Option<String>,
+    pub planned_existed: bool,
+    pub current_existed: bool,
 }
 
 /// Rollback checkpoint captured for a step.
@@ -126,6 +207,8 @@ pub struct PlanPatch {
     pub step_id: Option<StepId>,
     pub step_status: Option<StepStatus>,
     pub checkpoint: Option<Checkpoint>,
+    pub run_status: Option<PlanRunStatus>,
+    pub failure: Option<PlanFailure>,
 }
 
 /// Errors returned by plan persistence and validation.
@@ -161,6 +244,11 @@ impl PlanStore {
             .steps
             .into_iter()
             .map(|step| PlanStep {
+                planned_file_hashes: step
+                    .affected_files
+                    .iter()
+                    .map(|path| fingerprint_file(&self.project_root, path))
+                    .collect(),
                 id: step.id.unwrap_or_else(|| Ulid::new().to_string()),
                 title: step.title,
                 description: step.description,
@@ -180,6 +268,8 @@ impl PlanStore {
             steps,
             dependencies: new_plan.dependencies,
             status: PlanStatus::Draft,
+            active_run_id: None,
+            runs: Vec::new(),
             created_at: now,
             updated_at: now,
         };
@@ -246,6 +336,19 @@ impl PlanStore {
             plan.status = plan_status;
         }
 
+        if let Some(run_status) = patch.run_status {
+            if let Some(run) = plan.active_run_mut() {
+                if matches!(
+                    run_status,
+                    PlanRunStatus::Completed | PlanRunStatus::Cancelled | PlanRunStatus::RolledBack
+                ) {
+                    run.completed_at = Some(Utc::now());
+                }
+                run.status = run_status;
+                run.updated_at = Utc::now();
+            }
+        }
+
         if patch.step_status.is_some() || patch.checkpoint.is_some() {
             let Some(step_id) = patch.step_id else {
                 return Err(PlanError::Validation(
@@ -253,29 +356,95 @@ impl PlanStore {
                 ));
             };
 
-            let step = plan
-                .steps
-                .iter_mut()
-                .find(|step| step.id == step_id)
-                .ok_or_else(|| PlanError::Validation(format!("unknown step '{step_id}'")))?;
+            let (updated_status, updated_checkpoint) = {
+                let step =
+                    plan.steps.iter_mut().find(|step| step.id == step_id).ok_or_else(|| {
+                        PlanError::Validation(format!("unknown step '{step_id}'"))
+                    })?;
 
-            if let Some(step_status) = patch.step_status {
-                step.status = step_status;
-            }
-            if let Some(checkpoint) = patch.checkpoint {
-                if checkpoint.step_id != step.id {
-                    return Err(PlanError::Validation(format!(
-                        "checkpoint step_id '{}' does not match target step '{}'",
-                        checkpoint.step_id, step.id
-                    )));
+                if let Some(step_status) = patch.step_status {
+                    step.status = step_status;
                 }
-                step.checkpoint = Some(checkpoint);
+                if let Some(checkpoint) = patch.checkpoint {
+                    if checkpoint.step_id != step.id {
+                        return Err(PlanError::Validation(format!(
+                            "checkpoint step_id '{}' does not match target step '{}'",
+                            checkpoint.step_id, step.id
+                        )));
+                    }
+                    step.checkpoint = Some(checkpoint);
+                }
+
+                (step.status.clone(), step.checkpoint.clone())
+            };
+
+            if let Some(run_step) = plan.active_run_step_mut(&step_id) {
+                run_step.status = updated_status.clone();
+                match &updated_status {
+                    StepStatus::Running => {
+                        if run_step.started_at.is_none() {
+                            run_step.started_at = Some(Utc::now());
+                        }
+                    }
+                    StepStatus::Completed => {
+                        run_step.completed_at = Some(Utc::now());
+                        run_step.failure = None;
+                    }
+                    StepStatus::Failed(reason) => {
+                        run_step.failure = Some(PlanFailure {
+                            step_id: Some(step_id.clone()),
+                            reason: reason.clone(),
+                            recorded_at: Utc::now(),
+                        });
+                    }
+                    StepStatus::Pending | StepStatus::Skipped | StepStatus::RolledBack => {}
+                }
+                if let Some(checkpoint) = updated_checkpoint {
+                    run_step.checkpoint = Some(checkpoint);
+                }
             }
         }
+
+        if let Some(failure) = patch.failure {
+            if let Some(run) = plan.active_run_mut() {
+                run.failure = Some(failure);
+                run.updated_at = Utc::now();
+            }
+        }
+
+        plan.refresh_active_resume_point();
 
         plan.updated_at = Utc::now();
         self.save_plan(&plan)?;
         Ok(plan)
+    }
+
+    /// Start a new durable run or return the current active non-terminal run.
+    pub fn ensure_active_run(&self, plan_id: &str) -> Result<ExecutionPlan, PlanError> {
+        let mut plan = self.load_plan(plan_id)?;
+        plan.ensure_active_run();
+        plan.updated_at = Utc::now();
+        self.save_plan(&plan)?;
+        Ok(plan)
+    }
+
+    /// Return affected files whose content differs from the plan-created fingerprint.
+    pub fn stale_files_for_step(&self, step: &PlanStep) -> Vec<StalePlanFile> {
+        step.planned_file_hashes
+            .iter()
+            .filter_map(|planned| {
+                let current = fingerprint_file(&self.project_root, &planned.path);
+                (planned.hash != current.hash || planned.existed != current.existed).then_some(
+                    StalePlanFile {
+                        path: planned.path.clone(),
+                        planned_hash: planned.hash.clone(),
+                        current_hash: current.hash,
+                        planned_existed: planned.existed,
+                        current_existed: current.existed,
+                    },
+                )
+            })
+            .collect()
     }
 
     /// Absolute path for a persisted plan file.
@@ -286,6 +455,125 @@ impl PlanStore {
 
     fn plans_dir(&self) -> PathBuf {
         crate::config::project_state_dir(&self.project_root).join("plans")
+    }
+}
+
+impl ExecutionPlan {
+    /// Ensure this plan has an active durable run and return its ID.
+    pub fn ensure_active_run(&mut self) -> String {
+        if let Some(active_run_id) = &self.active_run_id {
+            if self.runs.iter().any(|run| {
+                run.id == *active_run_id
+                    && !matches!(
+                        run.status,
+                        PlanRunStatus::Completed
+                            | PlanRunStatus::Failed
+                            | PlanRunStatus::Cancelled
+                            | PlanRunStatus::RolledBack
+                    )
+            }) {
+                return active_run_id.clone();
+            }
+        }
+
+        let now = Utc::now();
+        let run_id = Ulid::new().to_string();
+        let run = PlanRun {
+            id: run_id.clone(),
+            status: PlanRunStatus::Approved,
+            steps: self
+                .steps
+                .iter()
+                .map(|step| PlanRunStep {
+                    step_id: step.id.clone(),
+                    status: step.status.clone(),
+                    checkpoint: step.checkpoint.clone(),
+                    started_at: None,
+                    completed_at: None,
+                    retry_count: 0,
+                    failure: None,
+                })
+                .collect(),
+            resume_point: None,
+            failure: None,
+            created_at: now,
+            updated_at: now,
+            started_at: None,
+            completed_at: None,
+        };
+
+        self.active_run_id = Some(run_id.clone());
+        self.runs.push(run);
+        self.refresh_active_resume_point();
+        run_id
+    }
+
+    fn active_run_mut(&mut self) -> Option<&mut PlanRun> {
+        let active_run_id = self.active_run_id.as_ref()?;
+        self.runs.iter_mut().find(|run| run.id == *active_run_id)
+    }
+
+    fn active_run_step_mut(&mut self, step_id: &str) -> Option<&mut PlanRunStep> {
+        self.active_run_mut()?.steps.iter_mut().find(|run_step| run_step.step_id == step_id)
+    }
+
+    fn refresh_active_resume_point(&mut self) {
+        let ready_step_ids = ready_step_ids(self);
+        let blocked_step_ids = blocked_step_ids(self);
+        if let Some(run) = self.active_run_mut() {
+            run.resume_point = Some(PlanResumePoint { ready_step_ids, blocked_step_ids });
+            if matches!(run.status, PlanRunStatus::Executing) && run.started_at.is_none() {
+                run.started_at = Some(Utc::now());
+            }
+            run.updated_at = Utc::now();
+        }
+    }
+}
+
+/// Return the pending step IDs whose dependencies are already complete.
+#[must_use]
+pub fn ready_step_ids(plan: &ExecutionPlan) -> Vec<StepId> {
+    plan.steps
+        .iter()
+        .filter(|step| matches!(step.status, StepStatus::Pending))
+        .filter(|step| dependencies_completed(plan, &step.id))
+        .map(|step| step.id.clone())
+        .collect()
+}
+
+fn blocked_step_ids(plan: &ExecutionPlan) -> Vec<StepId> {
+    plan.steps
+        .iter()
+        .filter(|step| matches!(step.status, StepStatus::Pending))
+        .filter(|step| !dependencies_completed(plan, &step.id))
+        .map(|step| step.id.clone())
+        .collect()
+}
+
+fn dependencies_completed(plan: &ExecutionPlan, step_id: &str) -> bool {
+    plan.dependencies.iter().filter(|dependency| dependency.dependent == step_id).all(
+        |dependency| {
+            plan.steps
+                .iter()
+                .find(|candidate| candidate.id == dependency.prerequisite)
+                .is_some_and(|candidate| matches!(candidate.status, StepStatus::Completed))
+        },
+    )
+}
+
+fn fingerprint_file(project_root: &std::path::Path, path: &std::path::Path) -> PlanFileHash {
+    let full_path = if path.is_absolute() { path.to_path_buf() } else { project_root.join(path) };
+
+    match std::fs::read(&full_path) {
+        Ok(content) => PlanFileHash {
+            path: path.to_path_buf(),
+            hash: Some(blake3::hash(&content).to_hex().to_string()),
+            existed: true,
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            PlanFileHash { path: path.to_path_buf(), hash: None, existed: false }
+        }
+        Err(_) => PlanFileHash { path: path.to_path_buf(), hash: None, existed: false },
     }
 }
 
@@ -415,9 +703,11 @@ fn plan_status_label(status: &PlanStatus) -> &'static str {
         PlanStatus::Draft => "draft",
         PlanStatus::Approved => "approved",
         PlanStatus::Executing => "executing",
+        PlanStatus::Paused => "paused",
         PlanStatus::Completed => "completed",
         PlanStatus::Failed => "failed",
         PlanStatus::Cancelled => "cancelled",
+        PlanStatus::RolledBack => "rolled_back",
     }
 }
 
@@ -501,6 +791,7 @@ mod tests {
     fn apply_patch_updates_step_status_and_plan_status() {
         let (_dir, store) = store();
         let plan = store.create_plan(sample_plan()).expect("create");
+        let plan = store.ensure_active_run(&plan.id).expect("run");
         let updated = store
             .apply_patch(
                 &plan.id,
@@ -509,12 +800,64 @@ mod tests {
                     step_id: Some("step-a".to_string()),
                     step_status: Some(StepStatus::Completed),
                     checkpoint: None,
+                    ..PlanPatch::default()
                 },
             )
             .expect("patch");
 
         assert_eq!(updated.status, PlanStatus::Executing);
         assert!(matches!(updated.steps[0].status, StepStatus::Completed));
+        let run = updated.runs.first().expect("run persisted");
+        assert!(matches!(run.steps[0].status, StepStatus::Completed));
+    }
+
+    #[test]
+    fn ensure_active_run_persists_resume_metadata() {
+        let (_dir, store) = store();
+        let plan = store.create_plan(sample_plan()).expect("create");
+        let with_run = store.ensure_active_run(&plan.id).expect("run");
+
+        assert!(with_run.active_run_id.is_some());
+        assert_eq!(with_run.runs.len(), 1);
+        let run = with_run.runs.first().expect("run");
+        assert_eq!(run.steps.len(), 2);
+        assert_eq!(
+            run.resume_point.as_ref().expect("resume point").ready_step_ids,
+            vec!["step-a".to_string()]
+        );
+        assert_eq!(
+            run.resume_point.as_ref().expect("resume point").blocked_step_ids,
+            vec!["step-b".to_string()]
+        );
+    }
+
+    #[test]
+    fn stale_files_for_step_detects_changed_planned_files() {
+        let (dir, store) = store();
+        std::fs::create_dir_all(dir.path().join("src/auth")).expect("mkdir");
+        std::fs::write(dir.path().join("src/auth/jwt.rs"), "old").expect("write old");
+
+        let plan = store
+            .create_plan(NewExecutionPlan {
+                steps: vec![NewPlanStep {
+                    id: Some("step-a".to_string()),
+                    title: "Edit JWT module".to_string(),
+                    description: "Change auth/jwt.rs".to_string(),
+                    affected_files: vec![PathBuf::from("src/auth/jwt.rs")],
+                    agent_type: "build".to_string(),
+                    estimated_tokens: None,
+                }],
+                dependencies: Vec::new(),
+                ..sample_plan()
+            })
+            .expect("create");
+
+        std::fs::write(dir.path().join("src/auth/jwt.rs"), "new").expect("write new");
+        let stale = store.stale_files_for_step(&plan.steps[0]);
+
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].path, PathBuf::from("src/auth/jwt.rs"));
+        assert_ne!(stale[0].planned_hash, stale[0].current_hash);
     }
 
     #[test]

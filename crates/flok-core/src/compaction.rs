@@ -266,7 +266,7 @@ impl CompactionStore {
     }
 
     fn compactions_dir(&self) -> PathBuf {
-        self.project_root.join(".flok").join("compactions")
+        crate::config::project_state_dir(&self.project_root).join("compactions")
     }
 
     fn project_memory_path(&self) -> PathBuf {

@@ -1,6 +1,6 @@
 //! Typed execution plans persisted in the workspace.
 //!
-//! Plans are stored as JSON under `.flok/plans/<plan_id>.json` so they can be
+//! Plans are stored under flok's generated per-project state directory so they can be
 //! reviewed, diffed, resumed, and executed later.
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -285,7 +285,7 @@ impl PlanStore {
     }
 
     fn plans_dir(&self) -> PathBuf {
-        self.project_root.join(".flok").join("plans")
+        crate::config::project_state_dir(&self.project_root).join("plans")
     }
 }
 

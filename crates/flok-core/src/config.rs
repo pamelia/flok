@@ -755,12 +755,54 @@ pub fn ensure_directories() -> anyhow::Result<()> {
             dirs.config_dir().join("flok"),
             dirs.data_dir().join("flok"),
             dirs.cache_dir().join("flok"),
+            flok_state_root(),
         ];
         for path in &paths {
             std::fs::create_dir_all(path)?;
         }
     }
     Ok(())
+}
+
+/// Root directory for generated flok runtime state.
+///
+/// This intentionally lives under `~/.flok` instead of the project tree so
+/// compactions, plans, memory, snapshots, and other agent artifacts do not
+/// pollute repositories.
+#[must_use]
+pub fn flok_state_root() -> PathBuf {
+    if cfg!(test) {
+        return std::env::temp_dir().join("flok-test-state");
+    }
+
+    if let Some(home) = directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()) {
+        return home.join(".flok");
+    }
+
+    std::env::temp_dir().join("flok")
+}
+
+/// Stable per-project directory for generated runtime state.
+#[must_use]
+pub fn project_state_dir(project_root: &Path) -> PathBuf {
+    let canonical =
+        std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+    let slug = canonical
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .map(sanitize_project_slug)
+        .filter(|slug| !slug.is_empty())
+        .unwrap_or_else(|| "project".to_string());
+    let hash = blake3::hash(canonical.to_string_lossy().as_bytes()).to_hex().to_string();
+    flok_state_root().join("projects").join(format!("{slug}-{}", &hash[..16]))
+}
+
+fn sanitize_project_slug(value: &str) -> String {
+    let slug: String = value
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') { ch } else { '-' })
+        .collect();
+    slug.trim_matches('-').to_string()
 }
 
 #[cfg(test)]
@@ -784,6 +826,14 @@ mod tests {
         assert_eq!(config.runtime_fallback, RuntimeFallbackConfig::default());
         assert_eq!(config.intelligent_routing, IntelligentRoutingConfig::default());
         assert_eq!(config.output_compression, OutputCompressionConfig::default());
+    }
+
+    #[test]
+    fn project_state_dir_is_outside_project_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = project_state_dir(dir.path());
+        assert!(!state_dir.starts_with(dir.path()));
+        assert!(state_dir.to_string_lossy().contains("projects"));
     }
 
     #[test]

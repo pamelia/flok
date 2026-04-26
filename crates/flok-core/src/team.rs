@@ -101,7 +101,7 @@ impl TeamStore {
     }
 
     fn teams_dir(&self) -> PathBuf {
-        self.project_root.join(".flok").join("teams")
+        crate::config::project_state_dir(&self.project_root).join("teams")
     }
 }
 
@@ -364,7 +364,7 @@ impl TeamRegistry {
         Self { teams: Arc::new(DashMap::new()), store: None }
     }
 
-    /// Create a registry backed by `.flok/teams` under the project root.
+    /// Create a registry backed by flok's generated per-project state directory.
     pub fn new_with_project_root(project_root: PathBuf) -> anyhow::Result<Self> {
         let store = Arc::new(TeamStore::new(project_root));
         let registry = Self { teams: Arc::new(DashMap::new()), store: Some(Arc::clone(&store)) };
@@ -583,7 +583,9 @@ mod tests {
         let registry = TeamRegistry::new_with_project_root(temp.path().to_path_buf()).unwrap();
         let team = registry.create_team("ephemeral").unwrap();
         let team_id = team.id.clone();
-        let team_path = temp.path().join(".flok").join("teams").join(format!("{team_id}.json"));
+        let team_path = crate::config::project_state_dir(temp.path())
+            .join("teams")
+            .join(format!("{team_id}.json"));
 
         assert!(team_path.exists());
         assert!(registry.delete(&team_id).unwrap());

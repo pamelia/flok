@@ -18,8 +18,8 @@ use ulid::Ulid;
 use crate::bus::BusEvent;
 use crate::compaction::CompactionStore;
 use crate::plan::{
-    summarize_plan, Checkpoint, CheckpointData, ExecutionPlan, PlanPatch, PlanStatus, PlanStore,
-    StepStatus,
+    ready_step_ids, summarize_plan, Checkpoint, CheckpointData, ExecutionPlan, PlanFailure,
+    PlanPatch, PlanRunStatus, PlanStatus, PlanStore, StepStatus,
 };
 use crate::provider::{
     CompletionRequest, Message, MessageContent, ModelRegistry, StepMetadata, StreamEvent,
@@ -648,21 +648,63 @@ impl SessionEngine {
         }
         let (prepared_plan, resumed_steps) = prepare_plan_for_execution(&store, &plan)?;
         plan = prepared_plan;
+        plan = store.ensure_active_run(&plan.id)?;
 
-        plan.status = PlanStatus::Executing;
-        plan.updated_at = Utc::now();
-        store.save_plan(&plan)?;
+        plan = store.apply_patch(
+            &plan.id,
+            PlanPatch {
+                plan_status: Some(PlanStatus::Executing),
+                run_status: Some(PlanRunStatus::Executing),
+                ..PlanPatch::default()
+            },
+        )?;
 
         loop {
             if self.cancel_token.is_cancelled() {
-                plan.status = PlanStatus::Cancelled;
-                plan.updated_at = Utc::now();
-                store.save_plan(&plan)?;
+                store.apply_patch(
+                    &plan.id,
+                    PlanPatch {
+                        plan_status: Some(PlanStatus::Cancelled),
+                        run_status: Some(PlanRunStatus::Cancelled),
+                        failure: Some(PlanFailure {
+                            step_id: None,
+                            reason: "plan execution cancelled before next step".to_string(),
+                            recorded_at: Utc::now(),
+                        }),
+                        ..PlanPatch::default()
+                    },
+                )?;
                 anyhow::bail!("plan execution cancelled");
             }
 
             if let Some(step_index) = next_ready_step_index(&plan) {
                 let step_id = plan.steps[step_index].id.clone();
+                let stale_files = store.stale_files_for_step(&plan.steps[step_index]);
+                if !stale_files.is_empty() {
+                    let stale_paths = stale_files
+                        .iter()
+                        .map(|file| file.path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    store.apply_patch(
+                        &plan.id,
+                        PlanPatch {
+                            plan_status: Some(PlanStatus::Paused),
+                            run_status: Some(PlanRunStatus::Paused),
+                            failure: Some(PlanFailure {
+                                step_id: Some(step_id.clone()),
+                                reason: format!("stale planned files detected: {stale_paths}"),
+                                recorded_at: Utc::now(),
+                            }),
+                            ..PlanPatch::default()
+                        },
+                    )?;
+                    anyhow::bail!(
+                        "plan '{}' is stale before step '{}'; affected files changed since the plan was created: {stale_paths}",
+                        plan.id,
+                        plan.steps[step_index].title
+                    );
+                }
                 let checkpoint = match self.state.snapshot.track().await {
                     Ok(Some(hash)) => Some(Checkpoint {
                         step_id: step_id.clone(),
@@ -680,9 +722,11 @@ impl SessionEngine {
                     &plan.id,
                     PlanPatch {
                         plan_status: Some(PlanStatus::Executing),
+                        run_status: Some(PlanRunStatus::Executing),
                         step_id: Some(step_id.clone()),
                         step_status: Some(StepStatus::Running),
                         checkpoint,
+                        ..PlanPatch::default()
                     },
                 )?;
 
@@ -740,9 +784,14 @@ impl SessionEngine {
             }
 
             if plan.steps.iter().all(|step| matches!(step.status, StepStatus::Completed)) {
-                plan.status = PlanStatus::Completed;
-                plan.updated_at = Utc::now();
-                store.save_plan(&plan)?;
+                plan = store.apply_patch(
+                    &plan.id,
+                    PlanPatch {
+                        plan_status: Some(PlanStatus::Completed),
+                        run_status: Some(PlanRunStatus::Completed),
+                        ..PlanPatch::default()
+                    },
+                )?;
                 let summary = if resumed_steps > 0 {
                     "Plan resumed and executed successfully."
                 } else {
@@ -2348,9 +2397,11 @@ fn plan_status_label(status: &PlanStatus) -> &'static str {
         PlanStatus::Draft => "draft",
         PlanStatus::Approved => "approved",
         PlanStatus::Executing => "executing",
+        PlanStatus::Paused => "paused",
         PlanStatus::Completed => "completed",
         PlanStatus::Failed => "failed",
         PlanStatus::Cancelled => "cancelled",
+        PlanStatus::RolledBack => "rolled_back",
     }
 }
 
@@ -2367,23 +2418,11 @@ fn format_plan_details(plan: &ExecutionPlan, store: &PlanStore) -> String {
 }
 
 fn next_ready_step_index(plan: &ExecutionPlan) -> Option<usize> {
-    plan.steps.iter().enumerate().find_map(|(index, step)| {
-        if !matches!(step.status, StepStatus::Pending) {
-            return None;
-        }
-
-        let ready =
-            plan.dependencies.iter().filter(|dependency| dependency.dependent == step.id).all(
-                |dependency| {
-                    plan.steps
-                        .iter()
-                        .find(|candidate| candidate.id == dependency.prerequisite)
-                        .is_some_and(|candidate| matches!(candidate.status, StepStatus::Completed))
-                },
-            );
-
-        ready.then_some(index)
-    })
+    let ready = ready_step_ids(plan);
+    plan.steps
+        .iter()
+        .enumerate()
+        .find_map(|(index, step)| ready.contains(&step.id).then_some(index))
 }
 
 fn build_plan_step_prompt(plan: &ExecutionPlan, step: &crate::plan::PlanStep) -> String {
@@ -2495,8 +2534,14 @@ fn mark_failed_plan(
         &current.id,
         PlanPatch {
             plan_status: Some(PlanStatus::Failed),
+            run_status: Some(PlanRunStatus::Failed),
             step_id: Some(failed_step_id.to_string()),
             step_status: Some(StepStatus::Failed(failure_reason)),
+            failure: Some(PlanFailure {
+                step_id: Some(failed_step_id.to_string()),
+                reason: error.to_string(),
+                recorded_at: Utc::now(),
+            }),
             ..PlanPatch::default()
         },
     )?;
@@ -2525,8 +2570,14 @@ fn mark_cancelled_plan(
         &current.id,
         PlanPatch {
             plan_status: Some(PlanStatus::Cancelled),
+            run_status: Some(PlanRunStatus::Cancelled),
             step_id: Some(cancelled_step_id.to_string()),
             step_status: Some(StepStatus::Failed(format!("step cancelled; {rollback_detail}"))),
+            failure: Some(PlanFailure {
+                step_id: Some(cancelled_step_id.to_string()),
+                reason: format!("step cancelled; {rollback_detail}"),
+                recorded_at: Utc::now(),
+            }),
             ..PlanPatch::default()
         },
     )

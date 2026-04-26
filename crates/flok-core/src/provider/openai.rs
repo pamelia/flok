@@ -220,7 +220,12 @@ impl OpenAiProvider {
             && request.reasoning_effort.is_some()
             && matches!(
                 ModelRegistry::model_name(&request.model),
-                "gpt-5.4" | "gpt-5.4-mini" | "gpt-5.4-nano"
+                "gpt-5.5"
+                    | "gpt-5.5-mini"
+                    | "gpt-5.5-nano"
+                    | "gpt-5.4"
+                    | "gpt-5.4-mini"
+                    | "gpt-5.4-nano"
             )
     }
 }
@@ -621,6 +626,31 @@ mod tests {
     }
 
     #[test]
+    fn build_request_body_omits_reasoning_effort_for_gpt_5_5_tools() {
+        let request = CompletionRequest {
+            model: "openai/gpt-5.5".into(),
+            reasoning_effort: Some(super::super::types::ReasoningEffort::High),
+            system: "You are a helper.".into(),
+            messages: vec![super::super::types::Message {
+                role: "user".into(),
+                content: vec![MessageContent::Text { text: "hello".into() }],
+            }],
+            tools: vec![super::super::types::ToolDefinition {
+                name: "read".into(),
+                description: "Read a file.".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }],
+            max_tokens: 4096,
+        };
+
+        let body = OpenAiProvider::build_request_body(&request);
+        assert_eq!(body.reasoning_effort, None);
+
+        let json = serde_json::to_string(&body).unwrap();
+        assert!(!json.contains("reasoning_effort"));
+    }
+
+    #[test]
     fn build_request_body_keeps_reasoning_effort_without_tools() {
         let request = CompletionRequest {
             model: "openai/gpt-5.4".into(),
@@ -636,5 +666,26 @@ mod tests {
 
         let body = OpenAiProvider::build_request_body(&request);
         assert_eq!(body.reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn build_request_body_does_not_send_service_tier_override() {
+        let request = CompletionRequest {
+            model: "openai/gpt-5.5".into(),
+            reasoning_effort: None,
+            system: "You are a helper.".into(),
+            messages: vec![super::super::types::Message {
+                role: "user".into(),
+                content: vec![MessageContent::Text { text: "hello".into() }],
+            }],
+            tools: vec![],
+            max_tokens: 4096,
+        };
+
+        let body = OpenAiProvider::build_request_body(&request);
+        let json = serde_json::to_string(&body).unwrap();
+        assert!(!json.contains("service_tier"));
+        assert!(!json.contains("\"fast\""));
+        assert!(!json.contains("\"priority\""));
     }
 }

@@ -522,9 +522,10 @@ fn display_model(model_id: &str) -> String {
         "anthropic/claude-opus-4-6" => "opus".to_string(),
         "anthropic/claude-sonnet-4-6" => "sonnet".to_string(),
         "anthropic/claude-haiku-4-5-20251001" => "haiku".to_string(),
+        "openai/gpt-5.5" => "gpt-5.5".to_string(),
+        "openai/gpt-5.5-mini" | "openai/gpt-5.4-mini" => "mini".to_string(),
+        "openai/gpt-5.5-nano" | "openai/gpt-5.4-nano" => "nano".to_string(),
         "openai/gpt-5.4" => "gpt-5.4".to_string(),
-        "openai/gpt-5.4-mini" => "mini".to_string(),
-        "openai/gpt-5.4-nano" => "nano".to_string(),
         "minimax/MiniMax-M2.7" => "minimax".to_string(),
         _ => ModelRegistry::model_name(model_id).to_string(),
     }

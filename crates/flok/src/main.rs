@@ -166,7 +166,7 @@ async fn run(args: cli::Args) -> Result<()> {
     let bus = Bus::new(512);
 
     // Create team registry for multi-agent coordination
-    let team_registry = TeamRegistry::new();
+    let team_registry = TeamRegistry::new_with_project_root(project_root.clone())?;
     tools.register(Arc::new(TeamCreateTool::new(team_registry.clone(), bus.clone())));
     tools.register(Arc::new(TeamDeleteTool::new(team_registry.clone())));
     tools.register(Arc::new(TeamTaskTool::new(team_registry.clone())));
@@ -896,7 +896,7 @@ fn run_models() -> Result<()> {
         }
         println!("\n{} models available", models.len());
         println!(
-            "\nShorthands: sonnet, opus, haiku, gpt-5.4, chatgpt-5.4, mini, nano, gpt-4.1, flash, pro, minimax"
+            "\nShorthands: sonnet, opus, haiku, gpt-5.5, chatgpt-5.5, mini, nano, gpt-5.4, gpt-4.1, flash, pro, minimax"
         );
     }
     Ok(())
@@ -922,7 +922,7 @@ struct ProviderMeta {
 
 const AUTH_PROVIDERS: &[ProviderMeta] = &[
     ProviderMeta { name: "anthropic", display_name: "Anthropic (Claude)" },
-    ProviderMeta { name: "openai", display_name: "OpenAI (GPT-5.4)" },
+    ProviderMeta { name: "openai", display_name: "OpenAI (GPT-5.5)" },
     ProviderMeta { name: "minimax", display_name: "MiniMax (M2.7)" },
 ];
 

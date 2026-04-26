@@ -428,7 +428,7 @@ impl TaskTool {
         if let Some(ref tid) = team_id {
             if let Some((_, mut team_arc)) = self.team_registry.teams_mut().remove(tid) {
                 if let Some(team_mut) = Arc::get_mut(&mut team_arc) {
-                    team_mut.add_member(&agent_name).await;
+                    team_mut.add_member(&agent_name).await?;
                 }
                 self.team_registry.reinsert(tid.clone(), team_arc);
             }
@@ -1125,7 +1125,7 @@ mod tests {
             target.fallback_chain,
             Some(vec![
                 ("openai".to_string(), "openai/gpt-5.4".to_string()),
-                ("openai".to_string(), "openai/gpt-5.4-nano".to_string()),
+                ("openai".to_string(), "openai/gpt-5.5-nano".to_string()),
             ]),
         );
     }

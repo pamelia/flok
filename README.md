@@ -250,6 +250,7 @@ See [docs/mcp.md](./docs/mcp.md) for setup details and current limitations.
 | `/show-plan [id]` | Show an execution plan (latest if no ID) |
 | `/approve [id]` | Approve a saved execution plan |
 | `/execute-plan [id]` | Execute a saved execution plan |
+| `/rollback-plan [id] [step_id]` | Restore a plan step checkpoint and reset dependent steps |
 | `/plan` | Switch to plan mode (read-only) |
 | `/build` | Switch to build mode |
 | `/sidebar` | Toggle sidebar |
@@ -336,6 +337,35 @@ Flok provides 26 built-in tools (plus 4 conditional LSP tools):
 | `bash` | Execute shell commands; 120s timeout; strips dangerous env vars (`LD_PRELOAD`, `DYLD_INSERT_LIBRARIES`, `NODE_OPTIONS`, etc.) |
 
 In **plan mode**, only Safe tools are available. Switch to **build mode** (`Tab` or `/build`) to enable Write and Dangerous tools.
+
+## Execution Plans And Verification
+
+Flok can persist structured execution plans under its generated project state directory. A plan contains named steps, dependencies, affected files, agent type, checkpoint data, durable run state, and verification history. Use plan mode for read-only analysis, then switch to build mode and execute the approved plan.
+
+Typical flow:
+
+```text
+/plan                  # switch to read-only planning
+ask flok to create a plan
+/show-plan             # inspect latest saved plan
+/approve               # approve latest plan
+/build                 # enable write-capable tools
+/execute-plan          # run approved steps
+```
+
+During execution, flok creates a checkpoint before each step. After the model finishes a step, flok runs the repo-appropriate verification command before marking that step complete. Verification records are persisted on the plan run step with the command, affected scope, outcome, duration, failure kind/impact, and summary. `/show-plan` displays the latest verification status for run steps.
+
+If verification passes, the step can complete. If verification fails, the step and plan are marked failed and flok attempts to restore the step checkpoint. If no verification command can be detected for the step scope, flok records an explicit skipped-verification record instead of silently treating the step as verified.
+
+Rollback is explicit:
+
+```text
+/rollback-plan                 # roll back to the latest checkpoint in the latest plan
+/rollback-plan <plan_id>        # roll back to the latest checkpoint in a specific plan
+/rollback-plan <plan_id> <step_id>
+```
+
+Rollback restores the selected checkpoint, marks the plan/run as rolled back, marks the target step as rolled back, and resets dependent steps to pending so `/execute-plan` can resume safely.
 
 ## Sub-Agents
 

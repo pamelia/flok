@@ -638,6 +638,13 @@ impl App {
                             let plan_id = (!rest.is_empty()).then_some(rest);
                             let _ = self.channels.cmd_tx.send(UiCommand::ExecutePlan(plan_id));
                         }
+                        "rollback-plan" => {
+                            let (plan_id, step_id) = parse_plan_step_args(&rest);
+                            let _ = self
+                                .channels
+                                .cmd_tx
+                                .send(UiCommand::RollbackPlan { plan_id, step_id });
+                        }
                         "plan" => {
                             self.channels.plan_mode.set(true);
                             self.footer.plan_mode = true;
@@ -669,7 +676,7 @@ impl App {
                         },
                         "help" => {
                             self.history.push(HistoryItem::system_info(
-                                "Slash: /new /clear /undo /redo /tree /branch /label /plans /show-plan /approve /execute-plan /plan /build /sidebar /sessions /mcp /help /quit",
+                                "Slash: /new /clear /undo /redo /tree /branch /label /plans /show-plan /approve /execute-plan /rollback-plan /plan /build /sidebar /sessions /mcp /help /quit",
                             ));
                             self.chat_view.on_new_content();
                             self.maintain_chat_drag_lock();
@@ -1364,6 +1371,13 @@ enum McpSlashCommand {
     Add(McpAddCommand),
 }
 
+fn parse_plan_step_args(rest: &str) -> (Option<String>, Option<String>) {
+    let mut args = rest.split_whitespace();
+    let plan_id = args.next().map(str::to_string);
+    let step_id = args.next().map(str::to_string);
+    (plan_id, step_id)
+}
+
 fn parse_mcp_command(rest: &str) -> Result<McpSlashCommand, String> {
     let mut parts = rest.split_whitespace();
     match parts.next() {
@@ -1619,6 +1633,24 @@ mod tests {
 
         let command = cmd_rx.try_recv().expect("execute plan command should be queued");
         assert!(matches!(command, UiCommand::ExecutePlan(Some(plan_id)) if plan_id == "plan-123"));
+    }
+
+    #[tokio::test]
+    async fn submit_rollback_plan_with_step_sends_rollback_command() {
+        let (channels, mut cmd_rx) = make_channels();
+        let (tx, rx) = mpsc::unbounded_channel::<AppEvent>();
+        let mut app = App::new(channels, tx, rx);
+
+        app.handle_event(AppEvent::Submit("/rollback-plan plan-123 step-2".to_string()));
+
+        let command = cmd_rx.try_recv().expect("rollback plan command should be queued");
+        assert!(matches!(
+            command,
+            UiCommand::RollbackPlan {
+                plan_id: Some(plan_id),
+                step_id: Some(step_id)
+            } if plan_id == "plan-123" && step_id == "step-2"
+        ));
     }
 
     #[tokio::test]

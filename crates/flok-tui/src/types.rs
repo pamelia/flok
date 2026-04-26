@@ -28,6 +28,8 @@ pub enum UiCommand {
     ApprovePlan(Option<String>),
     /// Execute a saved execution plan. `None` means "latest".
     ExecutePlan(Option<String>),
+    /// Roll back a saved execution plan to a step checkpoint.
+    RollbackPlan { plan_id: Option<String>, step_id: Option<String> },
     /// User wants to list sessions.
     ListSessions,
     /// List configured MCP servers from user config.

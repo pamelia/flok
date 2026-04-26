@@ -541,6 +541,18 @@ async fn run_interactive(
                         }
                     }
                 }
+                flok_tui::UiCommand::RollbackPlan { plan_id, step_id } => {
+                    match engine.rollback_plan(plan_id.as_deref(), step_id.as_deref()).await {
+                        Ok(text) => {
+                            let _ = ui_tx.send(flok_tui::UiEvent::Error(text));
+                        }
+                        Err(e) => {
+                            let _ = ui_tx.send(flok_tui::UiEvent::Error(format!(
+                                "Plan rollback failed: {e}"
+                            )));
+                        }
+                    }
+                }
                 flok_tui::UiCommand::ListSessions => {
                     // Query sessions from the DB and send as a system message
                     match engine.list_sessions_text() {

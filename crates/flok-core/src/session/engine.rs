@@ -591,7 +591,10 @@ impl SessionEngine {
                 plan.id,
             );
         }
-        let _ = write!(text, "\nUse /show-plan [ID], /approve [ID], or /execute-plan [ID].");
+        let _ = write!(
+            text,
+            "\nUse /show-plan [ID], /approve [ID], /execute-plan [ID], or /rollback-plan [ID] [STEP]."
+        );
         Ok(text)
     }
 
@@ -811,6 +814,30 @@ impl SessionEngine {
                 plan.id
             );
         }
+    }
+
+    /// Roll back a plan to the checkpoint before a selected step.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the plan or step cannot be resolved, no checkpoint exists,
+    /// or snapshot restoration fails.
+    pub async fn rollback_plan(
+        &self,
+        plan_id: Option<&str>,
+        step_id: Option<&str>,
+    ) -> anyhow::Result<String> {
+        let store = self.plan_store();
+        let plan = self.resolve_plan(plan_id)?;
+        let step = resolve_rollback_step(&plan, step_id)?;
+        let detail = rollback_plan_step(&self.state.snapshot, &step).await?;
+        let updated = mark_rolled_back_plan(&store, &plan, &step.id, &detail)?;
+
+        Ok(format!(
+            "Plan rolled back to step '{}'. {detail}\n\n{}",
+            step.title,
+            format_plan_details(&updated, &store)
+        ))
     }
 
     /// Create a branch from the current session at the given message ID.
@@ -2474,8 +2501,14 @@ fn prepare_plan_for_execution(
     let mut resumed_steps = 0usize;
     let mut changed = false;
 
-    if matches!(updated.status, PlanStatus::Failed | PlanStatus::Cancelled | PlanStatus::Executing)
-    {
+    if matches!(
+        updated.status,
+        PlanStatus::Failed
+            | PlanStatus::Cancelled
+            | PlanStatus::Executing
+            | PlanStatus::Paused
+            | PlanStatus::RolledBack
+    ) {
         updated.status = PlanStatus::Approved;
         changed = true;
     }
@@ -2501,6 +2534,28 @@ fn prepare_plan_for_execution(
     }
 
     Ok((updated, resumed_steps))
+}
+
+fn resolve_rollback_step(
+    plan: &ExecutionPlan,
+    step_id: Option<&str>,
+) -> anyhow::Result<crate::plan::PlanStep> {
+    let step = match step_id {
+        Some("full") => plan.steps.iter().find(|step| step.checkpoint.is_some()),
+        Some(id) => plan.steps.iter().find(|step| step.id == id),
+        None => plan.steps.iter().rev().find(|step| step.checkpoint.is_some()),
+    }
+    .cloned()
+    .ok_or_else(|| match step_id {
+        Some("full") | None => anyhow::anyhow!("plan '{}' has no rollback checkpoints", plan.id),
+        Some(id) => anyhow::anyhow!("plan '{}' has no step '{id}'", plan.id),
+    })?;
+
+    if step.checkpoint.is_none() {
+        anyhow::bail!("step '{}' has no rollback checkpoint", step.id);
+    }
+
+    Ok(step)
 }
 
 async fn rollback_plan_step(
@@ -2581,6 +2636,42 @@ fn mark_cancelled_plan(
             ..PlanPatch::default()
         },
     )
+}
+
+fn mark_rolled_back_plan(
+    store: &PlanStore,
+    current: &ExecutionPlan,
+    rolled_back_step_id: &str,
+    rollback_detail: &str,
+) -> Result<ExecutionPlan, crate::plan::PlanError> {
+    let mut updated = store.apply_patch(
+        &current.id,
+        PlanPatch {
+            plan_status: Some(PlanStatus::RolledBack),
+            run_status: Some(PlanRunStatus::RolledBack),
+            step_id: Some(rolled_back_step_id.to_string()),
+            step_status: Some(StepStatus::RolledBack),
+            failure: Some(PlanFailure {
+                step_id: Some(rolled_back_step_id.to_string()),
+                reason: rollback_detail.to_string(),
+                recorded_at: Utc::now(),
+            }),
+            ..PlanPatch::default()
+        },
+    )?;
+
+    for step_id in blocked_dependents(&updated, rolled_back_step_id) {
+        updated = store.apply_patch(
+            &updated.id,
+            PlanPatch {
+                step_id: Some(step_id),
+                step_status: Some(StepStatus::Pending),
+                ..PlanPatch::default()
+            },
+        )?;
+    }
+
+    Ok(updated)
 }
 
 fn blocked_dependents(plan: &ExecutionPlan, failed_step_id: &str) -> HashSet<String> {
@@ -3179,7 +3270,10 @@ mod tests {
     use crate::bus::Bus;
     use crate::config::FlokConfig;
     use crate::lsp::LspManager;
-    use crate::plan::{Dependency, NewExecutionPlan, NewPlanStep, PlanStatus, StepStatus};
+    use crate::plan::{
+        Checkpoint, CheckpointData, Dependency, NewExecutionPlan, NewPlanStep, PlanStatus,
+        StepStatus,
+    };
     use crate::provider::mock::{MockProvider, MockToolCall, MockTurn};
     use crate::provider::ProviderRegistry;
     use crate::session::PlanMode;
@@ -3541,6 +3635,64 @@ edition = "2021"
         assert!(result.contains("Plan resumed and executed successfully."));
         assert!(matches!(loaded.status, PlanStatus::Completed));
         assert!(loaded.steps.iter().all(|step| matches!(step.status, StepStatus::Completed)));
+    }
+
+    #[tokio::test]
+    async fn rollback_plan_marks_target_and_dependents_resumable() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let provider = Arc::new(MockProvider::new());
+        let engine = test_engine_with_tools(&temp_dir, &provider, ToolRegistry::new());
+        let store = engine.plan_store();
+        let created = store
+            .create_plan(NewExecutionPlan {
+                session_id: engine.session_id().to_string(),
+                title: "Rollback plan".to_string(),
+                description: "Rollback a completed step".to_string(),
+                steps: vec![
+                    NewPlanStep {
+                        id: Some("step-1".to_string()),
+                        title: "Checkpointed".to_string(),
+                        description: "Has a checkpoint".to_string(),
+                        affected_files: Vec::new(),
+                        agent_type: "build".to_string(),
+                        estimated_tokens: None,
+                    },
+                    NewPlanStep {
+                        id: Some("step-2".to_string()),
+                        title: "Dependent".to_string(),
+                        description: "Depends on step 1".to_string(),
+                        affected_files: Vec::new(),
+                        agent_type: "build".to_string(),
+                        estimated_tokens: None,
+                    },
+                ],
+                dependencies: vec![Dependency {
+                    prerequisite: "step-1".to_string(),
+                    dependent: "step-2".to_string(),
+                }],
+            })
+            .expect("create plan");
+
+        let checkpoint = Checkpoint {
+            step_id: "step-1".to_string(),
+            snapshot: CheckpointData::WorkspaceSnapshot { hash: "test-hash".to_string() },
+            created_at: Utc::now(),
+        };
+        let mut completed = store.ensure_active_run(&created.id).expect("active run");
+        completed.status = PlanStatus::Completed;
+        completed.steps[0].status = StepStatus::Completed;
+        completed.steps[0].checkpoint = Some(checkpoint);
+        completed.steps[1].status = StepStatus::Completed;
+        store.save_plan(&completed).expect("save completed plan");
+
+        let text =
+            engine.rollback_plan(Some(&created.id), Some("step-1")).await.expect("rollback plan");
+        let loaded = store.load_plan(&created.id).expect("reload");
+
+        assert!(text.contains("Plan rolled back to step 'Checkpointed'."));
+        assert!(matches!(loaded.status, PlanStatus::RolledBack));
+        assert!(matches!(loaded.steps[0].status, StepStatus::RolledBack));
+        assert!(matches!(loaded.steps[1].status, StepStatus::Pending));
     }
 
     #[tokio::test]

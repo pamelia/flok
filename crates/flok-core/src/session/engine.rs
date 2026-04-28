@@ -1315,6 +1315,7 @@ impl SessionEngine {
             let mut messages = self.assemble_messages_with_query(Some(user_text))?;
             let config_snapshot = self.state.config.snapshot();
             let max_repeated_tool_calls = call_history.values().copied().max().unwrap_or(0);
+            let session_cost_microusd = self.state.cost_tracker.estimated_cost_microusd();
             let routing = route_model(
                 &self.model_id,
                 &messages,
@@ -1323,6 +1324,11 @@ impl SessionEngine {
                     verification_retries,
                     consecutive_tool_error_rounds,
                     max_repeated_tool_calls,
+                    spent_microusd: session_cost_microusd,
+                    max_session_microusd: config_snapshot
+                        .config
+                        .intelligent_routing
+                        .max_session_cost_microusd,
                 },
                 &self.state.provider_registry,
                 &config_snapshot.config.intelligent_routing,

@@ -102,6 +102,11 @@ impl CostTracker {
         self.estimated_cost_microusd.load(Ordering::Relaxed) as f64 / 1_000_000.0
     }
 
+    /// Calculate the estimated cost in micro-USD.
+    pub fn estimated_cost_microusd(&self) -> u64 {
+        self.estimated_cost_microusd.load(Ordering::Relaxed)
+    }
+
     /// Format cost as a human-readable string.
     pub fn format_cost(&self) -> String {
         let cost = self.estimated_cost_usd();

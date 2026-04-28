@@ -300,11 +300,16 @@ pub struct IntelligentRoutingConfig {
     pub enabled: bool,
     /// Minimum complexity score required before upgrading the request model.
     pub complexity_threshold: u32,
+    /// Optional hard session spend budget in micro-USD.
+    ///
+    /// When the current session cost is at or above this value, routing prefers
+    /// the cheapest eligible configured model for subsequent requests.
+    pub max_session_cost_microusd: Option<u64>,
 }
 
 impl Default for IntelligentRoutingConfig {
     fn default() -> Self {
-        Self { enabled: true, complexity_threshold: 4 }
+        Self { enabled: true, complexity_threshold: 4, max_session_cost_microusd: None }
     }
 }
 
@@ -1483,11 +1488,13 @@ mod tests {
             [intelligent_routing]
             enabled = false
             complexity_threshold = 6
+            max_session_cost_microusd = 123_456
         ";
 
         let config: FlokConfig = toml::from_str(toml_str).unwrap();
         assert!(!config.intelligent_routing.enabled);
         assert_eq!(config.intelligent_routing.complexity_threshold, 6);
+        assert_eq!(config.intelligent_routing.max_session_cost_microusd, Some(123_456));
     }
 
     #[test]

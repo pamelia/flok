@@ -11,10 +11,11 @@ use std::sync::Arc;
 
 use crate::agent;
 use crate::bus::BusEvent;
-use crate::config::{AgentConfig, WorktreeConfig};
+use crate::config::{AgentConfig, IntelligentRoutingConfig, WorktreeConfig};
 use crate::provider::{
     CompletionRequest, Message, MessageContent, ModelRegistry, ProviderRegistry, ReasoningEffort,
 };
+use crate::routing::{route_model, RoutingContext};
 use crate::team::{TeamMessage, TeamRegistry};
 use crate::worktree::WorktreeManager;
 
@@ -304,6 +305,7 @@ struct SubagentTarget {
     provider_name: String,
     model_id: String,
     reasoning_effort: Option<ReasoningEffort>,
+    routing_config: Option<IntelligentRoutingConfig>,
     fallback_chain: Option<Vec<(String, String)>>,
 }
 
@@ -314,13 +316,14 @@ impl TaskTool {
         requested_model: Option<&str>,
         requested_reasoning_effort: Option<ReasoningEffort>,
     ) -> anyhow::Result<SubagentTarget> {
-        let agent_model = self.agent_config(agent_type).and_then(|config| config.model.as_deref());
+        let agent_config = self.agent_config(agent_type);
+        let agent_model = agent_config.and_then(|config| config.model.as_deref());
         let model_id = requested_model
             .map(ModelRegistry::resolve)
             .or_else(|| agent_model.map(ModelRegistry::resolve))
             .unwrap_or_else(|| self.default_model_id.clone());
         let reasoning_effort = requested_reasoning_effort
-            .or_else(|| self.agent_config(agent_type).and_then(|config| config.reasoning_effort))
+            .or_else(|| agent_config.and_then(|config| config.reasoning_effort))
             .or(self.default_reasoning_effort);
         let provider_name = if requested_model.is_some() || agent_model.is_some() {
             ModelRegistry::provider_name(&model_id).to_string()
@@ -338,8 +341,19 @@ impl TaskTool {
                 .map(|config| self.resolve_fallback_chain(&config.fallback_models))
                 .transpose()?
         };
+        let routing_config = if requested_model.is_some() {
+            None
+        } else {
+            agent_config.and_then(|config| config.intelligent_routing.clone())
+        };
 
-        Ok(SubagentTarget { provider_name, model_id, reasoning_effort, fallback_chain })
+        Ok(SubagentTarget {
+            provider_name,
+            model_id,
+            reasoning_effort,
+            routing_config,
+            fallback_chain,
+        })
     }
 
     fn agent_config(&self, agent_type: &str) -> Option<&AgentConfig> {
@@ -587,9 +601,19 @@ impl TaskTool {
 
         for step in 0..MAX_SUBAGENT_STEPS {
             tracing::debug!(step, description, "sub-agent step");
+            let active_model_id = route_subagent_model(
+                &target.model_id,
+                &messages,
+                step,
+                &self.provider_registry,
+                target.routing_config.as_ref(),
+                &self.bus,
+                &sub_ctx.session_id,
+            );
+            let active_provider = ModelRegistry::provider_name(&active_model_id).to_string();
 
             let request = CompletionRequest {
-                model: target.model_id.clone(),
+                model: active_model_id,
                 reasoning_effort: target.reasoning_effort,
                 system: system.clone(),
                 messages: messages.clone(),
@@ -600,7 +624,7 @@ impl TaskTool {
             // Use fallback-aware concurrency-limited streaming.
             let (text, tool_calls) = stream_with_retry(
                 &self.provider_registry,
-                &target.provider_name,
+                &active_provider,
                 request,
                 target.fallback_chain.as_deref(),
                 &self.bus,
@@ -715,6 +739,38 @@ async fn stream_with_retry(
     ))
 }
 
+fn route_subagent_model(
+    session_model: &str,
+    messages: &[Message],
+    step: usize,
+    provider_registry: &ProviderRegistry,
+    routing_config: Option<&IntelligentRoutingConfig>,
+    bus: &crate::bus::Bus,
+    session_id: &str,
+) -> String {
+    let Some(config) = routing_config else {
+        return session_model.to_string();
+    };
+
+    let routing = route_model(
+        session_model,
+        messages,
+        RoutingContext { round: step + 1, ..RoutingContext::default() },
+        provider_registry,
+        config,
+    );
+    if routing.model_id != session_model {
+        let reason = routing.reason.unwrap_or_else(|| "sub-agent routing policy".to_string());
+        bus.send(BusEvent::ModelRouted {
+            session_id: session_id.to_string(),
+            from_model: session_model.to_string(),
+            to_model: routing.model_id.clone(),
+            reason,
+        });
+    }
+    routing.model_id
+}
+
 /// Standalone sub-agent runner for background tasks (no `&self` needed).
 #[allow(clippy::too_many_arguments)]
 async fn run_subagent_standalone(
@@ -747,9 +803,19 @@ async fn run_subagent_standalone(
 
     for step in 0..MAX_SUBAGENT_STEPS {
         tracing::debug!(step, description, "background sub-agent step");
+        let active_model_id = route_subagent_model(
+            &target.model_id,
+            &messages,
+            step,
+            &provider_registry,
+            target.routing_config.as_ref(),
+            &bus,
+            &sub_ctx.session_id,
+        );
+        let active_provider = ModelRegistry::provider_name(&active_model_id).to_string();
 
         let request = CompletionRequest {
-            model: target.model_id.clone(),
+            model: active_model_id,
             reasoning_effort: target.reasoning_effort,
             system: system.to_string(),
             messages: messages.clone(),
@@ -760,7 +826,7 @@ async fn run_subagent_standalone(
         // Use retry + concurrency-limited streaming
         let (text, tool_calls) = stream_with_retry(
             &provider_registry,
-            &target.provider_name,
+            &active_provider,
             request,
             target.fallback_chain.as_deref(),
             &bus,
@@ -825,7 +891,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     use crate::bus::Bus;
-    use crate::config::{AgentConfig, WorktreeConfig};
+    use crate::config::{AgentConfig, IntelligentRoutingConfig, WorktreeConfig};
     use crate::provider::{Provider, StreamEvent};
     use crate::team::TeamRegistry;
 
@@ -940,6 +1006,7 @@ mod tests {
         assert_eq!(target.provider_name, "anthropic");
         assert_eq!(target.reasoning_effort, None);
         assert!(target.fallback_chain.is_none());
+        assert!(target.routing_config.is_none());
     }
 
     #[test]
@@ -965,6 +1032,39 @@ mod tests {
 
         assert_eq!(target.model_id, "anthropic/claude-haiku-4-5-20251001");
         assert_eq!(target.provider_name, "anthropic");
+    }
+
+    #[test]
+    fn routing_policy_uses_agent_config_when_no_task_param() {
+        let provider: Arc<dyn Provider> = Arc::new(RecordingProvider::new("anthropic", "ok"));
+        let mut registry = ProviderRegistry::new();
+        registry.insert("anthropic", provider, Some("anthropic/claude-sonnet-4-6".into()), 3);
+
+        let tool = test_task_tool_with_agents(
+            Arc::new(registry),
+            "anthropic",
+            "anthropic/claude-sonnet-4-6",
+            None,
+            [(
+                "general".to_string(),
+                AgentConfig {
+                    intelligent_routing: Some(IntelligentRoutingConfig {
+                        complexity_threshold: 1,
+                        ..IntelligentRoutingConfig::default()
+                    }),
+                    ..AgentConfig::default()
+                },
+            )]
+            .into_iter()
+            .collect(),
+        );
+
+        let target = tool.resolve_target("general", None, None).expect("target resolves");
+
+        assert_eq!(
+            target.routing_config.as_ref().map(|config| config.complexity_threshold),
+            Some(1),
+        );
     }
 
     #[test]

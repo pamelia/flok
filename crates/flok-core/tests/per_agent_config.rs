@@ -175,6 +175,58 @@ async fn agent_config_overrides_default_model() {
 }
 
 #[tokio::test]
+async fn agent_intelligent_routing_upgrades_subagent_model() {
+    let anthropic = Arc::new(RecordingProvider::new("anthropic", ProviderBehavior::Text("base")));
+    let openai = Arc::new(RecordingProvider::new("openai", ProviderBehavior::Text("routed")));
+    let anthropic_dyn: Arc<dyn Provider> = anthropic.clone();
+    let openai_dyn: Arc<dyn Provider> = openai.clone();
+    let mut registry = ProviderRegistry::new();
+    registry.insert(
+        "anthropic",
+        anthropic_dyn,
+        Some("anthropic/claude-haiku-4-5-20251001".into()),
+        3,
+    );
+    registry.insert("openai", openai_dyn, Some("openai/gpt-5.4".into()), 3);
+
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let project_root = std::fs::canonicalize(temp_dir.path()).expect("canonical project root");
+    let tool = make_task_tool(
+        Arc::new(registry),
+        "anthropic",
+        "anthropic/claude-haiku-4-5-20251001",
+        parse_agents_config(
+            r#"
+            [agents.general]
+            model = "haiku"
+
+            [agents.general.intelligent_routing]
+            enabled = true
+            complexity_threshold = 1
+            "#,
+        ),
+        project_root.clone(),
+    );
+
+    let output = tool
+        .execute(
+            serde_json::json!({
+                "description": "agent routing",
+                "prompt": "Review this architecture plan and migration spec.",
+                "subagent_type": "general"
+            }),
+            &test_context(project_root),
+        )
+        .await
+        .expect("task succeeds");
+
+    assert!(!output.is_error);
+    assert_eq!(output.content, "routed");
+    assert!(anthropic.seen_models().is_empty());
+    assert_eq!(openai.seen_models(), vec!["openai/gpt-5.4".to_string()]);
+}
+
+#[tokio::test]
 async fn agent_fallback_chain_replaces_provider_chain() {
     let anthropic = Arc::new(RecordingProvider::new("anthropic", ProviderBehavior::Status(529)));
     let openai = Arc::new(RecordingProvider::new("openai", ProviderBehavior::Text("openai ok")));

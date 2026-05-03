@@ -258,6 +258,8 @@ pub struct AgentConfig {
     pub model: Option<String>,
     /// Preferred reasoning effort for this built-in agent.
     pub reasoning_effort: Option<crate::provider::ReasoningEffort>,
+    /// Optional request-time routing policy for this built-in agent.
+    pub intelligent_routing: Option<IntelligentRoutingConfig>,
     /// Ordered fallback model IDs or aliases that replace the provider chain.
     pub fallback_models: Vec<String>,
     /// Extra text appended to the built-in system prompt.
@@ -1286,6 +1288,11 @@ mod tests {
             reasoning_effort = "low"
             fallback_models = ["minimax", "gpt-5.4-nano"]
             prompt_append = "Be concise."
+
+            [agents.explore.intelligent_routing]
+            enabled = true
+            complexity_threshold = 2
+            max_session_cost_microusd = 42_000
         "#;
 
         let config: FlokConfig = toml::from_str(toml_str).unwrap();
@@ -1295,6 +1302,17 @@ mod tests {
         assert_eq!(explore.reasoning_effort, Some(crate::provider::ReasoningEffort::Low));
         assert_eq!(explore.fallback_models, vec!["minimax", "gpt-5.4-nano"]);
         assert_eq!(explore.prompt_append.as_deref(), Some("Be concise."));
+        assert_eq!(
+            explore.intelligent_routing.as_ref().map(|routing| routing.complexity_threshold),
+            Some(2),
+        );
+        assert_eq!(
+            explore
+                .intelligent_routing
+                .as_ref()
+                .and_then(|routing| routing.max_session_cost_microusd),
+            Some(42_000),
+        );
     }
 
     #[test]
@@ -1317,11 +1335,13 @@ mod tests {
         );
         assert!(config.agents["explore"].fallback_models.is_empty());
         assert!(config.agents["explore"].prompt_append.is_none());
+        assert!(config.agents["explore"].intelligent_routing.is_none());
 
         assert!(config.agents["general"].model.is_none());
         assert!(config.agents["general"].reasoning_effort.is_none());
         assert!(config.agents["general"].fallback_models.is_empty());
         assert_eq!(config.agents["general"].prompt_append.as_deref(), Some("Keep output short."));
+        assert!(config.agents["general"].intelligent_routing.is_none());
     }
 
     #[test]

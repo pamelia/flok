@@ -120,13 +120,26 @@ pub fn route_model(
         return ModelRoutingDecision { model_id: session_model.to_string(), reason: None };
     }
 
+    let failure_escalation = routing_failure_escalation(context);
+    if failure_escalation.repeated_tool_failures {
+        if let Some(candidate) = strongest_candidate_above(&candidates, session_candidate) {
+            return ModelRoutingDecision {
+                model_id: candidate.model_id.clone(),
+                reason: Some(format!(
+                    "failure replay escalation after repeated tool failure rounds ({}); selected {:?} candidate with {} token context",
+                    context.consecutive_tool_error_rounds,
+                    candidate.tier,
+                    candidate.context_window
+                )),
+            };
+        }
+    }
+
     if analysis.score < policy.complexity_threshold {
         return ModelRoutingDecision { model_id: session_model.to_string(), reason: None };
     }
 
-    let Some(candidate) =
-        candidates.iter().max_by_key(|candidate| candidate_score(candidate, &analysis))
-    else {
+    let Some(candidate) = strongest_candidate(&candidates, &analysis) else {
         return ModelRoutingDecision { model_id: session_model.to_string(), reason: None };
     };
 
@@ -292,6 +305,14 @@ fn analyze_complexity(messages: &[Message], context: RoutingContext) -> Complexi
     analysis
 }
 
+fn routing_failure_escalation(context: RoutingContext) -> RoutingFailureEscalation {
+    RoutingFailureEscalation {
+        repeated_tool_failures: context.consecutive_tool_error_rounds >= 1,
+        verification_retry: context.verification_retries >= 1,
+        repeated_identical_tool_calls: context.max_repeated_tool_calls >= 2,
+    }
+}
+
 fn routing_candidates(
     session_model: &str,
     provider_registry: &ProviderRegistry,
@@ -307,6 +328,22 @@ fn routing_candidates(
         .into_iter()
         .filter_map(|model_id| routing_candidate(&registry, &model_id, analysis))
         .collect()
+}
+
+fn strongest_candidate<'a>(
+    candidates: &'a [RoutingCandidate],
+    analysis: &ComplexityAnalysis,
+) -> Option<&'a RoutingCandidate> {
+    candidates.iter().max_by_key(|candidate| candidate_score(candidate, analysis))
+}
+
+fn strongest_candidate_above<'a>(
+    candidates: &'a [RoutingCandidate],
+    current: &RoutingCandidate,
+) -> Option<&'a RoutingCandidate> {
+    candidates.iter().filter(|candidate| candidate.rank > current.rank).max_by_key(|candidate| {
+        (candidate.rank, candidate.context_window, candidate.max_output_tokens)
+    })
 }
 
 fn routing_candidate(
@@ -599,6 +636,29 @@ mod tests {
             .reason
             .as_deref()
             .is_some_and(|reason| reason.contains("repeated tool failure rounds")));
+    }
+
+    #[test]
+    fn route_model_replays_lower_tier_tool_failure_on_stronger_model() {
+        let registry = registry_with_defaults(&[("openai", "openai/gpt-5.4")]);
+
+        let decision = route_model(
+            "openai/gpt-5.4-mini",
+            &[text_message("fix the failed tool call")],
+            RoutingContext {
+                round: 2,
+                consecutive_tool_error_rounds: 1,
+                ..RoutingContext::default()
+            },
+            &registry,
+            &IntelligentRoutingConfig::default(),
+        );
+
+        assert_eq!(decision.model_id, "openai/gpt-5.4");
+        assert!(decision
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("failure replay escalation")));
     }
 
     #[test]

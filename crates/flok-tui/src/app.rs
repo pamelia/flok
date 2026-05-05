@@ -328,6 +328,9 @@ impl App {
                     self.finish_assistant(text, true);
                 }
                 crate::types::UiEvent::HistoryMessage { role, content } => {
+                    if role == "user" {
+                        self.bottom_pane.remember_input(content.clone());
+                    }
                     let item = match role.as_str() {
                         "user" => HistoryItem::user(content),
                         "assistant" => HistoryItem::assistant(content, true),
@@ -346,7 +349,9 @@ impl App {
                     self.dirty = true;
                 }
                 crate::types::UiEvent::Error(message) => {
+                    self.finish_active_as_error();
                     self.history.push(HistoryItem::system_error(message));
+                    self.stop_waiting();
                     self.chat_view.on_new_content();
                     self.maintain_chat_drag_lock();
                     self.dirty = true;
@@ -355,6 +360,12 @@ impl App {
                     self.history.clear();
                     self.active = None;
                     self.stop_waiting();
+                    self.bottom_pane.reset_input_history(
+                        messages
+                            .iter()
+                            .filter(|(role, _)| role == "user")
+                            .map(|(_, content)| content.clone()),
+                    );
                     for (role, content) in messages {
                         let item = match role.as_str() {
                             "user" => HistoryItem::user(content),
@@ -423,8 +434,9 @@ impl App {
                     self.sidebar.context_pct = pct;
                     self.dirty = true;
                 }
-                flok_core::bus::BusEvent::ToolCallStarted { tool_name, .. } => {
-                    self.dirty |= crate::stream::begin_tool_call(&mut self.active, tool_name);
+                flok_core::bus::BusEvent::ToolCallStarted { tool_name, invocation, .. } => {
+                    self.dirty |=
+                        crate::stream::begin_tool_call(&mut self.active, tool_name, &invocation);
                 }
                 flok_core::bus::BusEvent::ToolCallCompleted { is_error, .. } => {
                     let item =
@@ -853,6 +865,21 @@ impl App {
         self.dirty = true;
     }
 
+    fn finish_active_as_error(&mut self) {
+        let Some(active) = self.active.take() else {
+            return;
+        };
+
+        let item = match active.role {
+            Role::ToolCall => crate::stream::finalize_tool_call(Some(active), true, None),
+            Role::Assistant => {
+                crate::stream::finalize_assistant(Some(active), String::new(), false)
+            }
+            Role::User | Role::System => active.into_final(),
+        };
+        self.push_history_if_not_duplicate(item);
+    }
+
     fn push_history_if_not_duplicate(&mut self, item: HistoryItem) {
         let is_duplicate = match (&item, self.history.last()) {
             (
@@ -1221,6 +1248,11 @@ impl App {
         self.bottom_pane.handle_paste(text);
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_composer_text(&self) -> String {
+        self.bottom_pane.composer_text()
+    }
+
     pub(crate) fn test_set_permission_overlay(
         &mut self,
         request: flok_core::tool::PermissionRequest,
@@ -1477,6 +1509,7 @@ mod tests {
     };
     use tokio::sync::{broadcast, mpsc};
 
+    use crate::history::SystemLevel;
     use flok_core::session::PlanMode;
     use flok_core::tool::{PermissionRequest, QuestionRequest, TodoList};
     #[derive(Clone, Default)]
@@ -1609,6 +1642,104 @@ mod tests {
 
         let command = cmd_rx.try_recv().expect("cancel command should be queued");
         assert!(matches!(command, UiCommand::Cancel));
+    }
+
+    #[tokio::test]
+    async fn error_event_stops_waiting_after_submit() {
+        let (channels, _cmd_rx) = make_channels();
+        let (tx, rx) = mpsc::unbounded_channel::<AppEvent>();
+        let mut app = App::new(channels, tx, rx);
+
+        app.handle_event(AppEvent::Submit("inspect the repo".to_string()));
+        assert!(app.waiting_for_response);
+
+        app.handle_event(AppEvent::UiEvent(crate::types::UiEvent::Error(
+            "Tool call loop exceeded 25 rounds - possible doom loop".to_string(),
+        )));
+
+        assert!(!app.waiting_for_response);
+        assert!(
+            matches!(app.history.last(), Some(HistoryItem::System { level: SystemLevel::Error, text }) if text.contains("doom loop"))
+        );
+    }
+
+    #[tokio::test]
+    async fn error_event_finalizes_active_tool_call() {
+        let (channels, _cmd_rx) = make_channels();
+        let (tx, rx) = mpsc::unbounded_channel::<AppEvent>();
+        let mut app = App::new(channels, tx, rx);
+
+        app.handle_event(AppEvent::Submit("inspect the repo".to_string()));
+        app.handle_event(AppEvent::BusEvent(flok_core::bus::BusEvent::ToolCallStarted {
+            session_id: "session".to_string(),
+            tool_name: "bash".to_string(),
+            tool_call_id: "tool-call".to_string(),
+            invocation: "$ git status --short".to_string(),
+        }));
+
+        app.handle_event(AppEvent::UiEvent(crate::types::UiEvent::Error(
+            "Tool call loop exceeded 25 rounds - possible doom loop".to_string(),
+        )));
+
+        assert!(!app.waiting_for_response);
+        assert!(matches!(
+            app.history.as_slice(),
+            [
+                ..,
+                HistoryItem::ToolCall { name, preview, is_error: true, .. },
+                HistoryItem::System { level: SystemLevel::Error, .. }
+            ] if name == "bash" && preview.contains("git status")
+        ));
+    }
+
+    #[tokio::test]
+    async fn resumed_user_messages_seed_composer_history() {
+        let (channels, _cmd_rx) = make_channels();
+        let (tx, rx) = mpsc::unbounded_channel::<AppEvent>();
+        let mut app = App::new(channels, tx, rx);
+
+        app.handle_event(AppEvent::UiEvent(crate::types::UiEvent::HistoryMessage {
+            role: "user".to_string(),
+            content: "first prompt".to_string(),
+        }));
+        app.handle_event(AppEvent::UiEvent(crate::types::UiEvent::HistoryMessage {
+            role: "assistant".to_string(),
+            content: "first response".to_string(),
+        }));
+        app.handle_event(AppEvent::UiEvent(crate::types::UiEvent::HistoryMessage {
+            role: "user".to_string(),
+            content: "second prompt".to_string(),
+        }));
+
+        app.handle_event(AppEvent::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)));
+        assert_eq!(app.test_composer_text(), "second prompt");
+
+        app.handle_event(AppEvent::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)));
+        assert_eq!(app.test_composer_text(), "first prompt");
+    }
+
+    #[tokio::test]
+    async fn session_switch_replaces_composer_history_with_switched_session_prompts() {
+        let (channels, _cmd_rx) = make_channels();
+        let (tx, rx) = mpsc::unbounded_channel::<AppEvent>();
+        let mut app = App::new(channels, tx, rx);
+
+        app.handle_event(AppEvent::UiEvent(crate::types::UiEvent::HistoryMessage {
+            role: "user".to_string(),
+            content: "old session prompt".to_string(),
+        }));
+        app.handle_event(AppEvent::UiEvent(crate::types::UiEvent::SessionSwitched {
+            messages: vec![
+                ("user".to_string(), "new session prompt".to_string()),
+                ("assistant".to_string(), "new session response".to_string()),
+            ],
+        }));
+
+        app.handle_event(AppEvent::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)));
+        assert_eq!(app.test_composer_text(), "new session prompt");
+
+        app.handle_event(AppEvent::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)));
+        assert_eq!(app.test_composer_text(), "new session prompt");
     }
 
     #[tokio::test]

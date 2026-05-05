@@ -52,15 +52,18 @@ pub(crate) fn ingest_reasoning_delta(_active: &mut Option<ActiveItem>, _delta: &
 }
 
 /// Start a tool-call active item (for streaming tool output).
-pub(crate) fn begin_tool_call(active: &mut Option<ActiveItem>, tool_name: String) -> bool {
+pub(crate) fn begin_tool_call(
+    active: &mut Option<ActiveItem>,
+    tool_name: String,
+    invocation: &str,
+) -> bool {
     *active = Some(ActiveItem::new_tool(tool_name));
+    if !invocation.is_empty() {
+        let _ = ingest_tool_output(active, invocation);
+    }
     true
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "tool output streaming is not yet surfaced on the bus")
-)]
 /// Append tool output to an active tool call.
 pub(crate) fn ingest_tool_output(active: &mut Option<ActiveItem>, delta: &str) -> bool {
     if let Some(item) = active.as_mut() {
@@ -200,14 +203,12 @@ mod tests {
     #[test]
     fn tool_call_flow_begin_ingest_finalize() {
         let mut active: Option<ActiveItem> = None;
-        assert!(begin_tool_call(&mut active, "bash".to_string()));
-        assert!(ingest_tool_output(&mut active, "ls "));
-        assert!(ingest_tool_output(&mut active, "-la"));
+        assert!(begin_tool_call(&mut active, "bash".to_string(), "$ ls"));
         let item = finalize_tool_call(active, false, Some(42));
         match item {
             HistoryItem::ToolCall { name, preview, is_error, duration_ms } => {
                 assert_eq!(name, "bash");
-                assert_eq!(preview, "ls -la");
+                assert_eq!(preview, "$ ls");
                 assert!(!is_error);
                 assert_eq!(duration_ms, Some(42));
             }

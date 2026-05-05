@@ -28,7 +28,12 @@ pub enum BusEvent {
     TokenUsage { session_id: String, input_tokens: u64, output_tokens: u64 },
 
     /// A tool call is being executed.
-    ToolCallStarted { session_id: String, tool_name: String, tool_call_id: String },
+    ToolCallStarted {
+        session_id: String,
+        tool_name: String,
+        tool_call_id: String,
+        invocation: String,
+    },
 
     /// A tool call completed.
     ToolCallCompleted {

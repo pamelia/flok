@@ -115,10 +115,6 @@ impl ActiveItem {
         self.revision = self.revision.wrapping_add(1);
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "helper reserved for future active-item finalization paths")
-    )]
     pub(crate) fn into_final(self) -> HistoryItem {
         match self.role {
             Role::Assistant => HistoryItem::Assistant { text: self.streaming_text, markdown: true },

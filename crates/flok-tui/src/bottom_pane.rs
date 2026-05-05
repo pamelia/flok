@@ -57,6 +57,20 @@ impl BottomPane {
         self.composer.set_disabled(waiting);
     }
 
+    pub(crate) fn remember_input(&mut self, input: String) {
+        self.history.push(input);
+    }
+
+    pub(crate) fn reset_input_history<I>(&mut self, inputs: I)
+    where
+        I: IntoIterator<Item = String>,
+    {
+        self.history = InputHistory::new();
+        for input in inputs {
+            self.history.push(input);
+        }
+    }
+
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> Option<AppEvent> {
         // 1. Modal overlay captures first. `map` scopes the `&mut` borrow so we
         // can freely mutate `self.overlay` afterwards (avoids NLL borrow issues
@@ -152,6 +166,11 @@ impl BottomPane {
         self.composer.handle_paste(s);
         // Pasted text can start with `/` or remove one — keep popup in sync.
         self.sync_slash_popup();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn composer_text(&self) -> String {
+        self.composer.text()
     }
 
     pub(crate) fn compute_height(&self, width: u16) -> u16 {

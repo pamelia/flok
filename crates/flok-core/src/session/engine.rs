@@ -2411,6 +2411,11 @@ impl SessionEngine {
                 session_id: self.session_id.clone(),
                 tool_name: tc.name.clone(),
                 tool_call_id: tc.id.clone(),
+                invocation: visible_tool_invocation(
+                    &tc.name,
+                    &args,
+                    tool.describe_invocation(&args),
+                ),
             });
 
             let result = execute_single_tool(&*tool, args.clone(), &ctx, &tc.id, &tc.name).await;
@@ -2859,6 +2864,11 @@ async fn execute_safe_batch(
                     session_id: session_id.clone(),
                     tool_name: tc_name.clone(),
                     tool_call_id: tc_id.clone(),
+                    invocation: visible_tool_invocation(
+                        &tc_name,
+                        &args,
+                        tool.describe_invocation(&args),
+                    ),
                 });
 
                 let result = execute_single_tool(&*tool, args, &ctx, &tc_id, &tc_name).await;
@@ -2879,6 +2889,19 @@ async fn execute_safe_batch(
     for (i, result) in concurrent_results {
         pre_results[i] = Some(truncate_result(result));
     }
+}
+
+fn visible_tool_invocation(
+    tool_name: &str,
+    args: &serde_json::Value,
+    fallback_description: String,
+) -> String {
+    if tool_name == "bash" {
+        if let Some(command) = args.get("command").and_then(serde_json::Value::as_str) {
+            return format!("$ {command}");
+        }
+    }
+    fallback_description
 }
 
 /// Execute a single tool call with panic safety.

@@ -206,6 +206,7 @@ impl Tool for TaskTool {
             session_id: ctx.session_id.clone(),
             tool_name: format!("task:{agent_type}"),
             tool_call_id: description.to_string(),
+            invocation: format!("task: {description}"),
         });
 
         // Determine if this agent needs worktree isolation.
@@ -480,6 +481,7 @@ impl TaskTool {
                 session_id: session_id.clone(),
                 tool_name: format!("task:{agent_type}:{agent_name_clone}"),
                 tool_call_id: task_id_clone.clone(),
+                invocation: format!("task: {description}"),
             });
 
             let result = run_subagent_standalone(
